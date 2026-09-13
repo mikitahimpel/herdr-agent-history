@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+current_hooks=$(git config --local --get core.hooksPath || true)
+if [ -n "$current_hooks" ] && [ "$current_hooks" != ".githooks" ]; then
+    echo "Existing core.hooksPath=$current_hooks; integrate .githooks/pre-push before changing this setting." >&2
+    exit 1
+fi
+git config --local core.hooksPath .githooks
+echo "Enabled repository hooks. Run ./scripts/check before handoff."

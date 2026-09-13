@@ -1,0 +1,484 @@
+[
+  {
+    "id": "quality-enforcement",
+    "title": "Require the quality gate on GitHub main",
+    "rfc": "Repository setup requirement",
+    "deps": [],
+    "scope": [
+      "Configure a GitHub branch rule/ruleset for main requiring pull requests and the Quality gate status; review bypass permissions with the owner.",
+      "Verify a failing or missing required check blocks merging.",
+      "Keep ./scripts/check, CI, AGENTS.md, CLAUDE.md, and the pre-push hook aligned as new crates/tests are added."
+    ],
+    "acceptance": [
+      "An active main rule requires the Quality gate CI result and blocks failed/pending checks.",
+      "Record the verified rule and bypass policy; local hooks alone are not remote merge enforcement.",
+      "Scaffold formatting, lint, tests, and release build have a green CI run."
+    ],
+    "body": "## Outcome\n\nRequire the quality gate on GitHub main.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections Repository setup requirement.\n\n## Scope\n\n- Configure a GitHub branch rule/ruleset for main requiring pull requests and the Quality gate status; review bypass permissions with the owner.\n- Verify a failing or missing required check blocks merging.\n- Keep ./scripts/check, CI, AGENTS.md, CLAUDE.md, and the pre-push hook aligned as new crates/tests are added.\n\n## Acceptance criteria\n\n- [ ] An active main rule requires the Quality gate CI result and blocks failed/pending checks.\n- [ ] Record the verified rule and bypass policy; local hooks alone are not remote merge enforcement.\n- [ ] Scaffold formatting, lint, tests, and release build have a green CI run.\n\n## Dependencies\n\nNone; ready to start.\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:quality-enforcement -->\n"
+  },
+  {
+    "id": "foundation",
+    "title": "Define core domain models and adapter contracts",
+    "rfc": "1\u20134, 7, 17, 22, 30",
+    "deps": [],
+    "scope": [
+      "Define agent-qualified session identity, normalized events, sessions, search chunks/results, source references, and typed errors.",
+      "Separate pure core contracts from agent parsing, filesystem/process access, and Herdr host types; document crate ownership and dependency direction.",
+      "Record supported versions/fixtures before assuming native session layouts or CLI options."
+    ],
+    "acceptance": [
+      "Claude and Codex IDs cannot collide; timestamps and missing context have explicit semantics.",
+      "Source ranges are documented as half-open byte offsets, with file identity/generation for stale-reference detection.",
+      "Core builds and tests without Herdr; contract tests cover identity and optional metadata."
+    ],
+    "index": 1,
+    "body": "## Outcome\n\nDefine core domain models and adapter contracts.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 1\u20134, 7, 17, 22, 30.\n\n## Scope\n\n- Define agent-qualified session identity, normalized events, sessions, search chunks/results, source references, and typed errors.\n- Separate pure core contracts from agent parsing, filesystem/process access, and Herdr host types; document crate ownership and dependency direction.\n- Record supported versions/fixtures before assuming native session layouts or CLI options.\n\n## Acceptance criteria\n\n- [ ] Claude and Codex IDs cannot collide; timestamps and missing context have explicit semantics.\n- [ ] Source ranges are documented as half-open byte offsets, with file identity/generation for stale-reference detection.\n- [ ] Core builds and tests without Herdr; contract tests cover identity and optional metadata.\n\n## Dependencies\n\nNone; ready to start.\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:foundation -->\n"
+  },
+  {
+    "id": "fixtures",
+    "title": "Build sanitized Claude and Codex compatibility fixtures",
+    "rfc": "8, 10, 13, 17",
+    "deps": [
+      "foundation"
+    ],
+    "scope": [
+      "Document discovery layouts and versioned event schemas from supported agent versions.",
+      "Create synthetic or explicitly sanitized JSONL fixtures: user/assistant turns, tool outputs, metadata, Unicode, missing fields, unknown events, malformed lines, and partial tails.",
+      "Document the policy for human-readable tool output and explicitly exclude raw credentials, private transcripts, and hidden reasoning/internal events."
+    ],
+    "acceptance": [
+      "Fixtures cover both agents and native session IDs/cwd/timestamps.",
+      "Parser expectations are deterministic and tests never read the developer's home history.",
+      "Document format drift, unsupported records, and duplicate message/streaming variants."
+    ],
+    "index": 2,
+    "body": "## Outcome\n\nBuild sanitized Claude and Codex compatibility fixtures.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 8, 10, 13, 17.\n\n## Scope\n\n- Document discovery layouts and versioned event schemas from supported agent versions.\n- Create synthetic or explicitly sanitized JSONL fixtures: user/assistant turns, tool outputs, metadata, Unicode, missing fields, unknown events, malformed lines, and partial tails.\n- Document the policy for human-readable tool output and explicitly exclude raw credentials, private transcripts, and hidden reasoning/internal events.\n\n## Acceptance criteria\n\n- [ ] Fixtures cover both agents and native session IDs/cwd/timestamps.\n- [ ] Parser expectations are deterministic and tests never read the developer's home history.\n- [ ] Document format drift, unsupported records, and duplicate message/streaming variants.\n\n## Dependencies\n\n- foundation\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:fixtures -->\n"
+  },
+  {
+    "id": "claude",
+    "title": "Implement Claude session discovery and parsing",
+    "rfc": "8, 10, 17",
+    "deps": [
+      "foundation",
+      "fixtures"
+    ],
+    "scope": [
+      "Discover supported Claude JSONL locations without depending on open Herdr workspaces.",
+      "Extract native session identity, cwd, timestamps, user/assistant content, and bounded useful tool results.",
+      "Ignore non-searchable metadata and unsupported event types using documented diagnostics."
+    ],
+    "acceptance": [
+      "Versioned fixture tests cover all supported content variants and malformed input.",
+      "Discovery handles missing roots, unreadable files, symlinks, and duplicate paths predictably.",
+      "No tool IDs, protocol JSON, hidden reasoning, or token accounting enters normalized text."
+    ],
+    "index": 3,
+    "body": "## Outcome\n\nImplement Claude session discovery and parsing.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 8, 10, 17.\n\n## Scope\n\n- Discover supported Claude JSONL locations without depending on open Herdr workspaces.\n- Extract native session identity, cwd, timestamps, user/assistant content, and bounded useful tool results.\n- Ignore non-searchable metadata and unsupported event types using documented diagnostics.\n\n## Acceptance criteria\n\n- [ ] Versioned fixture tests cover all supported content variants and malformed input.\n- [ ] Discovery handles missing roots, unreadable files, symlinks, and duplicate paths predictably.\n- [ ] No tool IDs, protocol JSON, hidden reasoning, or token accounting enters normalized text.\n\n## Dependencies\n\n- foundation\n- fixtures\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:claude -->\n"
+  },
+  {
+    "id": "codex",
+    "title": "Implement Codex session discovery and parsing",
+    "rfc": "8, 10, 17",
+    "deps": [
+      "foundation",
+      "fixtures"
+    ],
+    "scope": [
+      "Discover supported Codex native JSONL sessions independently of open workspaces.",
+      "Extract session metadata and conversational text; deduplicate equivalent event representations and streamed updates.",
+      "Define compatibility behavior for unknown schema versions and events."
+    ],
+    "acceptance": [
+      "Fixture tests cover session metadata, user/assistant turns, tool results, Unicode, and missing fields.",
+      "Only supported conversational text enters search; native IDs remain resumable.",
+      "Discovery handles absent/unreadable roots and malformed records without aborting unrelated files."
+    ],
+    "index": 4,
+    "body": "## Outcome\n\nImplement Codex session discovery and parsing.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 8, 10, 17.\n\n## Scope\n\n- Discover supported Codex native JSONL sessions independently of open workspaces.\n- Extract session metadata and conversational text; deduplicate equivalent event representations and streamed updates.\n- Define compatibility behavior for unknown schema versions and events.\n\n## Acceptance criteria\n\n- [ ] Fixture tests cover session metadata, user/assistant turns, tool results, Unicode, and missing fields.\n- [ ] Only supported conversational text enters search; native IDs remain resumable.\n- [ ] Discovery handles absent/unreadable roots and malformed records without aborting unrelated files.\n\n## Dependencies\n\n- foundation\n- fixtures\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:codex -->\n"
+  },
+  {
+    "id": "chunks",
+    "title": "Build bounded conversation chunks with resumable turn state",
+    "rfc": "7, 10\u201313",
+    "deps": [
+      "claude",
+      "codex"
+    ],
+    "scope": [
+      "Group user turns with assistant responses and useful tool output; split oversized turns at deterministic boundaries.",
+      "Retain timestamps and exact source ranges; normalize whitespace without losing meaningful search terms.",
+      "Define how the final open turn is extended after an append or process restart, without duplicating searchable text."
+    ],
+    "acceptance": [
+      "Whole-file indexing and indexing the same bytes in arbitrary append batches produce equivalent chunks/search results.",
+      "Restart mid-turn and assistant-only continuation tests pass.",
+      "Chunk and tool-output size limits are explicit; source ranges round-trip Unicode and multi-record turns."
+    ],
+    "index": 5,
+    "body": "## Outcome\n\nBuild bounded conversation chunks with resumable turn state.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 7, 10\u201313.\n\n## Scope\n\n- Group user turns with assistant responses and useful tool output; split oversized turns at deterministic boundaries.\n- Retain timestamps and exact source ranges; normalize whitespace without losing meaningful search terms.\n- Define how the final open turn is extended after an append or process restart, without duplicating searchable text.\n\n## Acceptance criteria\n\n- [ ] Whole-file indexing and indexing the same bytes in arbitrary append batches produce equivalent chunks/search results.\n- [ ] Restart mid-turn and assistant-only continuation tests pass.\n- [ ] Chunk and tool-output size limits are explicit; source ranges round-trip Unicode and multi-record turns.\n\n## Dependencies\n\n- claude\n- codex\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:chunks -->\n"
+  },
+  {
+    "id": "storage",
+    "title": "Implement SQLite metadata schema, migrations, and FTS5 storage",
+    "rfc": "9, 10, 24, 30",
+    "deps": [
+      "foundation"
+    ],
+    "scope": [
+      "Choose and verify SQLite FTS5 support; create sessions, indexed_files, search_chunks, foreign keys, and versioned migrations.",
+      "Use an external-content FTS table or equivalent single-copy normalized-text design with transactional synchronization.",
+      "Support concurrent readers during updates, document WAL/locking policy, and keep the index rebuildable."
+    ],
+    "acceptance": [
+      "Fresh creation, reopen, migration rollback, foreign-key cleanup, and FTS insert/update/delete consistency tests pass.",
+      "Schema stores file generation and committed offsets without a second complete transcript copy.",
+      "Packaged SQLite actually supports FTS5; crash rollback leaves metadata and FTS consistent."
+    ],
+    "index": 6,
+    "body": "## Outcome\n\nImplement SQLite metadata schema, migrations, and FTS5 storage.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 9, 10, 24, 30.\n\n## Scope\n\n- Choose and verify SQLite FTS5 support; create sessions, indexed_files, search_chunks, foreign keys, and versioned migrations.\n- Use an external-content FTS table or equivalent single-copy normalized-text design with transactional synchronization.\n- Support concurrent readers during updates, document WAL/locking policy, and keep the index rebuildable.\n\n## Acceptance criteria\n\n- [ ] Fresh creation, reopen, migration rollback, foreign-key cleanup, and FTS insert/update/delete consistency tests pass.\n- [ ] Schema stores file generation and committed offsets without a second complete transcript copy.\n- [ ] Packaged SQLite actually supports FTS5; crash rollback leaves metadata and FTS consistent.\n\n## Dependencies\n\n- foundation\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:storage -->\n"
+  },
+  {
+    "id": "privacy",
+    "title": "Enforce local-only processing and private index permissions",
+    "rfc": "25",
+    "deps": [
+      "storage"
+    ],
+    "scope": [
+      "Choose a macOS user-scoped index location and override for tests; create directories as 0700 and DB/sidecars as 0600.",
+      "Protect temporary files, WAL/SHM, diagnostics, and error messages; avoid transcript content in default logs.",
+      "Keep the runtime free of network/telemetry services and treat transcript text as untrusted display data."
+    ],
+    "acceptance": [
+      "Permission tests under permissive umask cover new/reopened DB and SQLite sidecars.",
+      "Source transcripts are never modified; fixtures and logs contain no private history.",
+      "Document local sensitive data handling and rebuild/removal behavior."
+    ],
+    "index": 7,
+    "body": "## Outcome\n\nEnforce local-only processing and private index permissions.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 25.\n\n## Scope\n\n- Choose a macOS user-scoped index location and override for tests; create directories as 0700 and DB/sidecars as 0600.\n- Protect temporary files, WAL/SHM, diagnostics, and error messages; avoid transcript content in default logs.\n- Keep the runtime free of network/telemetry services and treat transcript text as untrusted display data.\n\n## Acceptance criteria\n\n- [ ] Permission tests under permissive umask cover new/reopened DB and SQLite sidecars.\n- [ ] Source transcripts are never modified; fixtures and logs contain no private history.\n- [ ] Document local sensitive data handling and rebuild/removal behavior.\n\n## Dependencies\n\n- storage\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:privacy -->\n"
+  },
+  {
+    "id": "incremental",
+    "title": "Implement transactional byte-offset incremental indexing",
+    "rfc": "12, 13",
+    "deps": [
+      "chunks",
+      "storage",
+      "privacy"
+    ],
+    "scope": [
+      "Read appended bytes from the committed offset; parse complete newline-terminated records only.",
+      "Commit chunks, FTS changes, open-turn state, and offsets atomically.",
+      "Define deterministic handling for malformed complete records, bounded diagnostics, concurrent writes, interruption, and retry."
+    ],
+    "acceptance": [
+      "Partial final JSON, newline completion, UTF-8 boundary, and crash-before/after-commit tests pass.",
+      "Repeated indexing is idempotent; appends read new bytes plus only explicitly bounded state.",
+      "A malformed complete record cannot permanently block all later valid records or silently hide skipped data."
+    ],
+    "index": 8,
+    "body": "## Outcome\n\nImplement transactional byte-offset incremental indexing.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 12, 13.\n\n## Scope\n\n- Read appended bytes from the committed offset; parse complete newline-terminated records only.\n- Commit chunks, FTS changes, open-turn state, and offsets atomically.\n- Define deterministic handling for malformed complete records, bounded diagnostics, concurrent writes, interruption, and retry.\n\n## Acceptance criteria\n\n- [ ] Partial final JSON, newline completion, UTF-8 boundary, and crash-before/after-commit tests pass.\n- [ ] Repeated indexing is idempotent; appends read new bytes plus only explicitly bounded state.\n- [ ] A malformed complete record cannot permanently block all later valid records or silently hide skipped data.\n\n## Dependencies\n\n- chunks\n- storage\n- privacy\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:incremental -->\n"
+  },
+  {
+    "id": "mutations",
+    "title": "Handle truncated, replaced, renamed, and missing source files",
+    "rfc": "14, 21, 30",
+    "deps": [
+      "incremental"
+    ],
+    "scope": [
+      "Classify new/appended/unchanged/truncated/replaced files using path, identity, size, mtime, and offset.",
+      "Rebuild only affected source generations atomically; define rename, deletion, and same-size rewrite policies.",
+      "Invalidate stale source references and retain truthful metadata when native history disappears."
+    ],
+    "acceptance": [
+      "Tests cover inode replacement, truncate-and-regrow, same-size edits, rename, deletion, and replacement during a read.",
+      "No old FTS chunks survive a successful replacement rebuild.",
+      "Unchanged files are not reparsed; missing originals yield explicit preview/resume errors."
+    ],
+    "index": 9,
+    "body": "## Outcome\n\nHandle truncated, replaced, renamed, and missing source files.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 14, 21, 30.\n\n## Scope\n\n- Classify new/appended/unchanged/truncated/replaced files using path, identity, size, mtime, and offset.\n- Rebuild only affected source generations atomically; define rename, deletion, and same-size rewrite policies.\n- Invalidate stale source references and retain truthful metadata when native history disappears.\n\n## Acceptance criteria\n\n- [ ] Tests cover inode replacement, truncate-and-regrow, same-size edits, rename, deletion, and replacement during a read.\n- [ ] No old FTS chunks survive a successful replacement rebuild.\n- [ ] Unchanged files are not reparsed; missing originals yield explicit preview/resume errors.\n\n## Dependencies\n\n- incremental\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:mutations -->\n"
+  },
+  {
+    "id": "git-context",
+    "title": "Capture repository and worktree context during indexing",
+    "rfc": "18",
+    "deps": [
+      "foundation",
+      "storage"
+    ],
+    "scope": [
+      "Resolve cwd to canonical repository/common Git directory, worktree, branch, and HEAD commit.",
+      "Handle normal repositories, linked worktrees, detached HEAD, non-Git paths, missing paths, and unusual path characters.",
+      "Persist provenance and observation time; do not overwrite useful recorded context with missing current state or claim index-time HEAD is historical truth."
+    ],
+    "acceptance": [
+      "Temporary-repository tests cover linked/deleted worktrees and detached HEAD.",
+      "Metadata remains usable after worktree deletion.",
+      "Git invocations use structured arguments and never mutate repositories during indexing."
+    ],
+    "index": 10,
+    "body": "## Outcome\n\nCapture repository and worktree context during indexing.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 18.\n\n## Scope\n\n- Resolve cwd to canonical repository/common Git directory, worktree, branch, and HEAD commit.\n- Handle normal repositories, linked worktrees, detached HEAD, non-Git paths, missing paths, and unusual path characters.\n- Persist provenance and observation time; do not overwrite useful recorded context with missing current state or claim index-time HEAD is historical truth.\n\n## Acceptance criteria\n\n- [ ] Temporary-repository tests cover linked/deleted worktrees and detached HEAD.\n- [ ] Metadata remains usable after worktree deletion.\n- [ ] Git invocations use structured arguments and never mutate repositories during indexing.\n\n## Dependencies\n\n- foundation\n- storage\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:git-context -->\n"
+  },
+  {
+    "id": "search",
+    "title": "Implement ranked FTS5 search with snippets",
+    "rfc": "6, 7, 24",
+    "deps": [
+      "storage",
+      "chunks"
+    ],
+    "scope": [
+      "Implement normal term queries, explicit phrase/prefix syntax, BM25 ordering, snippet generation, limits, and stable tie-breaking.",
+      "Join results to session/agent/Git context and exact source references; define repeated matches within one session.",
+      "Bound input and handle invalid FTS syntax as a user-facing result rather than a crash."
+    ],
+    "acceptance": [
+      "Tests cover punctuation, quotes, prefixes, Unicode, empty queries, ranking, and deterministic limits.",
+      "Search performs no JSONL scans and works with no Herdr workspaces open.",
+      "Queries are parameterized; snippets exclude protocol metadata and unsafe terminal controls."
+    ],
+    "index": 11,
+    "body": "## Outcome\n\nImplement ranked FTS5 search with snippets.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 6, 7, 24.\n\n## Scope\n\n- Implement normal term queries, explicit phrase/prefix syntax, BM25 ordering, snippet generation, limits, and stable tie-breaking.\n- Join results to session/agent/Git context and exact source references; define repeated matches within one session.\n- Bound input and handle invalid FTS syntax as a user-facing result rather than a crash.\n\n## Acceptance criteria\n\n- [ ] Tests cover punctuation, quotes, prefixes, Unicode, empty queries, ranking, and deterministic limits.\n- [ ] Search performs no JSONL scans and works with no Herdr workspaces open.\n- [ ] Queries are parameterized; snippets exclude protocol metadata and unsafe terminal controls.\n\n## Dependencies\n\n- storage\n- chunks\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:search -->\n"
+  },
+  {
+    "id": "lifecycle",
+    "title": "Coordinate activation indexing and visible initial progress",
+    "rfc": "15, 16",
+    "deps": [
+      "incremental",
+      "mutations",
+      "git-context",
+      "search"
+    ],
+    "scope": [
+      "On activation, serve existing search results while discovering and indexing changed files.",
+      "Report per-agent file progress, chunk counts, cancellation, and recoverable errors.",
+      "Coordinate multiple CLI/Herdr clients so writers are serialized without duplicate work; stop background work when its owner exits."
+    ],
+    "acceptance": [
+      "Tests demonstrate responsive reads during indexing and safe concurrent activation.",
+      "Interrupted initial scans resume without duplicates or skipped records.",
+      "Document whether search is available during first scan; no persistent daemon remains after exit."
+    ],
+    "index": 12,
+    "body": "## Outcome\n\nCoordinate activation indexing and visible initial progress.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 15, 16.\n\n## Scope\n\n- On activation, serve existing search results while discovering and indexing changed files.\n- Report per-agent file progress, chunk counts, cancellation, and recoverable errors.\n- Coordinate multiple CLI/Herdr clients so writers are serialized without duplicate work; stop background work when its owner exits.\n\n## Acceptance criteria\n\n- [ ] Tests demonstrate responsive reads during indexing and safe concurrent activation.\n- [ ] Interrupted initial scans resume without duplicates or skipped records.\n- [ ] Document whether search is available during first scan; no persistent daemon remains after exit.\n\n## Dependencies\n\n- incremental\n- mutations\n- git-context\n- search\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:lifecycle -->\n"
+  },
+  {
+    "id": "preview",
+    "title": "Read original conversation context around search matches",
+    "rfc": "7, 11, 21",
+    "deps": [
+      "claude",
+      "codex",
+      "mutations"
+    ],
+    "scope": [
+      "Load bounded surrounding original records from source references and render role-separated conversation.",
+      "Support expanding context without loading an entire large transcript.",
+      "Verify source generation before reading; sanitize terminal control sequences and distinguish missing/replaced sources."
+    ],
+    "acceptance": [
+      "Tests cover middle-of-file matches, Unicode, large records, incomplete tails, and source replacement.",
+      "Preview shows original conversational context with agent/repo/branch metadata.",
+      "No raw transcript archive is introduced in SQLite."
+    ],
+    "index": 13,
+    "body": "## Outcome\n\nRead original conversation context around search matches.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 7, 11, 21.\n\n## Scope\n\n- Load bounded surrounding original records from source references and render role-separated conversation.\n- Support expanding context without loading an entire large transcript.\n- Verify source generation before reading; sanitize terminal control sequences and distinguish missing/replaced sources.\n\n## Acceptance criteria\n\n- [ ] Tests cover middle-of-file matches, Unicode, large records, incomplete tails, and source replacement.\n- [ ] Preview shows original conversational context with agent/repo/branch metadata.\n- [ ] No raw transcript archive is introduced in SQLite.\n\n## Dependencies\n\n- claude\n- codex\n- mutations\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:preview -->\n"
+  },
+  {
+    "id": "cli",
+    "title": "Implement index, search, and status CLI commands",
+    "rfc": "23",
+    "deps": [
+      "search",
+      "lifecycle",
+      "preview"
+    ],
+    "scope": [
+      "Wire the standalone binary to core index/search/status services with help, configurable data paths, and clear exit codes.",
+      "Print searchable result context and progress/errors on appropriate streams.",
+      "Expose index counts, freshness, and actionable indexing errors without leaking transcript content in status."
+    ],
+    "acceptance": [
+      "Process-level integration tests run against isolated synthetic history and a temporary database.",
+      "Index \u2192 search \u2192 status works without Herdr and after process restart.",
+      "Invalid arguments/queries and missing/unreadable files have deterministic outcomes."
+    ],
+    "index": 14,
+    "body": "## Outcome\n\nImplement index, search, and status CLI commands.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 23.\n\n## Scope\n\n- Wire the standalone binary to core index/search/status services with help, configurable data paths, and clear exit codes.\n- Print searchable result context and progress/errors on appropriate streams.\n- Expose index counts, freshness, and actionable indexing errors without leaking transcript content in status.\n\n## Acceptance criteria\n\n- [ ] Process-level integration tests run against isolated synthetic history and a temporary database.\n- [ ] Index \u2192 search \u2192 status works without Herdr and after process restart.\n- [ ] Invalid arguments/queries and missing/unreadable files have deterministic outcomes.\n\n## Dependencies\n\n- search\n- lifecycle\n- preview\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:cli -->\n"
+  },
+  {
+    "id": "host-contract",
+    "title": "Define and implement the Herdr host integration boundary",
+    "rfc": "17, 19, 22",
+    "deps": [
+      "foundation"
+    ],
+    "scope": [
+      "Inspect the supported Herdr revision and document the actual API/extension strategy; identify any host-side changes.",
+      "Define testable operations to list/focus/create workspaces and identify/focus/start an agent session.",
+      "Keep shared runtime/session facts out of overlay-only state and keep core independent from Herdr types."
+    ],
+    "acceptance": [
+      "An ADR identifies supported Herdr versions, source ownership, build/distribution route, and any prerequisite host work.",
+      "A mock host tests workspace lookup and process launch requests.",
+      "No unverified Herdr command or private protocol is assumed; this issue owns any necessary companion integration changes."
+    ],
+    "index": 15,
+    "body": "## Outcome\n\nDefine and implement the Herdr host integration boundary.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 17, 19, 22.\n\n## Scope\n\n- Inspect the supported Herdr revision and document the actual API/extension strategy; identify any host-side changes.\n- Define testable operations to list/focus/create workspaces and identify/focus/start an agent session.\n- Keep shared runtime/session facts out of overlay-only state and keep core independent from Herdr types.\n\n## Acceptance criteria\n\n- [ ] An ADR identifies supported Herdr versions, source ownership, build/distribution route, and any prerequisite host work.\n- [ ] A mock host tests workspace lookup and process launch requests.\n- [ ] No unverified Herdr command or private protocol is assumed; this issue owns any necessary companion integration changes.\n\n## Dependencies\n\n- foundation\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:host-contract -->\n"
+  },
+  {
+    "id": "resume-agents",
+    "title": "Implement verified native Claude and Codex resume commands",
+    "rfc": "17, 19",
+    "deps": [
+      "claude",
+      "codex",
+      "host-contract"
+    ],
+    "scope": [
+      "Verify native resume CLI flags against supported installed versions or authoritative CLI help.",
+      "Construct agent-specific argument arrays using the original native session ID and chosen cwd.",
+      "Detect absent executables, unsupported versions, unavailable sessions, and launch errors without falling back silently to a new conversation."
+    ],
+    "acceptance": [
+      "Adapter tests assert exact argv/cwd with spaces and shell metacharacters.",
+      "Manual smoke tests for both supported agents demonstrate continuation of the same native session.",
+      "No shell interpolation or transcript-provided instructions control launch arguments."
+    ],
+    "index": 16,
+    "body": "## Outcome\n\nImplement verified native Claude and Codex resume commands.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 17, 19.\n\n## Scope\n\n- Verify native resume CLI flags against supported installed versions or authoritative CLI help.\n- Construct agent-specific argument arrays using the original native session ID and chosen cwd.\n- Detect absent executables, unsupported versions, unavailable sessions, and launch errors without falling back silently to a new conversation.\n\n## Acceptance criteria\n\n- [ ] Adapter tests assert exact argv/cwd with spaces and shell metacharacters.\n- [ ] Manual smoke tests for both supported agents demonstrate continuation of the same native session.\n- [ ] No shell interpolation or transcript-provided instructions control launch arguments.\n\n## Dependencies\n\n- claude\n- codex\n- host-contract\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:resume-agents -->\n"
+  },
+  {
+    "id": "restore-existing",
+    "title": "Resume in existing or closed workspaces with existing worktrees",
+    "rfc": "19, 29",
+    "deps": [
+      "git-context",
+      "host-contract",
+      "resume-agents"
+    ],
+    "scope": [
+      "Implement the restore decision service: resolve canonical cwd, focus matching workspace/session, or create a workspace for an existing worktree.",
+      "Reuse an already-running matching agent and avoid duplicate workspaces/processes.",
+      "Handle stale host state and workspace/process creation failures with recoverable errors."
+    ],
+    "acceptance": [
+      "Tests cover open workspace with active session, open workspace without matching agent, and closed workspace with existing cwd.",
+      "Repeated Enter and concurrent requests do not duplicate processes/workspaces.",
+      "Existing-worktree paths require no confirmation or extra user decisions."
+    ],
+    "index": 17,
+    "body": "## Outcome\n\nResume in existing or closed workspaces with existing worktrees.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 19, 29.\n\n## Scope\n\n- Implement the restore decision service: resolve canonical cwd, focus matching workspace/session, or create a workspace for an existing worktree.\n- Reuse an already-running matching agent and avoid duplicate workspaces/processes.\n- Handle stale host state and workspace/process creation failures with recoverable errors.\n\n## Acceptance criteria\n\n- [ ] Tests cover open workspace with active session, open workspace without matching agent, and closed workspace with existing cwd.\n- [ ] Repeated Enter and concurrent requests do not duplicate processes/workspaces.\n- [ ] Existing-worktree paths require no confirmation or extra user decisions.\n\n## Dependencies\n\n- git-context\n- host-contract\n- resume-agents\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:restore-existing -->\n"
+  },
+  {
+    "id": "restore-deleted",
+    "title": "Add confirmed deleted-worktree recovery and fallbacks",
+    "rfc": "20",
+    "deps": [
+      "restore-existing"
+    ],
+    "scope": [
+      "Return recovery choices: recreate and resume, resume in repository, view conversation, cancel.",
+      "Require explicit runtime confirmation immediately before Git/filesystem mutation; validate recorded repository, branch, commit, and target path.",
+      "Handle checked-out branches, missing refs/commits, collisions, detached HEAD, and insufficient metadata without destructive checkout/reset/clean."
+    ],
+    "acceptance": [
+      "No recreation occurs before confirmation; cancel is side-effect free.",
+      "Temporary Git integration tests exercise available/missing branch and commit plus target collisions.",
+      "Failure leaves existing user work intact; fallback options accurately reflect available repository/transcript state."
+    ],
+    "index": 18,
+    "body": "## Outcome\n\nAdd confirmed deleted-worktree recovery and fallbacks.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 20.\n\n## Scope\n\n- Return recovery choices: recreate and resume, resume in repository, view conversation, cancel.\n- Require explicit runtime confirmation immediately before Git/filesystem mutation; validate recorded repository, branch, commit, and target path.\n- Handle checked-out branches, missing refs/commits, collisions, detached HEAD, and insufficient metadata without destructive checkout/reset/clean.\n\n## Acceptance criteria\n\n- [ ] No recreation occurs before confirmation; cancel is side-effect free.\n- [ ] Temporary Git integration tests exercise available/missing branch and commit plus target collisions.\n- [ ] Failure leaves existing user work intact; fallback options accurately reflect available repository/transcript state.\n\n## Dependencies\n\n- restore-existing\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:restore-deleted -->\n"
+  },
+  {
+    "id": "overlay",
+    "title": "Build the Agent History search overlay in Herdr",
+    "rfc": "5, 15, 16, 22",
+    "deps": [
+      "host-contract",
+      "search",
+      "lifecycle"
+    ],
+    "scope": [
+      "Add the named command and configurable shortcut using Herdr's existing overlay/UI patterns.",
+      "Connect query editing, result metadata/snippets, selection, loading/progress, empty/error states, and async result updates.",
+      "Resolve Space behavior explicitly: query input must accept multiword text while Space on a focused result previews."
+    ],
+    "acceptance": [
+      "Keyboard tests cover multiword typing, arrows, Space preview intent, Enter selection, Esc dismissal, and focus restoration.",
+      "Stale query responses cannot replace newer results; selection stays stable where possible.",
+      "Search works with no workspaces open and remains responsive while indexing."
+    ],
+    "index": 19,
+    "body": "## Outcome\n\nBuild the Agent History search overlay in Herdr.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 5, 15, 16, 22.\n\n## Scope\n\n- Add the named command and configurable shortcut using Herdr's existing overlay/UI patterns.\n- Connect query editing, result metadata/snippets, selection, loading/progress, empty/error states, and async result updates.\n- Resolve Space behavior explicitly: query input must accept multiword text while Space on a focused result previews.\n\n## Acceptance criteria\n\n- [ ] Keyboard tests cover multiword typing, arrows, Space preview intent, Enter selection, Esc dismissal, and focus restoration.\n- [ ] Stale query responses cannot replace newer results; selection stays stable where possible.\n- [ ] Search works with no workspaces open and remains responsive while indexing.\n\n## Dependencies\n\n- host-contract\n- search\n- lifecycle\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:overlay -->\n"
+  },
+  {
+    "id": "overlay-actions",
+    "title": "Connect preview and resume/recovery interactions in Herdr",
+    "rfc": "5, 19\u201322, 29",
+    "deps": [
+      "overlay",
+      "preview",
+      "restore-existing",
+      "restore-deleted"
+    ],
+    "scope": [
+      "Connect Space to role-separated preview, Enter to the restore service, and Esc back to retained query/selection.",
+      "Present deleted-worktree choices and confirmation using native Herdr interaction patterns.",
+      "Show actionable launch/source errors and maintain accessible keyboard focus through each transition."
+    ],
+    "acceptance": [
+      "UI/integration tests cover search \u2192 preview \u2192 resume and return to search without losing state.",
+      "Normal existing-worktree flow hides CLI/workspace mechanics and requires no extra decisions.",
+      "Missing worktree confirmation and cancellation produce the expected host effects only."
+    ],
+    "index": 20,
+    "body": "## Outcome\n\nConnect preview and resume/recovery interactions in Herdr.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 5, 19\u201322, 29.\n\n## Scope\n\n- Connect Space to role-separated preview, Enter to the restore service, and Esc back to retained query/selection.\n- Present deleted-worktree choices and confirmation using native Herdr interaction patterns.\n- Show actionable launch/source errors and maintain accessible keyboard focus through each transition.\n\n## Acceptance criteria\n\n- [ ] UI/integration tests cover search \u2192 preview \u2192 resume and return to search without losing state.\n- [ ] Normal existing-worktree flow hides CLI/workspace mechanics and requires no extra decisions.\n- [ ] Missing worktree confirmation and cancellation produce the expected host effects only.\n\n## Dependencies\n\n- overlay\n- preview\n- restore-existing\n- restore-deleted\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:overlay-actions -->\n"
+  },
+  {
+    "id": "performance",
+    "title": "Measure search, incremental latency, storage, and idle resources",
+    "rfc": "10, 24, 27",
+    "deps": [
+      "cli",
+      "overlay-actions"
+    ],
+    "scope": [
+      "Build repeatable generated-history benchmarks and document representative local-history measurement procedure without uploading transcripts.",
+      "Measure warm/cold search p50/p95, discovery separately from append parsing, activation latency, DB/sidecar size, and idle lifecycle.",
+      "Record hardware, dataset bytes/session counts/query set, repetitions, and deviations; optimize measured bottlenecks only."
+    ],
+    "acceptance": [
+      "Report assesses p50 <30 ms and p95 <100 ms search; normal small incremental updates <100 ms.",
+      "Demonstrate incremental byte reads and characterize discovery cost as file count grows.",
+      "Report DB/raw-history ratio and prove no Agent History process remains after exit; no unmeasured daemon/vector work is added."
+    ],
+    "index": 21,
+    "body": "## Outcome\n\nMeasure search, incremental latency, storage, and idle resources.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 10, 24, 27.\n\n## Scope\n\n- Build repeatable generated-history benchmarks and document representative local-history measurement procedure without uploading transcripts.\n- Measure warm/cold search p50/p95, discovery separately from append parsing, activation latency, DB/sidecar size, and idle lifecycle.\n- Record hardware, dataset bytes/session counts/query set, repetitions, and deviations; optimize measured bottlenecks only.\n\n## Acceptance criteria\n\n- [ ] Report assesses p50 <30 ms and p95 <100 ms search; normal small incremental updates <100 ms.\n- [ ] Demonstrate incremental byte reads and characterize discovery cost as file count grows.\n- [ ] Report DB/raw-history ratio and prove no Agent History process remains after exit; no unmeasured daemon/vector work is added.\n\n## Dependencies\n\n- cli\n- overlay-actions\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:performance -->\n"
+  },
+  {
+    "id": "release",
+    "title": "Validate V1 end to end and document macOS installation",
+    "rfc": "3, 25, 26, 29, 30",
+    "deps": [
+      "privacy",
+      "cli",
+      "overlay-actions",
+      "performance"
+    ],
+    "scope": [
+      "Run the defining user journey for both agents across open, closed, and deleted worktree cases.",
+      "Document macOS build/install, supported agent/Herdr versions, shortcut setup, privacy, rebuild, limitations, and troubleshooting.",
+      "Exercise corruption/disposable-index rebuild and restart recovery; document packaging of core/CLI/host integration."
+    ],
+    "acceptance": [
+      "Automated isolated integration suite and manual real-agent smoke evidence are recorded.",
+      "Deleting/rebuilding the index preserves all native session data and restores search coverage.",
+      "Lint, tests, release build, and performance report pass or explicitly record unresolved release blockers before declaring V1 complete."
+    ],
+    "index": 22,
+    "body": "## Outcome\n\nValidate V1 end to end and document macOS installation.\n\n## RFC coverage\n\n[Herdr Agent History RFC](https://github.com/mikitahimpel/herdr-agent-history/blob/main/docs/RFC.md), sections 3, 25, 26, 29, 30.\n\n## Scope\n\n- Run the defining user journey for both agents across open, closed, and deleted worktree cases.\n- Document macOS build/install, supported agent/Herdr versions, shortcut setup, privacy, rebuild, limitations, and troubleshooting.\n- Exercise corruption/disposable-index rebuild and restart recovery; document packaging of core/CLI/host integration.\n\n## Acceptance criteria\n\n- [ ] Automated isolated integration suite and manual real-agent smoke evidence are recorded.\n- [ ] Deleting/rebuilding the index preserves all native session data and restores search coverage.\n- [ ] Lint, tests, release build, and performance report pass or explicitly record unresolved release blockers before declaring V1 complete.\n\n## Dependencies\n\n- privacy\n- cli\n- overlay-actions\n- performance\n\n## Required validation\n\nRun `./scripts/check` (formatting, Clippy, workspace tests, release build). Add isolated behavior tests appropriate to this change and record acceptance evidence. Never commit native transcripts or private index data.\n\n<!-- agent-history-issue:release -->\n"
+  }
+]
