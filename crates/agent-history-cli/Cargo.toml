@@ -7,3 +7,6 @@ publish.workspace = true
 [[bin]]
 name = "agent-history"
 path = "src/main.rs"
+
+[dependencies]
+agent-history-core = { path = "../agent-history-core" }
