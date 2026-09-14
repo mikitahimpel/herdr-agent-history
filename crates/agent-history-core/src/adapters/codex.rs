@@ -18,11 +18,13 @@ impl CodexAdapter {
 }
 impl Default for CodexAdapter {
     fn default() -> Self {
-        let root = std::env::var_os("HOME")
+        let root = std::env::var_os("CODEX_HOME")
             .map(PathBuf::from)
-            .map(|p| p.join(".codex/sessions"))
-            .unwrap_or_else(|| PathBuf::from(".codex/sessions"));
-        Self::with_root(root)
+            .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".codex")));
+        Self::new(
+            root.into_iter()
+                .flat_map(|p| [p.join("sessions"), p.join("archived_sessions")]),
+        )
     }
 }
 impl AgentAdapter for CodexAdapter {

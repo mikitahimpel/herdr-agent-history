@@ -28,6 +28,7 @@ pub struct SessionIdState {
     pub native_id: String,
 }
 
+#[derive(Clone)]
 pub struct ChunkBuilder {
     max_bytes: usize,
     pending: Option<OpenTurnState>,
@@ -58,6 +59,9 @@ impl ChunkBuilder {
             || state.pending.as_ref().is_some_and(|p| {
                 p.text.len() > max_bytes.max(4) * 2
                     || p.start > p.end
+                    || p.ordinal != state.next_ordinal
+                    || p.timestamp_millis
+                        .is_some_and(|v| v < 0 || v > i64::MAX as i128)
                     || !matches!(p.session_id.agent.as_str(), "Claude" | "Codex")
             })
         {
@@ -92,10 +96,11 @@ impl ChunkBuilder {
         if let Some(p) = &self.pending {
             let same = p.file_id == event.source.file_id
                 && p.generation == event.source.generation
-                && p.source_path == event.source.path.to_string_lossy();
+                && p.source_path == event.source.path.to_string_lossy()
+                && p.session_id.native_id == event.session_id.native_id
+                && p.session_id.agent == format!("{:?}", event.session_id.agent);
             if !same {
-                let old = self.pending.take().unwrap();
-                let mut out = Self::emit(old);
+                let mut out = self.finish();
                 out.extend(self.push(event));
                 return out;
             }
@@ -103,9 +108,7 @@ impl ChunkBuilder {
         if event.kind == EventKind::User
             && self.pending.as_ref().is_some_and(|p| !p.text.is_empty())
         {
-            if let Some(p) = self.pending.take() {
-                out.extend(Self::emit(p));
-            }
+            out.extend(self.finish());
         }
         let p = self.pending.get_or_insert_with(|| OpenTurnState {
             session_id: SessionIdState {
@@ -144,6 +147,11 @@ impl ChunkBuilder {
         }
         out
     }
+    /// Current searchable open turn, without closing it at an indexing boundary.
+    pub fn snapshot(&self) -> Option<ConversationChunk> {
+        self.pending.clone().and_then(|p| Self::emit(p).pop())
+    }
+
     pub fn finish(&mut self) -> Vec<ConversationChunk> {
         self.pending
             .take()
@@ -260,5 +268,69 @@ mod tests {
     #[test]
     fn corrupt_state_is_error() {
         assert!(ChunkBuilder::from_state(10, br#"{"next_ordinal":1,"pending":{"session_id":{"agent":"Other","native_id":"x"},"ordinal":0,"timestamp_millis":null,"source_path":"x","file_id":1,"generation":0,"start":4,"end":1,"text":"x"}}"#).is_err());
+    }
+    #[test]
+    fn ordinary_turns_have_distinct_ordinals() {
+        let mut b = ChunkBuilder::default();
+        let mut chunks = Vec::new();
+        for text in ["one", "two", "three"] {
+            chunks.extend(b.push(ev("s", EventKind::User, text, 0)));
+        }
+        chunks.extend(b.finish());
+        assert_eq!(
+            chunks.iter().map(|c| c.ordinal).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+    }
+    #[test]
+    fn every_restart_boundary_matches_whole_file() {
+        let events = vec![
+            ev("s", EventKind::User, "remember topic", 0),
+            ev("s", EventKind::Assistant, "a useful answer ☃", 30),
+            ev("s", EventKind::ToolResult, "tool output", 60),
+            ev("s", EventKind::User, "another turn", 90),
+            ev("s", EventKind::Assistant, "last answer", 120),
+        ];
+        let collect = |restart: bool| {
+            let mut b = ChunkBuilder::new(24);
+            let mut chunks = Vec::new();
+            for event in events.clone() {
+                chunks.extend(b.push(event));
+                if restart {
+                    let before = b.snapshot();
+                    b = ChunkBuilder::from_state(24, &b.state().unwrap()).unwrap();
+                    assert_eq!(before, b.snapshot());
+                }
+            }
+            chunks.extend(b.finish());
+            chunks
+        };
+        assert_eq!(collect(false), collect(true));
+    }
+    #[test]
+    fn same_source_different_session_is_not_merged() {
+        let mut b = ChunkBuilder::default();
+        b.push(ev("one", EventKind::User, "first", 0));
+        let chunks = b.push(ev("two", EventKind::Assistant, "second", 20));
+        assert_eq!(chunks[0].session_id.native_id, "one");
+        assert_eq!(b.snapshot().unwrap().session_id.native_id, "two");
+    }
+    #[test]
+    fn snapshot_keeps_turn_open_and_timestamp() {
+        let mut b = ChunkBuilder::default();
+        b.push(ev("s", EventKind::User, "question", 0));
+        let snapshot = b.snapshot().unwrap();
+        assert_eq!(
+            snapshot.timestamp,
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(7))
+        );
+        let mut b = ChunkBuilder::from_state(DEFAULT_MAX_CHUNK_BYTES, &b.state().unwrap()).unwrap();
+        assert!(b
+            .push(ev("s", EventKind::Assistant, "answer", 20))
+            .is_empty());
+        let current = b.snapshot().unwrap();
+        assert_eq!(current.ordinal, snapshot.ordinal);
+        assert_eq!(current.text, "question\nanswer");
+        assert_eq!(current.source.byte_range, 0..26);
     }
 }

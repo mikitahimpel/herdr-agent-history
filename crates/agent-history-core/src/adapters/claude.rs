@@ -18,11 +18,10 @@ impl ClaudeAdapter {
 }
 impl Default for ClaudeAdapter {
     fn default() -> Self {
-        let root = std::env::var_os("HOME")
+        let root = std::env::var_os("CLAUDE_CONFIG_DIR")
             .map(PathBuf::from)
-            .map(|p| p.join(".claude"))
-            .unwrap_or_else(|| PathBuf::from(".claude"));
-        Self::with_root(root)
+            .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".claude")));
+        Self::new(root.map(|p| p.join("projects")))
     }
 }
 impl AgentAdapter for ClaudeAdapter {

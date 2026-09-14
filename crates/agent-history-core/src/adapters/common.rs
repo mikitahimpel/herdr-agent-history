@@ -36,9 +36,8 @@ fn walk(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         return Ok(());
     }
     if meta.is_dir() {
-        for entry in fs::read_dir(path)? {
-            let entry = entry.map_err(CoreError::Io)?;
-            walk(&entry.path(), out)?;
+        for entry in fs::read_dir(path)?.flatten() {
+            let _ = walk(&entry.path(), out);
         }
     }
     Ok(())
@@ -90,4 +89,43 @@ pub(crate) fn text(v: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 pub(crate) fn source(path: &Path, file_id: u64, generation: u64, len: usize) -> crate::SourceRef {
     crate::SourceRef::new(path, file_id, generation, 0..len as u64).expect("valid range")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn nested_tool_results_and_text_blocks_exclude_protocol() {
+        let v = serde_json::json!([
+            {"type":"text","text":"first"},
+            {"type":"tool_use","text":"hidden","input":{"command":"secret"}},
+            {"type":"tool_result","content":[{"type":"text","text":"output"}]},
+            {"type":"text","text":"last"}
+        ]);
+        assert_eq!(text(&v).as_deref(), Some("first\noutput\nlast"));
+    }
+    #[test]
+    fn discovery_is_sorted_deduplicated_and_skips_symlinks() {
+        let dir = crate::test_support::TempDir::new("discovery").unwrap();
+        let a = dir.jsonl("a.jsonl", &["{}"]).unwrap();
+        dir.jsonl("z.jsonl", &["{}"]).unwrap();
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+        let found = discover_jsonl(&[dir.path().to_owned(), a]).unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found[0].path < found[1].path);
+    }
+    #[test]
+    fn timestamp_preserves_offset_and_subseconds() {
+        let value = serde_json::json!("2026-09-14T21:01:00.123456789+02:00");
+        let utc = serde_json::json!("2026-09-14T19:01:00.123456789Z");
+        assert_eq!(timestamp(Some(&value)), timestamp(Some(&utc)));
+        assert_eq!(
+            timestamp(Some(&value))
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos(),
+            123456789
+        );
+    }
 }
