@@ -77,11 +77,11 @@ Exclude tool protocol metadata, JSON structure, UUIDs, and irrelevant fields fro
 
 ## 10. Storage optimization
 
-Extract primarily user/assistant text and useful human-readable tool results. Exclude tool IDs, token accounting, protocol structure, tool arguments, and internal events. The source's example of 1 GB raw history containing 400 MB useful text is illustrative, not a measured guarantee. Avoid unnecessary transcript duplication; store no vectors.
+Product refinement (September 14, 2026): index user messages and assistant replies to the user only. Exclude tool calls and results (including loaded files and command output), reasoning, system/developer messages, token accounting, and internal events. Preserve code deliberately written in a user message or assistant reply. Search supports all conversation text, user messages only, or assistant replies only. The source's example of 1 GB raw history containing 400 MB useful text is illustrative, not a measured guarantee. Avoid unnecessary transcript duplication; store no vectors.
 
 ## 11. Conversation chunks
 
-A normal unit approximates a user turn plus assistant response rather than each JSONL event. Split long conversations into bounded chunks.
+A chunk contains text from one speaker so role filters apply to the actual matching text. Split long messages into bounded chunks and preserve the speaker across incremental restarts. Original conversation preview can include both speakers around a match.
 
 ```rust
 struct SearchChunk {

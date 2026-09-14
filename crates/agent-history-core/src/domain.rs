@@ -99,6 +99,7 @@ pub struct Session {
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct ConversationChunk {
     pub session_id: SessionId,
+    pub kind: EventKind,
     pub ordinal: u64,
     pub timestamp: Option<SystemTime>,
     pub source: SourceRef,
@@ -112,6 +113,7 @@ pub struct SearchResult {
     pub branch: Option<String>,
     pub cwd: Option<PathBuf>,
     pub timestamp: Option<SystemTime>,
+    pub kind: EventKind,
     pub source: SourceRef,
     pub snippet: String,
 }

@@ -8,7 +8,7 @@ Build bounded conversation chunks with resumable turn state.
 
 ## Scope
 
-- Group user turns with assistant responses and useful tool output; split oversized turns at deterministic boundaries.
+- Keep user and assistant text in separate speaker-qualified chunks; exclude tool output and split oversized messages at deterministic boundaries (September 14 product refinement).
 - Retain timestamps and exact source ranges; normalize whitespace without losing meaningful search terms.
 - Define how the final open turn is extended after an append or process restart, without duplicating searchable text.
 
@@ -16,7 +16,7 @@ Build bounded conversation chunks with resumable turn state.
 
 - [ ] Whole-file indexing and indexing the same bytes in arbitrary append batches produce equivalent chunks/search results.
 - [ ] Restart mid-turn and assistant-only continuation tests pass.
-- [ ] Chunk and tool-output size limits are explicit; source ranges round-trip Unicode and multi-record turns.
+- [ ] Chunk size limits are explicit; source ranges round-trip Unicode and multi-record messages; tool output is excluded.
 
 ## Dependencies
 

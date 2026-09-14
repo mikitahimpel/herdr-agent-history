@@ -52,22 +52,52 @@ impl AgentAdapter for CodexAdapter {
             cwd: string(payload.get("cwd")).map(PathBuf::from),
             started_at: timestamp(v.get("timestamp")),
         };
+        let channel = payload
+            .get("channel")
+            .or_else(|| v.get("channel"))
+            .and_then(|x| x.as_str());
+        let recipient = payload
+            .get("recipient")
+            .or_else(|| v.get("recipient"))
+            .and_then(|x| x.as_str());
+        let user_facing = matches!(channel, None | Some("final" | "commentary"))
+            && matches!(recipient, None | Some("all"));
         // Codex can emit both response_item and event_msg for one message. event_msg is a
         // transport mirror, so only response_item conversational records are indexed.
         let (kind, content) = match (
             typ.as_deref(),
             string(v.get("role").or_else(|| payload.get("role"))).as_deref(),
         ) {
-            (Some("response_item"), Some("user")) | (Some("message"), Some("user")) => (
+            (Some("response_item"), Some("user"))
+                if payload.get("type").and_then(|v| v.as_str()) == Some("message") =>
+            {
+                (
+                    EventKind::User,
+                    payload.get("content").or_else(|| v.get("content")),
+                )
+            }
+            (Some("response_item"), Some("assistant"))
+                if payload.get("type").and_then(|v| v.as_str()) == Some("message")
+                    && user_facing =>
+            {
+                (
+                    EventKind::Assistant,
+                    payload.get("content").or_else(|| v.get("content")),
+                )
+            }
+            (Some("message"), Some("user")) => (
                 EventKind::User,
                 payload.get("content").or_else(|| v.get("content")),
             ),
-            (Some("response_item"), Some("assistant")) | (Some("message"), Some("assistant")) => (
+            (Some("message"), Some("assistant")) if user_facing => (
                 EventKind::Assistant,
                 payload.get("content").or_else(|| v.get("content")),
             ),
             (Some("response_item"), _) if payload.get("output").is_some() => {
-                (EventKind::ToolResult, payload.get("output"))
+                return Ok(ParsedRecord {
+                    metadata,
+                    events: vec![],
+                });
             }
             _ => {
                 return Ok(ParsedRecord {
@@ -128,6 +158,26 @@ mod tests {
         let r = br#"{"type":"event_msg","payload":{"type":"agent_message","message":"duplicate"}}"#;
         assert!(CodexAdapter::with_root(".")
             .parse_record(&session(), r, source("x".as_ref(), 1, 0, r.len()))
+            .unwrap()
+            .events
+            .is_empty());
+    }
+    #[test]
+    fn excludes_analysis_and_tool_output() {
+        let adapter = CodexAdapter::with_root(".");
+        let analysis = br#"{"type":"response_item","payload":{"type":"message","role":"assistant","channel":"analysis","content":"private"}}"#;
+        assert!(adapter
+            .parse_record(
+                &session(),
+                analysis,
+                source("x".as_ref(), 1, 0, analysis.len())
+            )
+            .unwrap()
+            .events
+            .is_empty());
+        let tool = br#"{"type":"response_item","payload":{"type":"function_call_output","output":"secret"}}"#;
+        assert!(adapter
+            .parse_record(&session(), tool, source("x".as_ref(), 1, 0, tool.len()))
             .unwrap()
             .events
             .is_empty());

@@ -15,8 +15,8 @@ fn fixture() -> (agent_history_core::test_support::TempDir, PathBuf, PathBuf) {
     fs::write(
         codex.join("codex-session.jsonl"),
         br#"{"type":"session_meta","payload":{"id":"codex-session","cwd":"/tmp"}}
-{"type":"response_item","role":"user","payload":{"content":"portfolio visibility"}}
-{"type":"response_item","role":"assistant","payload":{"content":"Codex answer"}}
+{"type":"response_item","role":"user","payload":{"type":"message","content":"portfolio visibility"}}
+{"type":"response_item","role":"assistant","payload":{"type":"message","content":"Codex answer"}}
 "#,
     )
     .unwrap();
@@ -54,6 +54,18 @@ fn index_search_status_preview_and_append_work_across_processes() {
     assert!(text.contains("Claude"));
     assert!(text.contains("Codex"));
     assert!(text.contains("2026-09-14T12:00:00"));
+    for (query, role, matches) in [
+        ("portfolio", "user", true),
+        ("portfolio", "assistant", false),
+        ("answer", "assistant", true),
+        ("answer", "user", false),
+    ] {
+        let out = run(&db, &claude, &codex, &["search", query, "--role", role]);
+        assert!(out.status.success());
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(text.contains("Claude"), matches);
+        assert_eq!(text.contains("Codex"), matches);
+    }
     let out = run(&db, &claude, &codex, &["status"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("sessions: 2"));

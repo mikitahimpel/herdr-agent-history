@@ -37,10 +37,14 @@ See [overlay controls and recovery](docs/HERDR_PLUGIN.md) for keyboard behavior 
 ```sh
 agent-history index
 agent-history search "portfolio visibility"
+agent-history search "portfolio visibility" --role user
+agent-history search "portfolio visibility" --role assistant
 agent-history status
 agent-history preview claude <native-session-id>
 agent-history preview codex <native-session-id>
 ```
+
+Search includes user messages and assistant replies, excluding tool calls/results, loaded files, reasoning, and system/developer messages. Code deliberately included in a message remains searchable. Use `--role user`, `--role assistant`, or `--role all` (the default); in the overlay, **F2** cycles the same filters. **Down/Tab** focuses results, **Space** previews, and **Esc** goes back.
 
 Search uses SQLite FTS5: ordinary terms, quoted phrases, prefixes such as `portfolio*`, and boolean operators. Shell quoting must preserve FTS phrase quotes, for example `agent-history search '"portfolio visibility"'`.
 

@@ -11,6 +11,7 @@ Implement ranked FTS5 search with snippets.
 - Implement normal term queries, explicit phrase/prefix syntax, BM25 ordering, snippet generation, limits, and stable tie-breaking.
 - Join results to session/agent/Git context and exact source references; define repeated matches within one session.
 - Bound input and handle invalid FTS syntax as a user-facing result rather than a crash.
+- Filter matches by user messages, assistant replies, or both; the matched text must belong to the selected speaker, not an adjacent turn.
 
 ## Acceptance criteria
 

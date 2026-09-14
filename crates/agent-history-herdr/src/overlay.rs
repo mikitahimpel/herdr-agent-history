@@ -4,7 +4,7 @@ use crate::{
     resume_in_host, HostRuntime,
 };
 use agent_history_core::{
-    preview::preview_source, CoreError, IndexStore, Result, SearchResult, Session, Store,
+    preview::preview_source, CoreError, EventKind, IndexStore, Result, SearchResult, Session, Store,
 };
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OverlayKey {
@@ -16,6 +16,37 @@ pub enum OverlayKey {
     Enter,
     Esc,
     Tab,
+    F2,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RoleFilter {
+    #[default]
+    All,
+    User,
+    Assistant,
+}
+impl RoleFilter {
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::User,
+            Self::User => Self::Assistant,
+            Self::Assistant => Self::All,
+        }
+    }
+    pub fn event_kind(self) -> Option<EventKind> {
+        match self {
+            Self::All => None,
+            Self::User => Some(EventKind::User),
+            Self::Assistant => Some(EventKind::Assistant),
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::User => "User",
+            Self::Assistant => "Assistant",
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Mode {
@@ -39,10 +70,11 @@ pub struct OverlayState {
     pub closed: bool,
     pub recovery: Vec<RecoveryChoice>,
     pub status: String,
+    pub role_filter: RoleFilter,
 }
 impl OverlayState {
     pub fn refresh<S: Store>(&mut self, store: &S) {
-        match store.search(&self.query, 50) {
+        match store.search_with_role(&self.query, 50, self.role_filter.event_kind()) {
             Ok(items) => {
                 self.results = items;
                 self.selected = self.selected.min(self.results.len().saturating_sub(1));
@@ -165,8 +197,8 @@ impl OverlayState {
                     OverlayKey::Esc => self.mode = Mode::Results,
                     OverlayKey::Up => self.preview_scroll = self.preview_scroll.saturating_sub(1),
                     OverlayKey::Down => {
-                        self.preview_scroll = (self.preview_scroll + 1)
-                            .min(self.preview.lines().count().saturating_sub(1))
+                        // The renderer clamps against wrapped display lines at the current width.
+                        self.preview_scroll = self.preview_scroll.saturating_add(1)
                     }
                     OverlayKey::Enter => self.resume(store, host)?,
                     _ => {}
@@ -194,6 +226,11 @@ impl OverlayState {
                 } else {
                     Mode::Query
                 }
+            }
+            OverlayKey::F2 => {
+                self.role_filter = self.role_filter.next();
+                self.selected = 0;
+                self.refresh(store);
             }
             OverlayKey::Space if self.mode == Mode::Results => self.show_preview(store)?,
             OverlayKey::Space => {
@@ -229,6 +266,19 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn role_filter_cycles_and_maps_to_event_kinds() {
+        assert_eq!(RoleFilter::All.next(), RoleFilter::User);
+        assert_eq!(RoleFilter::User.next(), RoleFilter::Assistant);
+        assert_eq!(RoleFilter::Assistant.next(), RoleFilter::All);
+        assert_eq!(RoleFilter::All.event_kind(), None);
+        assert_eq!(RoleFilter::User.event_kind(), Some(EventKind::User));
+        assert_eq!(
+            RoleFilter::Assistant.event_kind(),
+            Some(EventKind::Assistant)
+        );
+    }
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {

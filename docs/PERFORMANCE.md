@@ -14,7 +14,11 @@ cargo build --release --example benchmark -p agent-history-core
 
 The example creates 100 Claude and 100 Codex JSONL files, with 100 user/assistant turns per file, under a temporary directory. Each run removes that directory at process exit. It asserts 200 discovered files and sessions, nonzero chunks, complete append accounting, and successful search results before printing measurements. The 200 search calls use ten varied terms and run after indexing, so these are warm in-process FTS timings.
 
-## macOS measurement
+## Current conversation-only schema 3 measurement
+
+The same synthetic corpus now produces 40,000 initial speaker-separated chunks (40,001 after append). A fresh Apple Silicon release run measured initial indexing at 1,487.216 ms, the 449-byte append at 55.460 ms, warm search p50/p95 at 26.191/26.828 ms, and maximum RSS at 12,140,544 bytes. SQLite plus WAL/SHM occupied 31,289,296 bytes (1.794 times raw input). This corpus contains user/assistant prose and no large tool outputs, so it measures the cost of role separation rather than storage savings from excluding tools. Native-history performance remains unmeasured for this build.
+
+## Earlier schema 2 macOS measurement
 
 Environment: macOS, `aarch64` (Apple Silicon). Command: `/usr/bin/time -l ./target/release/examples/benchmark`. The benchmark output was:
 

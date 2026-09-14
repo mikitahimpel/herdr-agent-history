@@ -73,12 +73,33 @@ pub struct IndexBatch {
 }
 pub trait Store {
     fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>>;
+    fn search_with_role(
+        &self,
+        query: &str,
+        limit: usize,
+        kind: Option<EventKind>,
+    ) -> Result<Vec<SearchResult>> {
+        if kind.is_some() {
+            return Err(CoreError::Unsupported(
+                "this store does not support role filters".into(),
+            ));
+        }
+        self.search(query, limit)
+    }
     /// Commits file progress, metadata, removals, inserts, and open-turn state atomically.
     fn commit_batch(&mut self, batch: IndexBatch) -> Result<()>;
 }
 impl<T: Store + ?Sized> Store for &mut T {
     fn search(&self, q: &str, l: usize) -> Result<Vec<SearchResult>> {
         (**self).search(q, l)
+    }
+    fn search_with_role(
+        &self,
+        q: &str,
+        l: usize,
+        k: Option<EventKind>,
+    ) -> Result<Vec<SearchResult>> {
+        (**self).search_with_role(q, l, k)
     }
     fn commit_batch(&mut self, b: IndexBatch) -> Result<()> {
         (**self).commit_batch(b)

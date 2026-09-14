@@ -45,7 +45,15 @@ impl AgentAdapter for ClaudeAdapter {
             cwd,
             started_at: timestamp(v.get("timestamp")),
         };
-        let mut kind = match string(v.get("type")).as_deref() {
+        if v.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
+            || v.get("is_meta").and_then(|v| v.as_bool()) == Some(true)
+        {
+            return Ok(ParsedRecord {
+                metadata,
+                events: vec![],
+            });
+        }
+        let kind = match string(v.get("type")).as_deref() {
             Some("user") => EventKind::User,
             Some("assistant") => EventKind::Assistant,
             _ => {
@@ -57,6 +65,7 @@ impl AgentAdapter for ClaudeAdapter {
         };
         let msg = v.get("message").unwrap_or(&v);
         let content = msg.get("content").unwrap_or(msg);
+        // Tool results and tool calls are protocol traffic, not conversation text.
         if kind == EventKind::User
             && content.as_array().is_some_and(|blocks| {
                 !blocks.is_empty()
@@ -65,7 +74,10 @@ impl AgentAdapter for ClaudeAdapter {
                         .all(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
             })
         {
-            kind = EventKind::ToolResult;
+            return Ok(ParsedRecord {
+                metadata,
+                events: vec![],
+            });
         }
         let mut events = Vec::new();
         if let Some(s) = text(content) {
@@ -119,5 +131,21 @@ mod tests {
         assert!(ClaudeAdapter::with_root(".")
             .parse_record(&session(), b"{", source("x".as_ref(), 1, 0, 1))
             .is_err());
+    }
+    #[test]
+    fn excludes_meta_and_tool_result_but_keeps_mixed_user_text() {
+        let adapter = ClaudeAdapter::with_root(".");
+        let meta = br#"{"type":"user","isMeta":true,"message":{"content":"hidden"}}"#;
+        assert!(adapter
+            .parse_record(&session(), meta, source("x".as_ref(), 1, 0, meta.len()))
+            .unwrap()
+            .events
+            .is_empty());
+        let mixed = br#"{"type":"user","message":{"content":[{"type":"text","text":"question"},{"type":"tool_result","content":[{"type":"text","text":"secret output"}]}]}}"#;
+        let parsed = adapter
+            .parse_record(&session(), mixed, source("x".as_ref(), 1, 0, mixed.len()))
+            .unwrap();
+        assert_eq!(parsed.events[0].text, "question");
+        assert!(!parsed.events[0].text.contains("secret"));
     }
 }

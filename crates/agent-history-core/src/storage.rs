@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const VERSION: i32 = 2;
+const VERSION: i32 = 3;
 const MAX_LIMIT: usize = 1000;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -107,9 +107,11 @@ impl SqliteStore {
         Ok(())
     }
     fn migrate(&mut self) -> Result<()> {
-        let version: i32 = self
+        // Serialize migration and re-read the version after acquiring the writer lock.
+        let tx = self
             .conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version > VERSION {
             return Err(CoreError::Unsupported(format!(
                 "database schema version {version} is newer than supported"
@@ -121,19 +123,28 @@ impl SqliteStore {
                     .into(),
             ));
         }
+        if version == 2 {
+            // Old chunks mix speakers/tools. Keep captured source/session context but rebuild
+            // searchable text using the checkpoint format marker on the next indexing pass.
+            tx.execute_batch("DROP TRIGGER chunks_ad;
+                DELETE FROM search_chunks;
+                INSERT INTO chunks_fts(chunks_fts) VALUES('delete-all');
+                CREATE TRIGGER chunks_ad AFTER DELETE ON search_chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES ('delete',old.rowid,old.text); END;
+                ALTER TABLE search_chunks ADD COLUMN kind INTEGER NOT NULL DEFAULT -1 CHECK(kind IN (0,1));
+                PRAGMA user_version=3;")?;
+        }
         if version == 0 {
-            let tx = self.conn.transaction()?;
             tx.execute_batch("\
                 CREATE TABLE sessions (agent INTEGER NOT NULL, native_id TEXT NOT NULL, source_path TEXT NOT NULL, source_file_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_start INTEGER NOT NULL DEFAULT 0, source_end INTEGER NOT NULL DEFAULT 0, cwd TEXT, repository TEXT, repository_root TEXT, worktree TEXT, branch TEXT, commit_hash TEXT, started_at INTEGER, ended_at INTEGER, git_observed_at INTEGER, PRIMARY KEY(agent,native_id));
                 CREATE TABLE indexed_files (path TEXT PRIMARY KEY, file_id INTEGER NOT NULL, generation INTEGER NOT NULL, committed_offset INTEGER NOT NULL, size INTEGER NOT NULL, modified INTEGER, open_turn_state BLOB);
-                CREATE TABLE search_chunks (rowid INTEGER PRIMARY KEY, agent INTEGER NOT NULL, native_id TEXT NOT NULL, ordinal INTEGER NOT NULL, timestamp INTEGER, source_path TEXT NOT NULL, source_file_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_start INTEGER NOT NULL, source_end INTEGER NOT NULL, text TEXT NOT NULL, FOREIGN KEY(agent,native_id) REFERENCES sessions(agent,native_id) ON DELETE CASCADE, UNIQUE(agent,native_id,source_file_id,source_generation,ordinal));
+                CREATE TABLE search_chunks (rowid INTEGER PRIMARY KEY, agent INTEGER NOT NULL, native_id TEXT NOT NULL, ordinal INTEGER NOT NULL, timestamp INTEGER, kind INTEGER NOT NULL CHECK(kind IN (0,1)), source_path TEXT NOT NULL, source_file_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_start INTEGER NOT NULL, source_end INTEGER NOT NULL, text TEXT NOT NULL, FOREIGN KEY(agent,native_id) REFERENCES sessions(agent,native_id) ON DELETE CASCADE, UNIQUE(agent,native_id,source_file_id,source_generation,ordinal));
                 CREATE VIRTUAL TABLE chunks_fts USING fts5(text, content='search_chunks', content_rowid='rowid', tokenize='unicode61');
                 CREATE TRIGGER chunks_ai AFTER INSERT ON search_chunks BEGIN INSERT INTO chunks_fts(rowid,text) VALUES (new.rowid,new.text); END;
                 CREATE TRIGGER chunks_ad AFTER DELETE ON search_chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES ('delete',old.rowid,old.text); END;
                 CREATE TRIGGER chunks_au AFTER UPDATE ON search_chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES ('delete',old.rowid,old.text); INSERT INTO chunks_fts(rowid,text) VALUES (new.rowid,new.text); END;
-                PRAGMA user_version=2;")?;
-            tx.commit()?;
+                PRAGMA user_version=3;")?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -170,6 +181,14 @@ impl SqliteStore {
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
         <Self as Store>::search(self, query, limit)
     }
+    pub fn search_with_role(
+        &self,
+        query: &str,
+        limit: usize,
+        kind: Option<crate::EventKind>,
+    ) -> Result<Vec<SearchResult>> {
+        <Self as Store>::search_with_role(self, query, limit, kind)
+    }
     pub fn commit_batch(&mut self, batch: IndexBatch) -> Result<()> {
         <Self as Store>::commit_batch(self, batch)
     }
@@ -180,6 +199,12 @@ impl Store for SqliteStore {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version != VERSION {
+            return Err(CoreError::Unsupported(format!(
+                "database schema version {version} changed; reopen the index"
+            )));
+        }
         if let (Some(expected), Some(file)) = (&batch.expected_file, &batch.file) {
             let actual = tx.query_row("SELECT path,file_id,generation,committed_offset,size,modified FROM indexed_files WHERE path=?", [pstr(&file.path)], row_file).optional()?;
             if &actual != expected {
@@ -214,7 +239,7 @@ impl Store for SqliteStore {
             tx.execute("INSERT INTO sessions(agent,native_id,source_path,source_file_id,source_generation,source_start,source_end,cwd,repository,repository_root,worktree,branch,commit_hash,started_at,ended_at,git_observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent,native_id) DO UPDATE SET source_path=excluded.source_path,source_file_id=excluded.source_file_id,source_generation=excluded.source_generation,source_start=excluded.source_start,source_end=excluded.source_end,cwd=excluded.cwd,repository=excluded.repository,repository_root=excluded.repository_root,worktree=excluded.worktree,branch=excluded.branch,commit_hash=excluded.commit_hash,started_at=excluded.started_at,ended_at=excluded.ended_at,git_observed_at=excluded.git_observed_at",params![agent_i(s.id.agent),s.id.native_id,pstr(&s.source.path),s.source.file_id,s.source.generation,s.source.byte_range.start,s.source.byte_range.end,optp(&s.cwd),s.repository,s.repository_root.as_ref().map(|p|pstr(p)),s.worktree.as_ref().map(|p|pstr(p)),s.branch,s.commit,ts(s.started_at),ts(s.ended_at),ts(s.git_observed_at)])?;
         }
         for c in batch.chunks {
-            tx.execute("INSERT INTO search_chunks(agent,native_id,ordinal,timestamp,source_path,source_file_id,source_generation,source_start,source_end,text) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent,native_id,source_file_id,source_generation,ordinal) DO UPDATE SET timestamp=excluded.timestamp,source_path=excluded.source_path,source_file_id=excluded.source_file_id,source_generation=excluded.source_generation,source_start=excluded.source_start,source_end=excluded.source_end,text=excluded.text",params![agent_i(c.session_id.agent),c.session_id.native_id,c.ordinal,ts(c.timestamp),pstr(&c.source.path),c.source.file_id,c.source.generation,c.source.byte_range.start,c.source.byte_range.end,c.text])?;
+            tx.execute("INSERT INTO search_chunks(agent,native_id,ordinal,timestamp,kind,source_path,source_file_id,source_generation,source_start,source_end,text) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent,native_id,source_file_id,source_generation,ordinal) DO UPDATE SET timestamp=excluded.timestamp,kind=excluded.kind,source_path=excluded.source_path,source_file_id=excluded.source_file_id,source_generation=excluded.source_generation,source_start=excluded.source_start,source_end=excluded.source_end,text=excluded.text",params![agent_i(c.session_id.agent),c.session_id.native_id,c.ordinal,ts(c.timestamp),kind_i(c.kind),pstr(&c.source.path),c.source.file_id,c.source.generation,c.source.byte_range.start,c.source.byte_range.end,c.text])?;
         }
         if let Some(f) = batch.file {
             tx.execute("INSERT INTO indexed_files(path,file_id,generation,committed_offset,size,modified,open_turn_state) VALUES(?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET file_id=excluded.file_id,generation=excluded.generation,committed_offset=excluded.committed_offset,size=excluded.size,modified=excluded.modified,open_turn_state=excluded.open_turn_state",params![pstr(&f.path),f.file_id,f.generation,f.committed_offset,f.size,ts(f.modified),batch.open_turn_state])?;
@@ -223,30 +248,42 @@ impl Store for SqliteStore {
         Ok(())
     }
     fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        self.search_with_role(query, limit, None)
+    }
+    fn search_with_role(
+        &self,
+        query: &str,
+        limit: usize,
+        role: Option<crate::EventKind>,
+    ) -> Result<Vec<SearchResult>> {
         if query.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let limit = limit.min(MAX_LIMIT);
-        let mut st=self.conn.prepare("SELECT c.agent,c.native_id,s.repository,s.branch,s.cwd,c.timestamp,c.source_path,c.source_file_id,c.source_generation,c.source_start,c.source_end,snippet(chunks_fts,0,'','', ' … ', 24) FROM chunks_fts JOIN search_chunks c ON c.rowid=chunks_fts.rowid JOIN sessions s ON s.agent=c.agent AND s.native_id=c.native_id WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts),c.agent,c.native_id,c.ordinal LIMIT ?")?;
+        let mut st=self.conn.prepare("SELECT c.agent,c.native_id,s.repository,s.branch,s.cwd,c.timestamp,c.kind,c.source_path,c.source_file_id,c.source_generation,c.source_start,c.source_end,snippet(chunks_fts,0,'','', ' … ', 24) FROM chunks_fts JOIN search_chunks c ON c.rowid=chunks_fts.rowid JOIN sessions s ON s.agent=c.agent AND s.native_id=c.native_id WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?) ORDER BY bm25(chunks_fts),c.agent,c.native_id,c.ordinal LIMIT ?")?;
         let rows = st
-            .query_map(params![query, limit as i64], |r| {
-                Ok(SearchResult {
-                    session_id: SessionId::new(agent_from(r.get(0)?)?, r.get::<_, String>(1)?),
-                    agent: agent_from(r.get(0)?)?,
-                    repository: r.get(2)?,
-                    branch: r.get(3)?,
-                    cwd: r.get::<_, Option<String>>(4)?.map(PathBuf::from),
-                    timestamp: from_ts(r.get(5)?),
-                    source: crate::SourceRef::new(
-                        PathBuf::from(r.get::<_, String>(6)?),
-                        r.get(7)?,
-                        r.get(8)?,
-                        r.get(9)?..r.get(10)?,
-                    )
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    snippet: r.get(11)?,
-                })
-            })?
+            .query_map(
+                params![query, role.map(kind_i), role.map(kind_i), limit as i64],
+                |r| {
+                    Ok(SearchResult {
+                        session_id: SessionId::new(agent_from(r.get(0)?)?, r.get::<_, String>(1)?),
+                        agent: agent_from(r.get(0)?)?,
+                        repository: r.get(2)?,
+                        branch: r.get(3)?,
+                        cwd: r.get::<_, Option<String>>(4)?.map(PathBuf::from),
+                        timestamp: from_ts(r.get(5)?),
+                        kind: kind_from(r.get(6)?)?,
+                        source: crate::SourceRef::new(
+                            PathBuf::from(r.get::<_, String>(7)?),
+                            r.get(8)?,
+                            r.get(9)?,
+                            r.get(10)?..r.get(11)?,
+                        )
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        snippet: r.get(12)?,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -340,6 +377,21 @@ fn agent_from(v: i64) -> rusqlite::Result<Agent> {
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
+fn kind_i(k: crate::EventKind) -> i64 {
+    match k {
+        crate::EventKind::User => 0,
+        crate::EventKind::Assistant => 1,
+        crate::EventKind::ToolResult => 2,
+    }
+}
+fn kind_from(v: i64) -> rusqlite::Result<crate::EventKind> {
+    match v {
+        0 => Ok(crate::EventKind::User),
+        1 => Ok(crate::EventKind::Assistant),
+        2 => Ok(crate::EventKind::ToolResult),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -370,6 +422,7 @@ mod tests {
     ) -> ConversationChunk {
         ConversationChunk {
             session_id: id.clone(),
+            kind: crate::EventKind::User,
             ordinal,
             timestamp: None,
             source: SourceRef::new(
@@ -398,6 +451,29 @@ mod tests {
         assert_eq!(db.search("\"portfolio visibility\"", 10).unwrap().len(), 1);
         assert_eq!(db.search("portfol*", 10).unwrap().len(), 1);
         assert_eq!(db.search("portfolio AND visibility", 10).unwrap().len(), 1);
+        let assistant = ConversationChunk {
+            kind: crate::EventKind::Assistant,
+            ordinal: 1,
+            ..chunk(&s.id, 7, 1, 1, "portfolio visibility")
+        };
+        db.commit_batch(IndexBatch {
+            chunks: vec![assistant],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            db.search_with_role("portfolio", 10, Some(crate::EventKind::User))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.search_with_role("portfolio", 10, Some(crate::EventKind::Assistant))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.search_with_role("portfolio", 10, None).unwrap().len(), 2);
         assert!(db.search("portfolio", 10).unwrap()[0]
             .snippet
             .contains("portfolio"));
@@ -423,6 +499,7 @@ mod tests {
         let s = session(Agent::Codex, "two", 8, 1);
         let bad = ConversationChunk {
             session_id: s.id.clone(),
+            kind: crate::EventKind::User,
             ordinal: 0,
             timestamp: None,
             source: SourceRef::new("/tmp/native.jsonl", 8, 1, 0..0).unwrap(),

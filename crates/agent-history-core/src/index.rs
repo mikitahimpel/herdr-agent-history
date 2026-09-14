@@ -12,7 +12,10 @@ use std::{
     os::unix::fs::MetadataExt,
     path::Path,
 };
+const CHECKPOINT_FORMAT_VERSION: u32 = 1;
 pub const DEFAULT_MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
+const PROGRESS_RECORD_INTERVAL: u64 = 128;
+const PROGRESS_BYTE_INTERVAL: u64 = 1024 * 1024;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexReport {
     pub bytes_read: u64,
@@ -24,8 +27,28 @@ pub struct IndexReport {
     pub failed_files: u64,
     pub errors: Vec<String>,
 }
+/// A snapshot of indexing work, safe to display without exposing source paths or transcript text.
+///
+/// Counts are cumulative for the complete call: `total_files` is the number of discovered files,
+/// while the `agent_*` fields apply to the agent named by `agent`. Completed files include failed
+/// attempts; `failed_files` counts failed discovery or file attempts. `records`, `bytes_read`, and
+/// `chunks` count work observed so far, including work in the current file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexProgress {
+    pub agent: crate::Agent,
+    pub completed_files: u64,
+    pub total_files: u64,
+    pub agent_completed_files: u64,
+    pub agent_total_files: u64,
+    pub bytes_read: u64,
+    pub records: u64,
+    pub chunks: u64,
+    pub failed_files: u64,
+}
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Checkpoint {
+    #[serde(default)]
+    pub format_version: u32,
     pub session: Session,
     pub builder: Vec<u8>,
     pub dev: u64,
@@ -114,6 +137,14 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
         discovered: &SessionFile,
         cache: &mut HashMap<std::path::PathBuf, crate::GitContext>,
     ) -> Result<IndexReport> {
+        self.index_with_cache_progress(discovered, cache, &mut |_, _, _| {})
+    }
+    fn index_with_cache_progress(
+        &mut self,
+        discovered: &SessionFile,
+        cache: &mut HashMap<std::path::PathBuf, crate::GitContext>,
+        progress: &mut dyn FnMut(u64, u64, u64),
+    ) -> Result<IndexReport> {
         let path = &discovered.path;
         let mut file = File::open(path)?;
         let meta = file.metadata()?;
@@ -140,8 +171,13 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
             None => false,
         };
         let append = prior.as_ref().is_some_and(|(f, _)| meta.len() > f.size) && valid;
-        let rebuild = !(valid && (unchanged || append));
-        if valid
+        let same_content = valid && (unchanged || append);
+        let current_format = checkpoint
+            .as_ref()
+            .is_some_and(|c| c.format_version == CHECKPOINT_FORMAT_VERSION);
+        let rebuild = !(same_content && current_format);
+        if current_format
+            && valid
             && unchanged
             && prior
                 .as_ref()
@@ -176,15 +212,19 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
                 &checkpoint.as_ref().unwrap().builder,
             )?
         };
-        let mut session = if rebuild {
+        let mut session = if rebuild && !same_content {
             Session::placeholder(self.adapter.agent(), path, fid, generation)
         } else {
+            // A format-only rebuild must not erase captured Git context for a deleted cwd.
             checkpoint.unwrap().session
         };
         file.seek(SeekFrom::Start(start))?;
         let mut reader = BufReader::new(file.take(meta.len() - start));
         let mut cursor = start;
         let mut chunks = Vec::new();
+        let mut pending_bytes = 0;
+        let mut pending_records = 0;
+        let mut reported_chunks = 0;
         let mut report = IndexReport {
             files: 1,
             ..Default::default()
@@ -192,12 +232,20 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
         loop {
             let (line, n, complete) = record(&mut reader, self.max_record_bytes)?;
             report.bytes_read += n;
+            pending_bytes += n;
             if !complete {
                 break;
             }
             if n > self.max_record_bytes as u64 + 1 {
                 report.malformed_records += 1;
                 cursor += n;
+                if pending_bytes >= PROGRESS_BYTE_INTERVAL {
+                    let new_chunks = chunks.len() as u64 - reported_chunks;
+                    progress(pending_bytes, pending_records, new_chunks);
+                    reported_chunks = chunks.len() as u64;
+                    pending_bytes = 0;
+                    pending_records = 0;
+                }
                 continue;
             }
             let source = SourceRef::new(path, fid, generation, cursor..cursor + n - 1).unwrap();
@@ -207,6 +255,7 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
             {
                 Ok(parsed) => {
                     report.records += 1;
+                    pending_records += 1;
                     if let Some(id) = parsed.metadata.native_id {
                         session.id = SessionId::new(self.adapter.agent(), id)
                     }
@@ -225,6 +274,19 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
                 Err(e) => return Err(e),
             }
             cursor += n;
+            if pending_records >= PROGRESS_RECORD_INTERVAL
+                || pending_bytes >= PROGRESS_BYTE_INTERVAL
+            {
+                let new_chunks = chunks.len() as u64 - reported_chunks;
+                progress(pending_bytes, pending_records, new_chunks);
+                reported_chunks = chunks.len() as u64;
+                pending_bytes = 0;
+                pending_records = 0;
+            }
+        }
+        let new_chunks = chunks.len() as u64 - reported_chunks;
+        if pending_bytes != 0 || pending_records != 0 || new_chunks != 0 {
+            progress(pending_bytes, pending_records, new_chunks);
         }
         let mut file = reader.into_inner().into_inner();
         if !same(&meta, &file.metadata()?) || !same(&meta, &fs::metadata(path)?) {
@@ -257,6 +319,7 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
             ));
         }
         let state = serde_json::to_vec(&Checkpoint {
+            format_version: CHECKPOINT_FORMAT_VERSION,
             session: session.clone(),
             builder: builder.state()?,
             dev: meta.dev(),
@@ -301,33 +364,110 @@ pub fn index_all<S: IndexStore>(
     store: &mut S,
     adapters: &[Box<dyn AgentAdapter>],
 ) -> Result<IndexReport> {
+    index_all_with_progress(store, adapters, |_| {})
+}
+
+/// Index all discovered files and report bounded, cumulative progress snapshots.
+pub fn index_all_with_progress<S: IndexStore, C: FnMut(IndexProgress)>(
+    store: &mut S,
+    adapters: &[Box<dyn AgentAdapter>],
+    mut callback: C,
+) -> Result<IndexReport> {
     let mut total = IndexReport::default();
     let mut cache = HashMap::new();
+    let mut discovered = Vec::with_capacity(adapters.len());
+    let mut total_files = 0u64;
+    let mut completed_files = 0u64;
     for adapter in adapters {
-        let files = match adapter.discover() {
-            Ok(f) => f,
+        match adapter.discover() {
+            Ok(files) => {
+                total_files += files.len() as u64;
+                discovered.push((adapter, files));
+            }
             Err(e) => {
                 total.failed_files += 1;
                 if total.errors.len() < 32 {
                     total.errors.push(e.to_string())
                 }
-                continue;
+                discovered.push((adapter, Vec::new()));
             }
-        };
+        }
+    }
+    for (adapter, files) in discovered {
+        let mut agent_completed_files = 0u64;
+        let agent_total_files = files.len() as u64;
+        callback(IndexProgress {
+            agent: adapter.agent(),
+            completed_files,
+            total_files,
+            agent_completed_files,
+            agent_total_files,
+            bytes_read: total.bytes_read,
+            records: total.records,
+            chunks: total.chunks,
+            failed_files: total.failed_files,
+        });
         for file in files {
-            match Indexer::new(adapter.as_ref(), &mut *store).index_with_cache(&file, &mut cache) {
+            let mut file_bytes = 0;
+            let mut file_records = 0;
+            let mut file_chunks = 0;
+            let mut emit = |bytes, records, chunks| {
+                file_bytes += bytes;
+                file_records += records;
+                file_chunks += chunks;
+                callback(IndexProgress {
+                    agent: adapter.agent(),
+                    completed_files,
+                    total_files,
+                    agent_completed_files,
+                    agent_total_files,
+                    bytes_read: total.bytes_read + file_bytes,
+                    records: total.records + file_records,
+                    chunks: total.chunks + file_chunks,
+                    failed_files: total.failed_files,
+                });
+            };
+            match Indexer::new(adapter.as_ref(), &mut *store)
+                .index_with_cache_progress(&file, &mut cache, &mut emit)
+            {
                 Ok(r) => {
                     total.bytes_read += r.bytes_read;
                     total.records += r.records;
                     total.malformed_records += r.malformed_records;
                     total.chunks += r.chunks;
                     total.files += 1;
+                    completed_files += 1;
+                    agent_completed_files += 1;
+                    callback(IndexProgress {
+                        agent: adapter.agent(),
+                        completed_files,
+                        total_files,
+                        agent_completed_files,
+                        agent_total_files,
+                        bytes_read: total.bytes_read,
+                        records: total.records,
+                        chunks: total.chunks,
+                        failed_files: total.failed_files,
+                    });
                 }
                 Err(e) => {
                     total.failed_files += 1;
                     if total.errors.len() < 32 {
                         total.errors.push(format!("{}: {e}", file.path.display()))
                     }
+                    completed_files += 1;
+                    agent_completed_files += 1;
+                    callback(IndexProgress {
+                        agent: adapter.agent(),
+                        completed_files,
+                        total_files,
+                        agent_completed_files,
+                        agent_total_files,
+                        bytes_read: total.bytes_read,
+                        records: total.records,
+                        chunks: total.chunks,
+                        failed_files: total.failed_files,
+                    });
                 }
             }
         }
@@ -394,7 +534,7 @@ mod tests {
         fs::create_dir(&claude).unwrap();
         fs::create_dir(&codex).unwrap();
         fs::write(claude.join("one.jsonl"), line("user", "claudeword ☃")).unwrap();
-        fs::write(codex.join("two.jsonl"),"{\"type\":\"session_meta\",\"payload\":{\"id\":\"real-codex\",\"cwd\":\"/nonexistent/synthetic\"}}\n{\"type\":\"response_item\",\"payload\":{\"role\":\"assistant\",\"content\":\"codexword\"}}\n").unwrap();
+        fs::write(codex.join("two.jsonl"),"{\"type\":\"session_meta\",\"payload\":{\"id\":\"real-codex\",\"cwd\":\"/nonexistent/synthetic\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"codexword\"}}\n").unwrap();
         let mut db = db(&d);
         let adapters: Vec<Box<dyn AgentAdapter>> = vec![
             Box::new(ClaudeAdapter::with_root(claude)),
@@ -454,7 +594,7 @@ mod tests {
             .unwrap();
         assert_eq!(session.cwd, Some("/nonexistent/synthetic".into()));
         assert_eq!(session.source.byte_range.end, p.metadata().unwrap().len());
-        assert_eq!(store.status().unwrap().chunks, 2);
+        assert_eq!(store.status().unwrap().chunks, 3);
         let mut whole = SqliteStore::open(d.path().join("other/index.sqlite")).unwrap();
         Indexer::new(&adapter, &mut whole)
             .index_file(&discovered(&p))
@@ -581,6 +721,27 @@ mod tests {
     struct Mixed {
         paths: Vec<SessionFile>,
     }
+
+    struct MixedAgent {
+        agent: crate::Agent,
+        paths: Vec<SessionFile>,
+    }
+    impl AgentAdapter for MixedAgent {
+        fn agent(&self) -> crate::Agent {
+            self.agent
+        }
+        fn discover(&self) -> Result<Vec<SessionFile>> {
+            Ok(self.paths.clone())
+        }
+        fn parse_record(
+            &self,
+            s: &Session,
+            r: &[u8],
+            src: SourceRef,
+        ) -> Result<crate::ParsedRecord> {
+            ClaudeAdapter::new([]).parse_record(s, r, src)
+        }
+    }
     impl AgentAdapter for Mixed {
         fn agent(&self) -> crate::Agent {
             crate::Agent::Claude
@@ -610,6 +771,75 @@ mod tests {
         assert_eq!(r.failed_files, 1);
         assert_eq!(r.errors.len(), 1);
         assert_eq!(store.search("goodword", 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn progress_reports_start_bounded_work_and_completion() {
+        let d = TempDir::new("progress").unwrap();
+        let p = d.path().join("many.jsonl");
+        let mut contents = String::new();
+        for n in 0..300 {
+            contents.push_str(&line("user", &format!("word{n}")));
+        }
+        fs::write(&p, contents).unwrap();
+        let mut store = db(&d);
+        let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(Mixed {
+            paths: vec![discovered(&p)],
+        })];
+        let mut snapshots = Vec::new();
+        let report =
+            index_all_with_progress(&mut store, &adapters, |progress| snapshots.push(progress))
+                .unwrap();
+        assert_eq!(report.files, 1);
+        assert!(snapshots.len() >= 4, "start, bounded updates, completion");
+        assert_eq!(snapshots[0].total_files, 1);
+        assert_eq!(snapshots[0].agent_total_files, 1);
+        assert_eq!(snapshots[0].completed_files, 0);
+        let final_progress = snapshots.last().unwrap();
+        assert_eq!(final_progress.completed_files, 1);
+        assert_eq!(final_progress.total_files, 1);
+        assert_eq!(final_progress.agent_completed_files, 1);
+        assert_eq!(final_progress.records, report.records);
+        assert_eq!(final_progress.bytes_read, report.bytes_read);
+        assert_eq!(final_progress.chunks, report.chunks);
+        assert!(snapshots.iter().all(|p| p.failed_files == 0));
+    }
+
+    #[test]
+    fn progress_tracks_agent_counts_and_failed_attempts() {
+        let d = TempDir::new("progress-failures").unwrap();
+        let good = d.path().join("good.jsonl");
+        fs::write(&good, line("user", "goodword")).unwrap();
+        let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+            Box::new(MixedAgent {
+                agent: crate::Agent::Claude,
+                paths: vec![discovered(&d.path().join("missing")), discovered(&good)],
+            }),
+            Box::new(MixedAgent {
+                agent: crate::Agent::Codex,
+                paths: vec![],
+            }),
+        ];
+        let mut store = db(&d);
+        let mut snapshots = Vec::new();
+        let report = index_all_with_progress(&mut store, &adapters, |p| snapshots.push(p)).unwrap();
+        assert_eq!(report.files, 1);
+        assert_eq!(report.failed_files, 1);
+        let claude_done = snapshots
+            .iter()
+            .rev()
+            .find(|p| p.agent == crate::Agent::Claude && p.agent_completed_files == 2)
+            .unwrap();
+        assert_eq!(claude_done.agent_total_files, 2);
+        assert_eq!(claude_done.completed_files, 2);
+        assert_eq!(claude_done.total_files, 2);
+        assert_eq!(claude_done.failed_files, 1);
+        let codex_start = snapshots
+            .iter()
+            .find(|p| p.agent == crate::Agent::Codex)
+            .unwrap();
+        assert_eq!(codex_start.agent_total_files, 0);
+        assert_eq!(codex_start.total_files, 2);
     }
 }
 

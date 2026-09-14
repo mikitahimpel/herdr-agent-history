@@ -3,7 +3,6 @@ use crate::{ConversationChunk, EventKind, NormalizedEvent, Result, SessionId, So
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MAX_CHUNK_BYTES: usize = 16 * 1024;
-pub const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OpenTurnState {
@@ -16,6 +15,7 @@ pub struct OpenTurnState {
     pub start: u64,
     pub end: u64,
     pub text: String,
+    pub kind: EventKind,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BuilderState {
@@ -87,12 +87,10 @@ impl ChunkBuilder {
         if event.text.trim().is_empty() {
             return out;
         }
+        if event.kind == EventKind::ToolResult {
+            return out;
+        }
         let text = normalize(&event.text);
-        let text = if event.kind == EventKind::ToolResult {
-            truncate_bytes(&text, MAX_TOOL_OUTPUT_BYTES)
-        } else {
-            text
-        };
         if let Some(p) = &self.pending {
             let same = p.file_id == event.source.file_id
                 && p.generation == event.source.generation
@@ -104,6 +102,9 @@ impl ChunkBuilder {
                 out.extend(self.push(event));
                 return out;
             }
+        }
+        if self.pending.as_ref().is_some_and(|p| p.kind != event.kind) {
+            out.extend(self.finish());
         }
         if event.kind == EventKind::User
             && self.pending.as_ref().is_some_and(|p| !p.text.is_empty())
@@ -126,6 +127,7 @@ impl ChunkBuilder {
             start: event.source.byte_range.start,
             end: event.source.byte_range.end,
             text: String::new(),
+            kind: event.kind,
         });
         if !p.text.is_empty() {
             p.text.push('\n');
@@ -183,6 +185,7 @@ impl ChunkBuilder {
             }),
             source,
             text: p.text,
+            kind: p.kind,
         }]
     }
 }
@@ -193,13 +196,6 @@ impl Default for ChunkBuilder {
 }
 fn normalize(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-fn truncate_bytes(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_owned()
-    } else {
-        format!("{}…", &s[..s.floor_char_boundary(max.saturating_sub(3))])
-    }
 }
 fn split_utf8(s: &str, max: usize) -> impl Iterator<Item = &str> {
     let mut at = 0;
@@ -325,12 +321,13 @@ mod tests {
             Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(7))
         );
         let mut b = ChunkBuilder::from_state(DEFAULT_MAX_CHUNK_BYTES, &b.state().unwrap()).unwrap();
-        assert!(b
-            .push(ev("s", EventKind::Assistant, "answer", 20))
-            .is_empty());
+        let emitted = b.push(ev("s", EventKind::Assistant, "answer", 20));
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].kind, EventKind::User);
         let current = b.snapshot().unwrap();
-        assert_eq!(current.ordinal, snapshot.ordinal);
-        assert_eq!(current.text, "question\nanswer");
-        assert_eq!(current.source.byte_range, 0..26);
+        assert_ne!(current.ordinal, snapshot.ordinal);
+        assert_eq!(current.kind, EventKind::Assistant);
+        assert_eq!(current.text, "answer");
+        assert_eq!(current.source.byte_range, 20..26);
     }
 }

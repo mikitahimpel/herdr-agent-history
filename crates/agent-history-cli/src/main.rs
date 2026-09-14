@@ -1,5 +1,5 @@
 use agent_history_core::adapters::{ClaudeAdapter, CodexAdapter};
-use agent_history_core::{Agent, AgentAdapter, SqliteStore};
+use agent_history_core::{Agent, AgentAdapter, EventKind, SqliteStore};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -47,6 +47,7 @@ struct Options {
     codex_root: Option<PathBuf>,
     query: Vec<String>,
     positional: Vec<String>,
+    role: Option<EventKind>,
 }
 impl Options {
     fn parse(args: &[String]) -> Result<Self, String> {
@@ -54,6 +55,20 @@ impl Options {
         let mut i = 0;
         while i < args.len() {
             let a = &args[i];
+            if a == "--role" {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--role requires all, user, or assistant".to_string())?;
+                o.role = match value.to_ascii_lowercase().as_str() {
+                    "all" => None,
+                    "user" => Some(EventKind::User),
+                    "assistant" => Some(EventKind::Assistant),
+                    _ => return Err("--role must be all, user, or assistant".into()),
+                };
+                i += 1;
+                continue;
+            }
             let target = match a.as_str() {
                 "--db" => &mut o.db,
                 "--claude-root" => &mut o.claude_root,
@@ -119,7 +134,7 @@ fn search(db: PathBuf, o: Options) -> Result<(), String> {
     }
     let store = open(&db)?;
     let results = store
-        .search(&o.query.join(" "), 50)
+        .search_with_role(&o.query.join(" "), 50, o.role)
         .map_err(|e| sanitize(&e.to_string()))?;
     for (i, r) in results.iter().enumerate() {
         let agent = match r.agent {
@@ -127,9 +142,10 @@ fn search(db: PathBuf, o: Options) -> Result<(), String> {
             Agent::Codex => "Codex",
         };
         println!(
-            "{}\t{}\t{} / {}\t{}\t{}\t{}:{}-{}\t{}",
+            "{}\t{}\t{}\t{} / {}\t{}\t{}\t{}:{}-{}\t{}",
             i + 1,
             agent,
+            role_name(r.kind),
             sanitize(r.repository.as_deref().unwrap_or("-")),
             sanitize(r.branch.as_deref().unwrap_or("-")),
             sanitize(&r.session_id.native_id),
@@ -208,6 +224,37 @@ fn sanitize(s: &str) -> String {
         })
         .collect()
 }
+fn role_name(kind: EventKind) -> &'static str {
+    match kind {
+        EventKind::User => "User",
+        EventKind::Assistant => "Assistant",
+        EventKind::ToolResult => "Tool",
+    }
+}
 fn print_help() {
     println!("agent-history {VERSION}\n\nUSAGE:\n  agent-history <command> [options]\n\nCOMMANDS:\n  index                 Index Claude and Codex sessions\n  search <query>        Search indexed conversations\n  status                Show index counts and database size\n  preview <agent> <id>  Preview a native session\n\nOPTIONS:\n  --db <path>           SQLite database path\n  --claude-root <path>  Claude projects root\n  --codex-root <path>   Codex sessions root\n  -h, --help            Show help\n  -V, --version         Show version");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_role_filter_without_consuming_query() {
+        let args = vec![
+            "--role".into(),
+            "assistant".into(),
+            "multiword".into(),
+            "query".into(),
+        ];
+        let options = Options::parse(&args).unwrap();
+        assert_eq!(options.role, Some(EventKind::Assistant));
+        assert_eq!(options.query, vec!["multiword", "query"]);
+    }
+
+    #[test]
+    fn rejects_unknown_role() {
+        let args = vec!["--role".into(), "tools".into(), "query".into()];
+        assert!(Options::parse(&args).is_err());
+    }
 }

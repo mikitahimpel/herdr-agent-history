@@ -72,8 +72,6 @@ pub(crate) fn text(v: &serde_json::Value) -> Option<String> {
                     x.get("text")
                         .and_then(|t| t.as_str())
                         .map(ToOwned::to_owned)
-                } else if kind == "tool_result" {
-                    x.get("content").and_then(text)
                 } else {
                     None
                 }
@@ -102,7 +100,7 @@ mod tests {
             {"type":"tool_result","content":[{"type":"text","text":"output"}]},
             {"type":"text","text":"last"}
         ]);
-        assert_eq!(text(&v).as_deref(), Some("first\noutput\nlast"));
+        assert_eq!(text(&v).as_deref(), Some("first\nlast"));
     }
     #[test]
     fn discovery_is_sorted_deduplicated_and_skips_symlinks() {

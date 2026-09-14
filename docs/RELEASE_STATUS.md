@@ -12,7 +12,7 @@ V1 is **not released** and GitHub issue #13 remains open. The repository now con
 | --- | --- | --- |
 | #7 Foundation | Shared types/contracts, isolated fixtures, CI definition, local quality gate | Remote CI execution not verified |
 | #1 Ingestion | Claude/Codex adapters, synthetic fixtures, bounded resumable chunks | Real native-format compatibility evidence |
-| #2 SQLite/FTS | Schema 2, external-content FTS, search/ranking, atomic source-scoped updates | Broader real-corpus measurements |
+| #2 SQLite/FTS | Schema 3, role-filtered external-content FTS, search/ranking, atomic source-scoped updates | Broader real-corpus measurements |
 | #3 Incremental indexing | Committed offsets, partial-record retry, replacement handling, concurrent-writer checks | Documented interior rewrite/regrow limitation |
 | #4 Git context | Main/linked/bare/separate Git directory tests; preserved observations | Index-time metadata is not proof of historical branch state |
 | #5 CLI | Cross-process index/search/status/preview/append tests | Real-history user validation |
@@ -29,11 +29,16 @@ All GitHub issues were inspected as the source backlog. No issue was closed, PR 
 ## Validation evidence
 
 - `./scripts/setup` enabled the pre-push hook.
-- `./scripts/check` passed formatting, Clippy with warnings denied, all 64 tests (45 core, 16 host/controller, 3 CLI), and the release build using the lockfile.
+- `./scripts/check` passed formatting, Clippy with warnings denied, all 74 tests (51 core, 18 host/controller/renderer, 5 CLI), and the release build using the lockfile.
 - Core regressions cover source identity, generation, partial Unicode records, rollback and competing writers, both adapters, normalized previews, and selected-source session context.
 - Host tests cover exact live-session matching, safe command construction, UI effects, explicit recovery cancellation/confirmation, locked and existing worktree targets, and preserving the original checkout.
-- The release overlay was exercised in a synthetic PTY: activation, a multiword query, result focus, original conversation preview, back navigation, and terminal cleanup. No native agent was launched.
+- The current release overlay passed a synthetic PTY interaction check: a 200,000-tool-record startup displayed live elapsed/per-agent progress; F2 restricted visible results to User then Assistant; original preview excluded tools and scrolled to the end of a long wrapped reply; Esc preserved the query/filter and Ctrl-C exited cleanly. No native agent was launched.
+- Independent conversation-flow tests verify both agents’ role filters, excluded tool/reasoning traffic, source immutability, append/restart, and schema 2 upgrade with captured context retained.
 - Packaging smoke installs/uninstalls into an isolated prefix and checks that unrelated output files and synthetic native history remain intact.
+
+## Conversation-only update (September 14)
+
+The current build excludes tool traffic and supports All/User/Assistant search filters (F2 in the overlay; `--role` in the CLI), wrapped results and previews, and live startup progress. Schema 2 is automatically rebuilt into speaker-separated schema 3 while retaining captured source/session context. Close older clients before launching the updated build. The current schema 3 synthetic run measured search p50/p95 at 26.191/26.828 ms and initial indexing at 1,487.216 ms; the earlier measurements below remain historical. See PERFORMANCE.md for the current storage and append measurements.
 
 ## Measurements
 
@@ -49,7 +54,7 @@ Continue acceptance from a Herdr-managed task with installed Claude Code/Codex i
 
 - Only sampled boundaries verify prior content during append; arbitrary interior rewrite followed by regrowth can evade detection. Same-size changes and ordinary replacements/truncations are covered.
 - Renamed sources retain unavailable old-path search rows alongside the new path.
-- Initial activation indexing is synchronous and has no cancellation or per-file progress callback. Derived chunks are retained per file until commit, so memory grows with that file's extracted text.
+- Initial activation indexing is synchronous; elapsed time and per-agent/file progress are visible, but search waits for the scan and there is no cancellation API. Derived chunks are retained per file until commit, so memory grows with that file's extracted text.
 - The overlay is a terminal plugin, not an in-process native Herdr widget. Herdr 0.7.1 is the target; later CLI changes require compatibility work.
 - Safe worktree recreation uses the captured commit in detached HEAD state; it does not recreate uncommitted changes or reconstruct unavailable commits.
 - The package is a local candidate, not a published, clean-install-certified release.

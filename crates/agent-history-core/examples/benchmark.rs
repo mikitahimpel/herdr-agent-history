@@ -111,10 +111,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let status = store.status()?;
     assert_eq!(initial.files, FILES_PER_AGENT as u64 * 2);
     assert_eq!(initial.records, 40_100);
-    assert_eq!(initial.chunks, 20_000);
+    assert_eq!(initial.chunks, 40_000);
     assert_eq!(initial.failed_files, 0);
     assert_eq!(status.sessions, FILES_PER_AGENT as u64 * 2);
-    assert_eq!(status.chunks, 20_000);
+    assert_eq!(status.chunks, 40_000);
 
     let append_path = &claude_paths[0];
     let append = line(
@@ -143,7 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let final_status = store.status()?;
     assert_eq!(incremental.records, 1);
     assert_eq!(final_status.sessions, 200);
-    assert_eq!(final_status.chunks, 20_001);
+    assert_eq!(final_status.chunks, 40_001);
 
     let queries = [
         "portfolio",
