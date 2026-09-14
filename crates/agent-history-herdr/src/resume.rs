@@ -10,7 +10,7 @@ pub struct NativeResumePlan {
 impl NativeResumePlan {
     pub fn for_session(session: &Session) -> Result<Self> {
         let id = &session.id.native_id;
-        if id.is_empty() || id.chars().any(char::is_control) {
+        if !is_uuid(id) {
             return Err(CoreError::Unsupported(
                 "native session ID is missing or invalid; refusing to start a new session".into(),
             ));
@@ -26,12 +26,24 @@ impl NativeResumePlan {
     }
 }
 
+fn is_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23].into_iter().all(|i| bytes[i] == b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| [8, 13, 18, 23].contains(&i) || b.is_ascii_hexdigit())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceRecord {
     pub id: String,
     pub cwd: std::path::PathBuf,
     #[serde(default)]
     pub root_pane_id: Option<String>,
+    #[serde(default)]
+    pub root_pane_occupied: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,16 +79,22 @@ mod tests {
     #[test]
     fn plans_only_verified_native_commands() {
         assert_eq!(
-            NativeResumePlan::for_session(&session(Agent::Claude, "c1"))
-                .unwrap()
-                .argv,
-            ["claude", "--resume", "c1"]
+            NativeResumePlan::for_session(&session(
+                Agent::Claude,
+                "00000000-0000-4000-8000-000000000001"
+            ))
+            .unwrap()
+            .argv,
+            ["claude", "--resume", "00000000-0000-4000-8000-000000000001"]
         );
         assert_eq!(
-            NativeResumePlan::for_session(&session(Agent::Codex, "x1"))
-                .unwrap()
-                .argv,
-            ["codex", "resume", "x1"]
+            NativeResumePlan::for_session(&session(
+                Agent::Codex,
+                "00000000-0000-4000-8000-000000000002"
+            ))
+            .unwrap()
+            .argv,
+            ["codex", "resume", "00000000-0000-4000-8000-000000000002"]
         );
     }
 

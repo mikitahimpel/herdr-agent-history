@@ -58,6 +58,7 @@ pub fn plan_recreate(session: &Session) -> Result<GitRecreationPlan> {
             root.display().to_string(),
             "worktree".into(),
             "add".into(),
+            "--".into(),
             path.display().to_string(),
             revision,
         ],
