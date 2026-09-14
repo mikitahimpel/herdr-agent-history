@@ -1,10 +1,30 @@
 # V1 implementation backlog
 
-Publication status: **pending**. GitHub file and issue writes were rejected by the session approval policy. These are publication-ready issue definitions, not existing GitHub issues.
+GitHub issues [#1–#13](https://github.com/mikitahimpel/herdr-agent-history/issues) are the authoritative V1 backlog. The smaller work items below elaborate their scope; they are not separately published issues.
 
 Repository: https://github.com/mikitahimpel/herdr-agent-history
 
-The bootstrap creates three Rust crates, CI, formatting/lint/test/build gate, a local pre-push hook, and agent instructions. Features remain unimplemented. Server-side required checks are not enabled yet.
+The bootstrap creates three Rust crates, CI, formatting/lint/test/build gate, a local pre-push hook, and agent instructions. Shared domain contracts are implemented; product integration and the release gate remain pending. Server-side required checks have not been verified.
+
+## GitHub issue mapping
+
+| GitHub issue | Detailed work items below |
+| --- | --- |
+| #7 Foundation | foundation |
+| #1 Ingestion | fixtures, claude, codex, chunks |
+| #2 Storage/search | storage, search |
+| #3 Incremental indexing | incremental, mutations |
+| #4 Git context | git-context |
+| #5 CLI | cli, preview |
+| #8 Core integration | lifecycle, performance (core measurements) |
+| #9 Native resume compatibility | resume-agents |
+| #6 Herdr integration | host-contract, restore-existing, restore-deleted, overlay, overlay-actions |
+| #11 Safeguards | privacy, restoration and corruption safeguards |
+| #10 Packaging | release (installation/artifacts) |
+| #12 Documentation | release (usage/troubleshooting) |
+| #13 Release gate | performance, release (end-to-end evidence) |
+
+Implementation does not imply acceptance: real native-agent/Herdr validation and clean macOS installation evidence are required before closing dependent release issues.
 
 ## Work items
 
