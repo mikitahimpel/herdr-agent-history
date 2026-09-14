@@ -67,9 +67,20 @@ pub(crate) fn text(v: &serde_json::Value) -> Option<String> {
     if let Some(a) = v.as_array() {
         let s = a
             .iter()
-            .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join("");
+            .filter_map(|x| {
+                let kind = x.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if matches!(kind, "text" | "input_text" | "output_text") {
+                    x.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(ToOwned::to_owned)
+                } else if kind == "tool_result" {
+                    x.get("content").and_then(text)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
         if !s.is_empty() {
             return Some(s);
         }

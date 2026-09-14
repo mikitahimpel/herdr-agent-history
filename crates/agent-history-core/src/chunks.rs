@@ -18,6 +18,11 @@ pub struct OpenTurnState {
     pub text: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct BuilderState {
+    next_ordinal: u64,
+    pending: Option<OpenTurnState>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionIdState {
     pub agent: String,
     pub native_id: String,
@@ -40,27 +45,38 @@ impl ChunkBuilder {
         Self::new(DEFAULT_MAX_CHUNK_BYTES)
     }
     pub fn from_state(max_bytes: usize, bytes: &[u8]) -> Result<Self> {
-        let pending = if bytes.is_empty() {
-            None
+        let state: BuilderState = if bytes.is_empty() {
+            BuilderState {
+                next_ordinal: 0,
+                pending: None,
+            }
         } else {
-            Some(
-                serde_json::from_slice(bytes)
-                    .map_err(|e| crate::CoreError::InvalidRecord(e.to_string()))?,
-            )
+            serde_json::from_slice(bytes)
+                .map_err(|e| crate::CoreError::InvalidRecord(e.to_string()))?
         };
+        if state.next_ordinal > 1_000_000_000
+            || state.pending.as_ref().is_some_and(|p| {
+                p.text.len() > max_bytes.max(4) * 2
+                    || p.start > p.end
+                    || !matches!(p.session_id.agent.as_str(), "Claude" | "Codex")
+            })
+        {
+            return Err(crate::CoreError::InvalidRecord(
+                "invalid open turn state".into(),
+            ));
+        }
         Ok(Self {
             max_bytes: max_bytes.max(4),
-            pending,
-            next_ordinal: 0,
+            pending: state.pending,
+            next_ordinal: state.next_ordinal,
         })
     }
     pub fn state(&self) -> Result<Vec<u8>> {
-        self.pending
-            .as_ref()
-            .map(|s| {
-                serde_json::to_vec(s).map_err(|e| crate::CoreError::InvalidRecord(e.to_string()))
-            })
-            .unwrap_or_else(|| Ok(Vec::new()))
+        serde_json::to_vec(&BuilderState {
+            next_ordinal: self.next_ordinal,
+            pending: self.pending.clone(),
+        })
+        .map_err(|e| crate::CoreError::InvalidRecord(e.to_string()))
     }
     pub fn push(&mut self, event: NormalizedEvent) -> Vec<ConversationChunk> {
         let mut out = Vec::new();
@@ -97,7 +113,10 @@ impl ChunkBuilder {
                 native_id: event.session_id.native_id.clone(),
             },
             ordinal: self.next_ordinal,
-            timestamp_millis: None,
+            timestamp_millis: event
+                .timestamp
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i128),
             source_path: event.source.path.to_string_lossy().into_owned(),
             file_id: event.source.file_id,
             generation: event.source.generation,
@@ -117,27 +136,43 @@ impl ChunkBuilder {
             for part in split_utf8(&full, self.max_bytes) {
                 let mut q = p.clone();
                 q.text = part.to_owned();
-                out.extend(Self::emit(q));
+                q.ordinal = self.next_ordinal;
                 self.next_ordinal += 1;
+                out.extend(Self::emit(q));
             }
             self.pending = None;
         }
         out
     }
     pub fn finish(&mut self) -> Vec<ConversationChunk> {
-        self.pending.take().map(Self::emit).unwrap_or_default()
+        self.pending
+            .take()
+            .map(|mut p| {
+                p.ordinal = self.next_ordinal;
+                self.next_ordinal += 1;
+                Self::emit(p)
+            })
+            .unwrap_or_default()
     }
     fn emit(p: OpenTurnState) -> Vec<ConversationChunk> {
         let agent = match p.session_id.agent.as_str() {
             "Claude" => crate::Agent::Claude,
             _ => crate::Agent::Codex,
         };
-        let source = SourceRef::new(p.source_path, p.file_id, p.generation, p.start..p.end)
-            .expect("builder range");
+        let source = match SourceRef::new(p.source_path, p.file_id, p.generation, p.start..p.end) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
         vec![ConversationChunk {
             session_id: SessionId::new(agent, p.session_id.native_id),
             ordinal: p.ordinal,
-            timestamp: None,
+            timestamp: p.timestamp_millis.and_then(|m| {
+                if m >= 0 {
+                    Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(m as u64))
+                } else {
+                    None
+                }
+            }),
             source,
             text: p.text,
         }]
@@ -173,4 +208,57 @@ fn split_utf8(s: &str, max: usize) -> impl Iterator<Item = &str> {
         at = e;
         Some(r)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn ev(id: &str, kind: EventKind, text: &str, start: u64) -> NormalizedEvent {
+        NormalizedEvent {
+            session_id: SessionId::new(crate::Agent::Claude, id),
+            kind,
+            timestamp: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(7)),
+            source: SourceRef::new("f", 1, 0, start..start + text.len() as u64).unwrap(),
+            text: text.into(),
+        }
+    }
+    #[test]
+    fn ordinals_are_unique_across_turns_and_splits() {
+        let mut b = ChunkBuilder::new(8);
+        let mut out = b.push(ev("s", EventKind::User, "abcdefghijk", 0));
+        out.extend(b.push(ev("s", EventKind::User, "next", 20)));
+        out.extend(b.finish());
+        assert_eq!(
+            out.iter().map(|c| c.ordinal).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+    #[test]
+    fn state_round_trips_pending_and_empty() {
+        let mut b = ChunkBuilder::default();
+        let empty = b.state().unwrap();
+        let _ = ChunkBuilder::from_state(10, &empty).unwrap();
+        b.push(ev("s", EventKind::User, "pending", 0));
+        let bytes = b.state().unwrap();
+        let mut r = ChunkBuilder::from_state(100, &bytes).unwrap();
+        assert_eq!(r.finish()[0].text, "pending");
+    }
+    #[test]
+    fn unicode_small_limit_makes_progress() {
+        let mut b = ChunkBuilder::new(4);
+        let out = b.push(ev("s", EventKind::User, "☃☃", 0));
+        assert!(!out.is_empty());
+    }
+    #[test]
+    fn mismatched_source_flushes() {
+        let mut b = ChunkBuilder::default();
+        b.push(ev("s", EventKind::User, "one", 0));
+        let mut e = ev("s", EventKind::Assistant, "two", 20);
+        e.source = SourceRef::new("g", 2, 1, 20..23).unwrap();
+        assert_eq!(b.push(e).len(), 1);
+    }
+    #[test]
+    fn corrupt_state_is_error() {
+        assert!(ChunkBuilder::from_state(10, br#"{"next_ordinal":1,"pending":{"session_id":{"agent":"Other","native_id":"x"},"ordinal":0,"timestamp_millis":null,"source_path":"x","file_id":1,"generation":0,"start":4,"end":1,"text":"x"}}"#).is_err());
+    }
 }
