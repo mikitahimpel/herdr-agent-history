@@ -12,6 +12,21 @@ pub struct Preview {
     pub truncated_before: bool,
     pub truncated_after: bool,
 }
+
+/// Resolve the metadata belonging to this source, rather than another file with
+/// the same native session ID. Call `preview_source` to also verify the current
+/// native file before starting a resume operation.
+pub fn session_for_source<S: IndexStore>(store: &S, source: &SourceRef) -> Result<crate::Session> {
+    let (indexed, bytes) = store.indexed_file_state(&source.path)?.ok_or_else(stale)?;
+    if indexed.file_id != source.file_id
+        || indexed.generation != source.generation
+        || source.byte_range.start > source.byte_range.end
+        || source.byte_range.end > indexed.committed_offset
+    {
+        return Err(stale());
+    }
+    Ok(crate::index::decode(bytes.as_deref().ok_or_else(stale)?)?.session)
+}
 /// Verify the indexed generation and read complete records in a bounded window.
 /// Context and total read allocation are capped regardless of the source range.
 pub fn preview_source<S: IndexStore>(
@@ -127,4 +142,47 @@ fn sanitize(s: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod source_session_tests {
+    use super::*;
+    #[test]
+    fn duplicate_native_ids_resolve_the_selected_sources_context() {
+        let dir = crate::test_support::TempDir::new("source-session").unwrap();
+        let history = dir.path().join("histories");
+        std::fs::create_dir(&history).unwrap();
+        for (file, cwd, text) in [
+            ("a", "/missing/first", "firsttopic"),
+            ("b", "/missing/second", "secondtopic"),
+        ] {
+            let record = serde_json::json!({"type":"user", "sessionId":"same-native", "cwd":cwd, "message":{"content":text}});
+            std::fs::write(history.join(format!("{file}.jsonl")), format!("{record}\n")).unwrap();
+        }
+        let mut store = crate::SqliteStore::open(dir.path().join("private/index.sqlite")).unwrap();
+        crate::index::index_all(
+            &mut store,
+            &[Box::new(crate::adapters::ClaudeAdapter::with_root(history))],
+        )
+        .unwrap();
+        let first = store.search("firsttopic", 10).unwrap().remove(0);
+        assert_eq!(
+            session_for_source(&store, &first.source)
+                .unwrap()
+                .cwd
+                .as_deref(),
+            Some(std::path::Path::new("/missing/first"))
+        );
+        let second = store.search("secondtopic", 10).unwrap().remove(0);
+        assert_eq!(
+            session_for_source(&store, &second.source)
+                .unwrap()
+                .cwd
+                .as_deref(),
+            Some(std::path::Path::new("/missing/second"))
+        );
+        let mut stale_source = first.source;
+        stale_source.generation += 1;
+        assert!(session_for_source(&store, &stale_source).is_err());
+    }
 }

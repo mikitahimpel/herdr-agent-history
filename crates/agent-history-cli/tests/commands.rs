@@ -3,15 +3,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn fixture() -> (PathBuf, PathBuf, PathBuf) {
-    let root = std::env::temp_dir().join(format!("agent-history-cli-{}", std::process::id()));
-    let claude = root.join("claude");
-    let codex = root.join("codex");
+fn fixture() -> (agent_history_core::test_support::TempDir, PathBuf, PathBuf) {
+    let root = agent_history_core::test_support::TempDir::new("cli-fixture").unwrap();
+    let claude = root.path().join("claude");
+    let codex = root.path().join("codex");
     fs::create_dir_all(&claude).unwrap();
     fs::create_dir_all(&codex).unwrap();
-    let mut permissions = fs::metadata(&root).unwrap().permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&root, permissions).unwrap();
     fs::write(claude.join("claude-session.jsonl"), br#"{"type":"user","sessionId":"claude-session","message":{"content":"portfolio visibility"}}
 {"type":"assistant","sessionId":"claude-session","message":{"content":"Claude answer"}}
 "#).unwrap();
@@ -23,10 +20,8 @@ fn fixture() -> (PathBuf, PathBuf, PathBuf) {
 "#,
     )
     .unwrap();
-    (root.clone(), claude, codex)
+    (root, claude, codex)
 }
-
-use std::os::unix::fs::PermissionsExt;
 
 fn run(db: &Path, claude: &Path, codex: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_agent-history"))
@@ -46,7 +41,7 @@ fn run(db: &Path, claude: &Path, codex: &Path, args: &[&str]) -> std::process::O
 #[test]
 fn index_search_status_preview_and_append_work_across_processes() {
     let (root, claude, codex) = fixture();
-    let db = root.join("index.sqlite");
+    let db = root.path().join("private/index.sqlite");
     let out = run(&db, &claude, &codex, &["index"]);
     assert!(
         out.status.success(),
@@ -82,7 +77,6 @@ fn index_search_status_preview_and_append_work_across_processes() {
     assert!(out.status.success());
     let out = run(&db, &claude, &codex, &["search", "appended"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("appended"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -100,4 +94,25 @@ fn help_version_and_argument_errors_are_deterministic() {
         .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown option"));
+}
+
+#[test]
+fn missing_home_and_removed_reset_fail_without_modifying_files() {
+    let dir = agent_history_core::test_support::TempDir::new("cli-errors").unwrap();
+    let native = dir.path().join("history.jsonl");
+    fs::write(&native, "private fixture").unwrap();
+    let bin = env!("CARGO_BIN_EXE_agent-history");
+    let out = Command::new(bin)
+        .arg("status")
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let out = Command::new(bin)
+        .args(["reset", "--db"])
+        .arg(&native)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(fs::read_to_string(native).unwrap(), "private fixture");
 }
