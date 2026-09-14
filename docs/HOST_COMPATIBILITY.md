@@ -108,6 +108,13 @@ creation, and launch. This route is compatible with Herdr 0.7.x's published
 plugin contract, but its UI is a terminal pane rather than a native Herdr
 popup.
 
+The installed 0.7.1 binary confirms this route with `herdr plugin --help`, which
+exposes `plugin link`, `plugin list`, declared `plugin action`, and
+`plugin pane open|focus|close`. It does not expose `herdr api schema`; schema
+export is present in the inspected 0.7.5 source/docs and must therefore be
+treated as a newer-host convenience rather than a 0.7.1 prerequisite. The
+plugin CLI itself is sufficient for linking and operating a declared pane.
+
 If the requested overlay must be a native Herdr-rendered search surface with
 custom key handling, a companion Herdr change is required. The likely source
 areas to review are the existing overlay renderers under `src/ui/` (for example
@@ -129,6 +136,9 @@ recorded in an ADR before implementation.
 * A terminal-pane plugin is implementable against the current host contract.
   A native search overlay is blocked on a Herdr companion change because
   plugin v1 has no native non-terminal UI extension point.
+* Live socket/API probing was not performed: this checkout is outside a
+  Herdr-managed pane (`HERDR_ENV` is not set), and the Herdr control skill
+  requires that environment for inspecting a running session. No live server
+  was started.
 * No source/API was unavailable: a local Herdr source checkout and published
   source documentation were available for inspection.
-
