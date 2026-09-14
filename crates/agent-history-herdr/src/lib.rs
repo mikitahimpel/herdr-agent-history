@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Workspace {
+    pub id: String,
     pub cwd: PathBuf,
 }
 
 /// Host operations are intentionally narrow so core remains independent of Herdr.
 pub trait HostAdapter {
     fn workspaces(&self) -> Result<Vec<Workspace>>;
+    fn live_session(&self, workspace: &Workspace) -> Result<Option<agent_history_core::SessionId>>;
     fn focus_workspace(&self, workspace: &Workspace) -> Result<()>;
     fn open_workspace(&self, cwd: &Path) -> Result<Workspace>;
     fn start_session(&self, session: &Session, workspace: &Workspace) -> Result<()>;

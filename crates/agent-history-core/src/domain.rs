@@ -87,11 +87,13 @@ pub struct Session {
     pub source: SourceRef,
     pub cwd: Option<PathBuf>,
     pub repository: Option<String>,
+    pub repository_root: Option<PathBuf>,
     pub worktree: Option<PathBuf>,
     pub branch: Option<String>,
     pub commit: Option<String>,
     pub started_at: Option<SystemTime>,
     pub ended_at: Option<SystemTime>,
+    pub git_observed_at: Option<SystemTime>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConversationChunk {
@@ -154,11 +156,13 @@ mod tests {
             source: SourceRef::new("x", 1, 0, 0..0).unwrap(),
             cwd: None,
             repository: None,
+            repository_root: None,
             worktree: None,
             branch: None,
             commit: None,
             started_at: None,
             ended_at: None,
+            git_observed_at: None,
         };
         assert!(s.cwd.is_none());
     }

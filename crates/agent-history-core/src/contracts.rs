@@ -41,22 +41,18 @@ pub trait SessionResumer {
     fn resume(&self, session: &Session, workspace: &Path) -> Result<()>;
 }
 /// A transaction commits derived chunks and the last complete-record offset atomically.
-pub trait StoreTransaction {
-    fn upsert_session(&mut self, session: &Session) -> Result<()>;
-    fn append_chunk(&mut self, chunk: &ConversationChunk) -> Result<()>;
-    fn set_committed_offset(&mut self, offset: u64) -> Result<()>;
-    fn commit(self: Box<Self>) -> Result<()>;
-}
 #[derive(Clone, Debug, Default)]
 pub struct IndexBatch {
     pub file: Option<IndexedFile>,
     pub sessions: Vec<Session>,
     pub chunks: Vec<ConversationChunk>,
     pub replaced_chunks: Vec<(SessionId, u64)>,
+    /// Source identities whose derived chunks must be removed before inserts.
+    pub removed_sources: Vec<(u64, u64)>,
     pub open_turn_state: Option<Vec<u8>>,
 }
 pub trait Store {
-    fn begin(&mut self, file: &IndexedFile) -> Result<Box<dyn StoreTransaction + '_>>;
     fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>>;
+    /// Commits file progress, metadata, removals, inserts, and open-turn state atomically.
     fn commit_batch(&mut self, batch: IndexBatch) -> Result<()>;
 }

@@ -9,12 +9,21 @@ pub struct TempDir {
 }
 impl TempDir {
     pub fn new(prefix: &str) -> std::io::Result<Self> {
-        let path = std::env::temp_dir().join(format!(
-            "agent-history-{prefix}-{}",
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&path)?;
-        Ok(Self { path })
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        for _ in 0..100 {
+            let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("agent-history-{prefix}-{pid}-{nonce}"));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate isolated temp directory",
+        ))
     }
     pub fn path(&self) -> &Path {
         &self.path
