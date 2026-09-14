@@ -18,7 +18,12 @@ impl CommandRunner for ProcessRunner {
         let (program, args) = argv
             .split_first()
             .ok_or_else(|| CoreError::Unsupported("empty Herdr command".into()))?;
-        let output = std::process::Command::new(program)
+        let executable = if program == "herdr" {
+            std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| program.into())
+        } else {
+            program.into()
+        };
+        let output = std::process::Command::new(executable)
             .args(args)
             .output()
             .map_err(CoreError::Io)?;
@@ -102,11 +107,8 @@ impl<R: CommandRunner> HerdrCli<R> {
         session: &Session,
     ) -> Result<String> {
         let plan = NativeResumePlan::for_session(session)?;
-        if workspace.root_pane_occupied {
-            return Err(CoreError::Unsupported(
-                "Herdr workspace pane is occupied; refusing to replace a live agent".into(),
-            ));
-        }
+        // Herdr v0.7.1 starts a new split for --workspace; it never replaces
+        // an occupied pane. Explicit --focus makes Enter activate that split.
         let name = format!("agent-history-{}", &session.id.native_id[..8]);
         let mut argv = vec![
             "herdr".into(),
@@ -117,6 +119,7 @@ impl<R: CommandRunner> HerdrCli<R> {
             workspace.id.clone(),
             "--cwd".into(),
             workspace.cwd.display().to_string(),
+            "--focus".into(),
             "--".into(),
         ];
         argv.extend(plan.argv);
@@ -357,6 +360,7 @@ mod tests {
                 "w1",
                 "--cwd",
                 "/tmp/project",
+                "--focus",
                 "--",
                 "codex",
                 "resume",
@@ -420,21 +424,43 @@ mod tests {
     }
 
     #[test]
-    fn occupied_workspace_refuses_different_live_agent_before_start() {
+    fn occupied_workspace_starts_focused_split_without_writing_existing_pane() {
         let mut cli = queued(&[
             r#"{"result":{"workspaces":[{"workspace_id":"w1"}]}}"#,
             r#"{"result":{"panes":[{"pane_id":"w1:p1","cwd":"/tmp/project","agent":"claude"}]}}"#,
             r#"{"result":{}}"#,
             r#"{"result":{"agents":[{"workspace_id":"w1","pane_id":"w1:p1","agent":"claude","agent_session":{"source":"herdr:claude","agent":"claude","kind":"id","value":"00000000-0000-4000-8000-000000000006"}}]}}"#,
+            r#"{"result":{"agent":{}}}"#,
         ]);
-        let error = crate::resume_in_host_with_checker(
+        crate::resume_in_host_with_checker(
             &mut cli,
             &session(Agent::Codex, "00000000-0000-4000-8000-000000000007"),
             |_| true,
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("occupied"));
-        assert_eq!(cli.into_inner().commands.len(), 4);
+        .unwrap();
+        let commands = cli.into_inner().commands;
+        assert_eq!(commands.len(), 5);
+        assert_eq!(
+            commands[4],
+            [
+                "herdr",
+                "agent",
+                "start",
+                "agent-history-00000000",
+                "--workspace",
+                "w1",
+                "--cwd",
+                "/tmp/project",
+                "--focus",
+                "--",
+                "codex",
+                "resume",
+                "00000000-0000-4000-8000-000000000007"
+            ]
+        );
+        assert!(!commands.iter().any(|c| c
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "run" | "send" | "--pane"))));
     }
 
     #[test]

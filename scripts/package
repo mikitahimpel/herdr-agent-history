@@ -20,10 +20,10 @@ trap 'rm -rf "$stage"' EXIT INT TERM
 mkdir -p "$stage/agent-history/plugin" "$stage/agent-history/docs"
 cp target/release/agent-history "$stage/agent-history/"
 cp "$overlay" "$stage/agent-history/"
-cp README.md scripts/install scripts/uninstall "$stage/agent-history/"
-cp docs/TROUBLESHOOTING.md "$stage/agent-history/docs/"
+cp README.md AGENTS.md scripts/install scripts/uninstall "$stage/agent-history/"
+cp -R docs/. "$stage/agent-history/docs/"
 if [ ! -d plugin ]; then echo "package: host plugin folder is missing" >&2; exit 2; fi
 cp -R plugin/. "$stage/agent-history/plugin/"
 tar -C "$stage" -czf "$archive" agent-history
-shasum -a 256 "$archive" > "$archive.sha256"
+(cd "$out" && shasum -a 256 agent-history-macos-arm64.tar.gz) > "$archive.sha256"
 echo "created $archive"

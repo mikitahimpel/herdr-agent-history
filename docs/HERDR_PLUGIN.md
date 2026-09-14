@@ -1,45 +1,21 @@
-# Agent History Herdr plugin contract
+# Agent History Herdr plugin contract (#6)
 
-The current Herdr 0.7.1 CLI exposes plugin linking and terminal panes. Agent
-History can ship a companion plugin whose action opens a terminal overlay; the
-plugin process then runs the Agent History UI and calls Herdr's public CLI.
+The companion plugin in `plugin/agent-history/herdr-plugin.toml` opens the `agent-history-overlay` terminal pane through Herdr's public plugin surface. It targets the inspected Herdr 0.7.1 CLI. This is a terminal overlay, not an in-process native widget. The executable must be installed on the plugin process's PATH. Keybinding assignment remains a Herdr configuration step.
 
-Minimal manifest shape:
+The overlay opens `~/Library/Application Support/Herdr Agent History/index.sqlite` by default. `--db PATH` overrides `AGENT_HISTORY_DB`, which overrides that default. It discovers both native agents and performs an incremental activation scan before accepting queries, showing processed/failure/skipped-record counts and bounded errors. This scan is synchronous: initial indexing delays the interactive screen. There is no daemon or claimed async progress/cancellation implementation.
 
-```toml
-id = "agent-history"
-name = "Agent History"
-version = "0.1.0"
-min_herdr_version = "0.7.1"
-description = "Search and resume local Claude Code and Codex sessions"
-platforms = ["macos"]
+For isolated fixtures, `--claude-root PATH` and `--codex-root PATH` disable both agents' default root discovery and use only the explicitly supplied roots. `--help` opens neither histories nor the database.
 
-[[actions]]
-id = "open"
-title = "Open Agent History"
-contexts = ["global"]
-command = ["agent-history", "overlay"]
+Type a multiword query normally, including spaces. Down/Up or Tab focuses results; Space on focused results loads normalized, role-separated original transcript context through the core's verified preview API. Preview supports Up/Down scrolling and Esc returns to the retained query and selection. Enter validates the original source and loads the selected source's persisted session metadata before dispatching resume. Rows show agent, repository, branch, date, and snippet. Control characters are sanitized for rendering. Ctrl-C exits; a terminal guard restores raw/alternate-screen state on normal return, errors, and Rust unwinding.
 
-[[panes]]
-id = "search"
-title = "Agent History"
-placement = "overlay"
-command = ["agent-history", "overlay"]
-```
+Resume commands use separate argv entries and honor `HERDR_BIN_PATH` when supplied. The inspected Herdr syntax is `herdr agent start NAME --workspace ID --cwd PATH --focus -- NATIVE_ARGV`. The host coordinator focuses an exact `(agent, native session ID)` match; otherwise it creates or reuses the matching workspace and launches `claude --resume ID` or `codex resume ID`. An occupied workspace remains available: Herdr creates a new split for a new agent, and `--focus` activates it. No commands are sent to an existing pane. Invalid native IDs and stale/missing sources fail before host mutation.
 
-The exact action keybinding is configured by the user in Herdr's keybinding
-configuration or by the plugin's supported action declaration. The overlay
-process should use `HERDR_BIN_PATH` when invoking Herdr and preserve each
-argument as a separate argv item. The resume sequence is:
+A missing cwd opens explicit choices: resume in the available recorded repository, view original conversation, or cancel. Worktree recreation is offered only with an existing repository, an absolute recorded worktree path, an in-worktree cwd, and a full recorded commit hash. Choosing recreation displays the target and commit; only an explicit `y` response performs Git mutation. `n` or Esc cancels without effects.
 
-1. list workspaces and match the session's persisted cwd;
-2. focus the matching workspace, or create one with `workspace create --cwd`;
-3. inspect live agents and focus only an exact `(agent, native session ID)`;
-4. when no exact live match exists, start the agent with the verified native
-   argv (`claude --resume ID` or `codex resume ID`) in the returned shell pane;
-5. report an unavailable resume capability when the ID or workspace cannot be
-   resolved. Never start a plain Claude or Codex process as a fallback.
+Recreation validates commit availability, rejects existing targets and symlinks, rejects symlink traversal, and recreates a detached checkout at the captured commit. A missing but still registered target uses a single `--force` solely to replace that exact unlocked registration; locked registrations are refused. It never forces a branch, resets or prunes a repository, deletes paths, or overwrites an existing checkout. The repository's existing branch and checkout remain intact. The target parent must already exist. Missing commits, unavailable parents, locked registrations, or other Git failures remain visible errors with repository/view/cancel fallbacks. If the original cwd was a deleted untracked subdirectory not present in the saved commit, creation can succeed while resume still requires fallback; no directory content is invented.
 
-Herdr plugin v1 does not provide in-process native widgets. A native Herdr
-popup would require a companion Herdr release and source changes, while this
-terminal-pane route is available in the installed 0.7.1 plugin surface.
+Isolated tests exercise real database indexing/search/original preview, query focus and space behavior, stale-source refusal, mock exact-session dispatch, cancellation, existing-repository fallback, and a manually deleted registered worktree recreated only after confirmation. Temporary Git tests also check locked registrations, unavailable commits, symlink/target collisions, and preservation of the other checkout. Tests never read private histories or launch real agents/Herdr. Actual plugin keyboard presentation, native launches, packaging, and clean-machine operation still require runtime acceptance evidence.
+
+A release-binary PTY smoke check using an isolated synthetic history verified activation counts, multiword query typing, result focus, normalized original preview, Esc returning with selection retained, and Ctrl-C restoring the alternate screen/cursor. It intentionally did not press Enter or launch any native agent.
+
+The split behavior was verified read-only from Herdr tag `v0.7.1`, commit `fe30dd9a0fcf55cf07fe8dfedc99abdfc801e42d`, `src/app/agents.rs`: `start_agent` routes `workspace_id` without `tab_id` to `spawn_agent_split`, passing the requested `focus` value. This justifies allowing existing occupied workspaces and explicitly requesting focus. Exact live-session matches still use focus without creating another agent. Workspace cwd lookup currently uses the first listed pane; matching arbitrary directories in other panes/tabs remains a limitation.

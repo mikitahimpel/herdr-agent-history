@@ -24,4 +24,4 @@ Preview reads the canonical transcript at the stored source range. A deleted or 
 
 ## Packaging or installation stops before copying binaries
 
-Packaging currently targets macOS Apple Silicon and requires both `agent-history` and the host-provided `agent-history-overlay` release binaries. The overlay integration is still a release blocker. The scripts do not claim a clean-user installation until that artifact and release validation are available.
+Packaging currently targets macOS Apple Silicon and requires both `agent-history` and the host-provided `agent-history-overlay` release binaries. The scripts do not claim clean-user installation or real native-session acceptance. See RELEASE_STATUS.md for the remaining release gate.

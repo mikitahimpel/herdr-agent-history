@@ -1,0 +1,18 @@
+id = "agent-history"
+name = "Agent History"
+version = "0.1.0"
+min_herdr_version = "0.7.1"
+description = "Search and resume local Claude Code and Codex sessions"
+platforms = ["macos"]
+
+[[actions]]
+id = "open"
+title = "Open Agent History"
+contexts = ["global"]
+command = ["herdr", "plugin", "pane", "open", "--plugin", "agent-history", "--entrypoint", "search"]
+
+[[panes]]
+id = "search"
+title = "Agent History"
+placement = "overlay"
+command = ["agent-history-overlay"]

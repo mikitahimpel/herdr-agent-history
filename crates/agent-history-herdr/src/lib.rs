@@ -2,6 +2,7 @@
 use agent_history_core::{CoreError, Result, Session};
 use std::path::Path;
 
+pub mod overlay;
 pub mod restore;
 pub mod resume;
 pub mod socket;

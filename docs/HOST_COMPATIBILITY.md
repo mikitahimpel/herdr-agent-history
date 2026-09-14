@@ -81,18 +81,17 @@ The public CLI and socket API provide the operations needed by the host adapter:
    `workspace.list`, `workspace.focus`, `workspace.create`, `agent.list`,
    `agent.focus`, and `agent.start`.
 
-`agent start` targets a workspace (or tab/cwd) on 0.7.1; the caller must first
-ensure that the target workspace has an available shell. A host adapter should
-match a historical result to a workspace by persisted cwd/worktree metadata,
-focus that workspace, then resolve the target pane/agent before deciding
-whether to start a resume command. The public surface has no direct
-“workspace by cwd” lookup. The sibling 0.7.5 source has a different lower-level
-`AgentStartParams` shape, so it is not evidence for the installed 0.7.1 CLI.
+The installed command help and the local `v0.7.1` tag at
+`fe30dd9a0fcf55cf07fe8dfedc99abdfc801e42d` are the implementation authority.
+In that tag, `src/app/agents.rs::start_agent` routes a supplied workspace to
+`spawn_agent_split`; the adapter passes `--cwd` and `--focus` to select the
+original directory and focus the new agent. An occupied pane is not overwritten.
+Exact live native sessions are focused instead, preventing an unnecessary
+duplicate process. The adapter derives workspace cwd from pane records;
+complex multi-cwd workspaces still require live compatibility testing.
 
-These operations are documented in the sibling source's
-`docs/versions/0.7.5/website/src/content/docs/agent-automation.mdx` and
-`socket-api.mdx`, with request types in `src/api/schema/workspaces.rs`,
-`src/api/schema/agents.rs`, and `src/api/schema/plugins.rs`.
+The earlier inspection of the 0.7.5 checkout was useful research, but its
+changed agent-start syntax must not be treated as proof of 0.7.1 compatibility.
 
 ## Overlay and extension route
 
