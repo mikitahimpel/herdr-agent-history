@@ -4,6 +4,7 @@ use crate::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -40,13 +41,43 @@ impl SqliteStore {
         if let Some(parent) = path.parent() {
             Self::make_private_parent(parent)?;
         }
-        let conn = Connection::open(path)?;
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{}", path.to_string_lossy(), suffix));
+            if let Ok(md) = fs::symlink_metadata(&sidecar) {
+                if md.file_type().is_symlink() {
+                    return Err(CoreError::Storage("refusing symlink SQLite sidecar".into()));
+                }
+            }
+        }
+        let mut options = fs::OpenOptions::new();
+        // O_NOFOLLOW is 0x100 on macOS and Linux; it prevents a final symlink race.
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(0x100);
+        let file = options.open(path)?;
+        drop(file);
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
         Self::private_file(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let mut store = Self { conn };
         store.migrate()?;
         store.conn.pragma_update(None, "journal_mode", "WAL")?;
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{}", path.to_string_lossy(), suffix));
+            if let Ok(md) = fs::symlink_metadata(&sidecar) {
+                if md.file_type().is_symlink() {
+                    return Err(CoreError::Storage("refusing symlink SQLite sidecar".into()));
+                }
+                fs::set_permissions(sidecar, fs::Permissions::from_mode(0o600))?;
+            }
+        }
         Ok(store)
     }
 
@@ -54,6 +85,14 @@ impl SqliteStore {
         if !parent.exists() {
             fs::create_dir_all(parent)?;
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        } else {
+            let md = fs::symlink_metadata(parent)?;
+            if md.file_type().is_symlink() || !md.is_dir() {
+                return Err(CoreError::Storage("index parent is not a directory".into()));
+            }
+            if md.permissions().mode() & 0o077 != 0 {
+                return Err(CoreError::Storage("index parent is not private".into()));
+            }
         }
         Ok(())
     }
@@ -301,7 +340,7 @@ mod tests {
     #[test]
     fn fts_insert_delete_and_reindex_are_transactional() {
         let dir = crate::test_support::TempDir::new("storage").unwrap();
-        let path = dir.path().join("index.sqlite");
+        let path = dir.path().join("private/index.sqlite");
         let mut db = SqliteStore::open(&path).unwrap();
         let s = session(Agent::Claude, "one", 7, 1);
         db.commit_batch(IndexBatch {
@@ -311,6 +350,12 @@ mod tests {
         })
         .unwrap();
         assert_eq!(db.search("portfolio", 10).unwrap().len(), 1);
+        assert_eq!(db.search("\"portfolio visibility\"", 10).unwrap().len(), 1);
+        assert_eq!(db.search("portfol*", 10).unwrap().len(), 1);
+        assert_eq!(db.search("portfolio AND visibility", 10).unwrap().len(), 1);
+        assert!(db.search("portfolio", 10).unwrap()[0]
+            .snippet
+            .contains("portfolio"));
         db.commit_batch(IndexBatch {
             removed_sources: vec![(7, 1)],
             ..Default::default()
@@ -329,7 +374,7 @@ mod tests {
     #[test]
     fn failed_batch_rolls_back_all_changes() {
         let dir = crate::test_support::TempDir::new("storage-rollback").unwrap();
-        let mut db = SqliteStore::open(dir.path().join("index.sqlite")).unwrap();
+        let mut db = SqliteStore::open(dir.path().join("private/index.sqlite")).unwrap();
         let s = session(Agent::Codex, "two", 8, 1);
         let bad = ConversationChunk {
             session_id: s.id.clone(),
