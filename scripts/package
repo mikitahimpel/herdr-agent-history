@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+case "$(uname -s):$(uname -m)" in
+  Darwin:arm64) ;;
+  *) echo "package: only macOS Apple Silicon (Darwin arm64) is supported" >&2; exit 2 ;;
+esac
+./scripts/check
+cargo build --release -p agent-history-cli -p agent-history-herdr
+overlay="target/release/agent-history-overlay"
+if [ ! -x "$overlay" ]; then
+  echo "package: waiting for the agent-history-overlay binary from the host integration" >&2
+  exit 2
+fi
+out="${1:-dist}"
+rm -rf "$out"
+mkdir -p "$out/agent-history"
+cp target/release/agent-history "$out/agent-history/"
+cp "$overlay" "$out/agent-history/"
+cp README.md "$out/agent-history/"
+tar -C "$out" -czf "$out/agent-history-macos-arm64.tar.gz" agent-history
+echo "created $out/agent-history-macos-arm64.tar.gz"

@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+prefix="${1:-$HOME/.local/bin}"
+if [ "$(uname -s):$(uname -m)" != "Darwin:arm64" ]; then
+  echo "install: only macOS Apple Silicon (Darwin arm64) is supported" >&2
+  exit 2
+fi
+if [ ! -x target/release/agent-history ] || [ ! -x target/release/agent-history-overlay ]; then
+  echo "install: run ./scripts/package after the host overlay binary is available" >&2
+  exit 2
+fi
+mkdir -p "$prefix"
+cp target/release/agent-history "$prefix/agent-history"
+cp target/release/agent-history-overlay "$prefix/agent-history-overlay"
+chmod 755 "$prefix/agent-history" "$prefix/agent-history-overlay"
+echo "installed Agent History binaries in $prefix"

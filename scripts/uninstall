@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+prefix="${1:-$HOME/.local/bin}"
+for name in agent-history agent-history-overlay; do
+  path="$prefix/$name"
+  if [ -e "$path" ]; then
+    rm -f "$path"
+    echo "removed $path"
+  fi
+done

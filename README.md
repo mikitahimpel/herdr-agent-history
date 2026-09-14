@@ -6,7 +6,7 @@ Local search and restoration for Claude Code and Codex development sessions on m
 
 ## Status
 
-Planning and repository scaffold. Indexing, search, preview, and restoration are not implemented yet. The CLI currently reports this explicitly.
+The standalone CLI supports indexing, full-text search, status, and bounded source preview. Herdr overlay integration and session restoration remain in progress.
 
 - [RFC](docs/RFC.md): product requirements and architectural constraints.
 - [Implementation backlog](docs/BACKLOG.md): sequenced work, dependencies, and acceptance criteria.
@@ -17,7 +17,7 @@ Planning and repository scaffold. Indexing, search, preview, and restoration are
 | Crate | Responsibility |
 | --- | --- |
 | `agent-history-core` | Agent formats, normalization, indexing, SQLite, search, source preview, Git context |
-| `agent-history-cli` | Debugging interface: planned `index`, `search`, and `status` commands |
+| `agent-history-cli` | Debugging interface: `index`, `search`, `status`, and `preview` commands |
 | `agent-history-herdr` | Host boundary, resume orchestration, workspace restoration |
 
 Herdr's overlay will require integration in Herdr itself. This repository owns the core and host adapter; the integration issue must identify the supported host revision and extension mechanism.
@@ -31,7 +31,7 @@ Herdr's overlay will require integration in Herdr itself. This repository owns t
 
 Agents must follow [AGENTS.md](AGENTS.md); Claude Code also loads [CLAUDE.md](CLAUDE.md). CI and the pre-push hook run the same required gate. [GitHub publication and required-check setup](docs/GITHUB_SETUP.md) remain pending because remote writes were blocked.
 
-The initial scaffold has no third-party dependencies. SQLite with FTS5 will be selected and verified in the storage issue.
+The CLI uses SQLite with FTS5. See [Troubleshooting](docs/TROUBLESHOOTING.md) for private-index and rebuild guidance.
 
 ## V1 constraints
 
