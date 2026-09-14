@@ -25,8 +25,21 @@ pub trait HostRuntime {
 /// Finds the exact native session before starting anything. In particular, a
 /// live agent with another session ID is never treated as a match.
 pub fn resume_in_host<H: HostRuntime>(host: &mut H, session: &Session) -> Result<()> {
+    resume_in_host_with_checker(host, session, |path| path.exists())
+}
+
+pub fn resume_in_host_with_checker<H, F>(host: &mut H, session: &Session, exists: F) -> Result<()>
+where
+    H: HostRuntime,
+    F: Fn(&Path) -> bool,
+{
     let plan = resume::NativeResumePlan::for_session(session)?;
     let cwd = workspace_required(session.cwd.as_deref())?;
+    if !exists(cwd) {
+        return Err(CoreError::Unsupported(
+            "session workspace path does not exist; refusing to create a workspace".into(),
+        ));
+    }
     let workspaces = host.workspaces()?;
     let workspace = if let Some(workspace) = workspaces.iter().find(|w| w.cwd == cwd) {
         host.focus_workspace(&workspace.id)?;

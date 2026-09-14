@@ -107,19 +107,16 @@ impl<R: CommandRunner> HerdrCli<R> {
                 "Herdr workspace pane is occupied; refusing to replace a live agent".into(),
             ));
         }
+        let name = format!("agent-history-{}", &session.id.native_id[..8]);
         let mut argv = vec![
             "herdr".into(),
             "agent".into(),
             "start".into(),
-            "agent-history-resume".into(),
-            "--kind".into(),
-            match plan.agent {
-                agent_history_core::Agent::Claude => "claude",
-                agent_history_core::Agent::Codex => "codex",
-            }
-            .into(),
+            name,
             "--workspace".into(),
             workspace.id.clone(),
+            "--cwd".into(),
+            workspace.cwd.display().to_string(),
             "--".into(),
         ];
         argv.extend(plan.argv);
@@ -192,6 +189,9 @@ struct AgentWire {
 }
 #[derive(Deserialize)]
 struct AgentSessionWire {
+    source: String,
+    agent: String,
+    kind: String,
     value: String,
 }
 
@@ -204,15 +204,25 @@ pub fn parse_agent_list(json: &str) -> Result<Vec<crate::resume::LiveAgent>> {
             let agent = match a.agent.as_deref() {
                 Some("claude") => Agent::Claude,
                 Some("codex") => Agent::Codex,
-                _ => return Err(CoreError::Unsupported("unknown live Herdr agent".into())),
+                _ => return Ok(None),
             };
-            let session_id = a.agent_session.map(|s| SessionId::new(agent, s.value));
-            Ok(crate::resume::LiveAgent {
+            let session_id = a.agent_session.and_then(|s| {
+                (s.source == format!("herdr:{}", a.agent.as_deref().unwrap_or_default())
+                    && s.agent == a.agent.as_deref().unwrap_or_default()
+                    && s.kind == "id")
+                    .then(|| SessionId::new(agent, s.value))
+            });
+            Ok(Some(crate::resume::LiveAgent {
                 id: a.pane_id,
                 workspace_id: a.workspace_id,
                 agent,
                 session_id,
-            })
+            }))
+        })
+        .filter_map(|item| match item {
+            Ok(Some(agent)) => Some(Ok(agent)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
         })
         .collect()
 }
@@ -220,7 +230,7 @@ pub fn parse_agent_list(json: &str) -> Result<Vec<crate::resume::LiveAgent>> {
 fn parse_envelope<T: for<'de> Deserialize<'de>>(json: &str) -> Result<Envelope<T>> {
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| CoreError::Unsupported(format!("invalid Herdr response: {e}")))?;
-    if let Some(error) = value.get("error") {
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
         return Err(CoreError::Unsupported(format!("Herdr API error: {error}")));
     }
     serde_json::from_value(value)
@@ -342,11 +352,11 @@ mod tests {
                 "herdr",
                 "agent",
                 "start",
-                "agent-history-resume",
-                "--kind",
-                "codex",
+                "agent-history-00000000",
                 "--workspace",
                 "w1",
+                "--cwd",
+                "/tmp/project",
                 "--",
                 "codex",
                 "resume",
@@ -370,9 +380,10 @@ mod tests {
             r#"{"result":{"agents":[]}}"#,
             r#"{"result":{"agent":{}}}"#,
         ]);
-        crate::resume_in_host(
+        crate::resume_in_host_with_checker(
             &mut cli,
             &session(Agent::Codex, "00000000-0000-4000-8000-000000000004"),
+            |_| true,
         )
         .unwrap();
         let commands = cli.into_inner().commands;
@@ -393,12 +404,13 @@ mod tests {
             r#"{"result":{"workspaces":[{"workspace_id":"w1"}]}}"#,
             r#"{"result":{"panes":[{"pane_id":"w1:p1","cwd":"/tmp/project","agent":"codex"}]}}"#,
             r#"{"result":{}}"#,
-            r#"{"result":{"agents":[{"workspace_id":"w1","pane_id":"w1:p1","agent":"codex","agent_session":{"value":"00000000-0000-4000-8000-000000000005"}}]}}"#,
+            r#"{"result":{"agents":[{"workspace_id":"w1","pane_id":"w1:p1","agent":"codex","agent_session":{"source":"herdr:codex","agent":"codex","kind":"id","value":"00000000-0000-4000-8000-000000000005"}}]}}"#,
             r#"{"result":{}}"#,
         ]);
-        crate::resume_in_host(
+        crate::resume_in_host_with_checker(
             &mut cli,
             &session(Agent::Codex, "00000000-0000-4000-8000-000000000005"),
+            |_| true,
         )
         .unwrap();
         let commands = cli.into_inner().commands;
@@ -413,11 +425,12 @@ mod tests {
             r#"{"result":{"workspaces":[{"workspace_id":"w1"}]}}"#,
             r#"{"result":{"panes":[{"pane_id":"w1:p1","cwd":"/tmp/project","agent":"claude"}]}}"#,
             r#"{"result":{}}"#,
-            r#"{"result":{"agents":[{"workspace_id":"w1","pane_id":"w1:p1","agent":"claude","agent_session":{"value":"00000000-0000-4000-8000-000000000006"}}]}}"#,
+            r#"{"result":{"agents":[{"workspace_id":"w1","pane_id":"w1:p1","agent":"claude","agent_session":{"source":"herdr:claude","agent":"claude","kind":"id","value":"00000000-0000-4000-8000-000000000006"}}]}}"#,
         ]);
-        let error = crate::resume_in_host(
+        let error = crate::resume_in_host_with_checker(
             &mut cli,
             &session(Agent::Codex, "00000000-0000-4000-8000-000000000007"),
+            |_| true,
         )
         .unwrap_err();
         assert!(error.to_string().contains("occupied"));
@@ -431,5 +444,34 @@ mod tests {
         assert!(error
             .to_string()
             .contains("invalid Herdr response envelope"));
+    }
+
+    #[test]
+    fn agent_parser_skips_unrelated_agents_and_rejects_mismatched_provenance() {
+        let json = r#"{"error":null,"result":{"agents":[
+            {"workspace_id":"w1","pane_id":"w1:p1","agent":"pi"},
+            {"workspace_id":"w1","pane_id":"w1:p2","agent":"claude","agent_session":{"source":"other","agent":"claude","kind":"id","value":"00000000-0000-4000-8000-000000000008"}},
+            {"workspace_id":"w1","pane_id":"w1:p3","agent":"claude","agent_session":{"source":"herdr:claude","agent":"claude","kind":"id","value":"00000000-0000-4000-8000-000000000009"}}
+        ]}}"#;
+        let agents = parse_agent_list(json).unwrap();
+        assert_eq!(agents.len(), 2);
+        assert!(agents[0].session_id.is_none());
+        assert_eq!(
+            agents[1].session_id.as_ref().unwrap().native_id,
+            "00000000-0000-4000-8000-000000000009"
+        );
+    }
+
+    #[test]
+    fn missing_cwd_refuses_before_workspace_listing() {
+        let mut cli = queued(&[]);
+        let error = crate::resume_in_host_with_checker(
+            &mut cli,
+            &session(Agent::Claude, "00000000-0000-4000-8000-000000000010"),
+            |_| false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not exist"));
+        assert!(cli.into_inner().commands.is_empty());
     }
 }
