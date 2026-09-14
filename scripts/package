@@ -4,6 +4,10 @@ case "$(uname -s):$(uname -m)" in
   Darwin:arm64) ;;
   *) echo "package: only macOS Apple Silicon (Darwin arm64) is supported" >&2; exit 2 ;;
 esac
+out="${1:-dist}"
+mkdir -p "$out"
+archive="$out/agent-history-macos-arm64.tar.gz"
+if [ -e "$archive" ]; then echo "package: refusing to overwrite $archive" >&2; exit 2; fi
 ./scripts/check
 cargo build --release -p agent-history-cli -p agent-history-herdr
 overlay="target/release/agent-history-overlay"
@@ -11,11 +15,15 @@ if [ ! -x "$overlay" ]; then
   echo "package: waiting for the agent-history-overlay binary from the host integration" >&2
   exit 2
 fi
-out="${1:-dist}"
-rm -rf "$out"
-mkdir -p "$out/agent-history"
-cp target/release/agent-history "$out/agent-history/"
-cp "$overlay" "$out/agent-history/"
-cp README.md "$out/agent-history/"
-tar -C "$out" -czf "$out/agent-history-macos-arm64.tar.gz" agent-history
-echo "created $out/agent-history-macos-arm64.tar.gz"
+stage=$(mktemp -d "${TMPDIR:-/tmp}/agent-history-package.XXXXXX")
+trap 'rm -rf "$stage"' EXIT INT TERM
+mkdir -p "$stage/agent-history/plugin" "$stage/agent-history/docs"
+cp target/release/agent-history "$stage/agent-history/"
+cp "$overlay" "$stage/agent-history/"
+cp README.md scripts/install scripts/uninstall "$stage/agent-history/"
+cp docs/TROUBLESHOOTING.md "$stage/agent-history/docs/"
+if [ ! -d plugin ]; then echo "package: host plugin folder is missing" >&2; exit 2; fi
+cp -R plugin/. "$stage/agent-history/plugin/"
+tar -C "$stage" -czf "$archive" agent-history
+shasum -a 256 "$archive" > "$archive.sha256"
+echo "created $archive"

@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/agent-history-package-test.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT INT TERM
+mkdir -p "$tmp/package" "$tmp/prefix" "$tmp/out"
+printf marker > "$tmp/out/keep"
+printf old > "$tmp/out/agent-history-macos-arm64.tar.gz"
+if scripts/package "$tmp/out" >/dev/null 2>&1; then exit 1; fi
+test "$(cat "$tmp/out/keep")" = marker
+test "$(cat "$tmp/out/agent-history-macos-arm64.tar.gz")" = old
+cp scripts/install scripts/uninstall "$tmp/package/"
+for name in agent-history agent-history-overlay; do
+  printf '#!/bin/sh\n' > "$tmp/package/$name"
+  chmod 755 "$tmp/package/$name"
+done
+printf native > "$tmp/native-history"
+HOME="$tmp/home" sh "$tmp/package/install" "$tmp/prefix" >/dev/null
+test -x "$tmp/prefix/agent-history"
+printf unrelated > "$tmp/prefix/keep"
+sh "$tmp/package/uninstall" "$tmp/prefix" >/dev/null
+test -f "$tmp/prefix/keep"
+test "$(cat "$tmp/native-history")" = native
+echo "packaging smoke passed"
