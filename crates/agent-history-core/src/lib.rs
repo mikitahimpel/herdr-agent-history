@@ -6,7 +6,9 @@ pub mod domain;
 pub mod git;
 pub mod storage;
 pub mod test_support;
-pub use contracts::{AgentAdapter, CoreError, GitContextProvider, IndexBatch, Result, SessionResumer, Store};
+pub use contracts::{
+    AgentAdapter, CoreError, GitContextProvider, IndexBatch, Result, SessionResumer, Store,
+};
 pub use domain::*;
 pub use git::GitContextResolver;
 pub use storage::{IndexStatus, IndexedFileState, SqliteStore};

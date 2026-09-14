@@ -56,7 +56,7 @@ impl SqliteStore {
             .write(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(0x100);
+            .custom_flags(libc::O_NOFOLLOW);
         let file = options.open(path)?;
         drop(file);
         let conn = Connection::open_with_flags(
@@ -394,5 +394,136 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(db.status().unwrap(), IndexStatus::default());
+    }
+    #[test]
+    fn search_phrase_prefix_boolean_and_rank() {
+        let d = crate::test_support::TempDir::new("query").unwrap();
+        let mut db = SqliteStore::open(d.path().join("p/index.sqlite")).unwrap();
+        let a = session(Agent::Claude, "a", 1, 1);
+        let b = session(Agent::Codex, "b", 2, 1);
+        db.commit_batch(IndexBatch {
+            sessions: vec![a.clone(), b.clone()],
+            chunks: vec![
+                chunk(&a.id, 1, 1, 0, "alpha beta"),
+                chunk(&b.id, 2, 1, 0, "alpha alpha beta"),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(db.search("\"alpha beta\"", 10).unwrap().len(), 2);
+        assert_eq!(db.search("alph* AND beta", 10).unwrap()[0].session_id, b.id);
+        assert!(db.search("alpha", 10).unwrap()[0].snippet.contains("alpha"));
+    }
+    #[test]
+    fn file_state_nanoseconds_and_open_turn_survive_reopen() {
+        let d = crate::test_support::TempDir::new("reopen").unwrap();
+        let p = d.path().join("p/index.sqlite");
+        let t = UNIX_EPOCH + std::time::Duration::new(42, 123456789);
+        let mut db = SqliteStore::open(&p).unwrap();
+        db.commit_batch(IndexBatch {
+            file: Some(IndexedFile {
+                path: "source".into(),
+                file_id: 4,
+                generation: 2,
+                committed_offset: 17,
+                size: 17,
+                modified: Some(t),
+            }),
+            open_turn_state: Some(b"partial".to_vec()),
+            ..Default::default()
+        })
+        .unwrap();
+        drop(db);
+        let db = SqliteStore::open(&p).unwrap();
+        let x = db.indexed_file_state("source").unwrap().unwrap();
+        assert_eq!(x.file.modified, Some(t));
+        assert_eq!(x.open_turn_state, Some(b"partial".to_vec()));
+    }
+    #[test]
+    fn rollback_preserves_previous_file_offset_open_turn_and_search_rows() {
+        let d = crate::test_support::TempDir::new("rollback-state").unwrap();
+        let p = d.path().join("p/index.sqlite");
+        let mut db = SqliteStore::open(&p).unwrap();
+        let s = session(Agent::Claude, "keep", 3, 1);
+        db.commit_batch(IndexBatch {
+            file: Some(IndexedFile {
+                path: "source".into(),
+                file_id: 3,
+                generation: 1,
+                committed_offset: 9,
+                size: 9,
+                modified: None,
+            }),
+            open_turn_state: Some(b"old".to_vec()),
+            sessions: vec![s.clone()],
+            chunks: vec![chunk(&s.id, 3, 1, 0, "keep me")],
+            ..Default::default()
+        })
+        .unwrap();
+        let r = db.commit_batch(IndexBatch {
+            file: Some(IndexedFile {
+                path: "source".into(),
+                file_id: 3,
+                generation: 1,
+                committed_offset: 99,
+                size: 99,
+                modified: None,
+            }),
+            open_turn_state: Some(b"new".to_vec()),
+            chunks: vec![ConversationChunk {
+                session_id: SessionId::new(Agent::Codex, "missing"),
+                ..chunk(&s.id, 3, 1, 1, "bad")
+            }],
+            ..Default::default()
+        });
+        assert!(r.is_err());
+        let x = db.indexed_file_state("source").unwrap().unwrap();
+        assert_eq!(x.file.committed_offset, 9);
+        assert_eq!(x.open_turn_state, Some(b"old".to_vec()));
+        assert_eq!(db.search("keep", 10).unwrap().len(), 1);
+    }
+    #[test]
+    fn unknown_schema_and_invalid_row_return_errors() {
+        let d = crate::test_support::TempDir::new("schema").unwrap();
+        let p = d.path().join("p/index.sqlite");
+        let db = SqliteStore::open(&p).unwrap();
+        db.connection()
+            .pragma_update(None, "user_version", 999)
+            .unwrap();
+        drop(db);
+        assert!(SqliteStore::open(&p).is_err());
+        let d = crate::test_support::TempDir::new("row").unwrap();
+        let p = d.path().join("p/index.sqlite");
+        let db = SqliteStore::open(&p).unwrap();
+        db.connection().execute("INSERT INTO sessions(agent,native_id,source_path,source_file_id,source_generation) VALUES(9,'x','p',1,1)",[]).unwrap();
+        assert!(db.sessions().is_err());
+    }
+    #[test]
+    fn permissions_and_sidecar_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = crate::test_support::TempDir::new("permissions").unwrap();
+        let p = d.path().join("private/index.sqlite");
+        let db = SqliteStore::open(&p).unwrap();
+        assert_eq!(
+            fs::metadata(d.path().join("private"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(db);
+        let target = d.path().join("target");
+        fs::write(&target, "x").unwrap();
+        std::os::unix::fs::symlink(
+            &target,
+            PathBuf::from(format!("{}-wal", p.to_string_lossy())),
+        )
+        .unwrap();
+        assert!(SqliteStore::open(&p).is_err());
     }
 }
