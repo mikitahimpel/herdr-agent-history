@@ -96,9 +96,18 @@ fn index(db: PathBuf, o: Options) -> Result<(), String> {
     let r = agent_history_core::index::index_all(&mut store, &adapters(&o))
         .map_err(|e| sanitize(&e.to_string()))?;
     println!(
-        "indexed {} records ({} bytes, {} chunks; {} malformed)",
-        r.records, r.bytes_read, r.chunks, r.malformed_records
+        "indexed {} files ({} failed), {} records ({} bytes, {} chunks; {} malformed)",
+        r.files, r.failed_files, r.records, r.bytes_read, r.chunks, r.malformed_records
     );
+    for error in &r.errors {
+        eprintln!("agent-history: indexing error: {}", sanitize(error));
+    }
+    if r.failed_files > 0 {
+        return Err(format!(
+            "index completed with {} failed file(s)",
+            r.failed_files
+        ));
+    }
     Ok(())
 }
 fn search(db: PathBuf, o: Options) -> Result<(), String> {

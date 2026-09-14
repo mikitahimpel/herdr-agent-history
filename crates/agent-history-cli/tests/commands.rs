@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn fixture() -> (PathBuf, PathBuf, PathBuf) {
@@ -28,7 +28,7 @@ fn fixture() -> (PathBuf, PathBuf, PathBuf) {
 
 use std::os::unix::fs::PermissionsExt;
 
-fn run(db: &PathBuf, claude: &PathBuf, codex: &PathBuf, args: &[&str]) -> std::process::Output {
+fn run(db: &Path, claude: &Path, codex: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_agent-history"))
         .args(args)
         .args([
