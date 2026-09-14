@@ -10,7 +10,7 @@ fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("agent-history: {message}");
+            eprintln!("agent-history: {}", sanitize(&message));
             ExitCode::from(2)
         }
     }
@@ -27,6 +27,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
     }
     let command = args[0].as_str();
     let options = Options::parse(&args[1..])?;
+    if matches!(command, "index" | "status") && !options.positional.is_empty() {
+        return Err(format!("{command} does not accept positional arguments"));
+    }
     let db = options.db.clone().map_or_else(default_db, Ok)?;
     match command {
         "index" => index(db, options),
@@ -124,12 +127,15 @@ fn search(db: PathBuf, o: Options) -> Result<(), String> {
             Agent::Codex => "Codex",
         };
         println!(
-            "{}\t{}\t{} / {}\t{}\t{}:{}-{}\t{}",
+            "{}\t{}\t{} / {}\t{}\t{}\t{}:{}-{}\t{}",
             i + 1,
             agent,
             sanitize(r.repository.as_deref().unwrap_or("-")),
             sanitize(r.branch.as_deref().unwrap_or("-")),
             sanitize(&r.session_id.native_id),
+            r.timestamp
+                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
+                .unwrap_or_else(|| "-".into()),
             sanitize(&r.source.path.display().to_string()),
             r.source.byte_range.start,
             r.source.byte_range.end,
@@ -151,8 +157,8 @@ fn status(db: PathBuf) -> Result<(), String> {
         }
     }
     println!(
-        "files: {}\nsessions: {} (Claude: {}, Codex: {})\nchunks: {}\ndatabase bytes: {}",
-        s.files, s.sessions, claude, codex, s.chunks, bytes
+        "files: {}\nsessions: {} (Claude: {}, Codex: {})\nchunks: {}\ndatabase: {}\ndatabase bytes: {}",
+        s.files, s.sessions, claude, codex, s.chunks, sanitize(&db.display().to_string()), bytes
     );
     Ok(())
 }

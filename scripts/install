@@ -8,14 +8,26 @@ if [ "$(uname -s):$(uname -m)" != "Darwin:arm64" ]; then
 fi
 if [ -x "$artifact_dir/agent-history" ] && [ -x "$artifact_dir/agent-history-overlay" ]; then
   source_dir="$artifact_dir"
-elif [ -x target/release/agent-history ] && [ -x target/release/agent-history-overlay ]; then
-  source_dir="target/release"
+elif [ -x "$artifact_dir/../target/release/agent-history" ] && [ -x "$artifact_dir/../target/release/agent-history-overlay" ]; then
+  source_dir="$artifact_dir/../target/release"
 else
   echo "install: run ./scripts/package after the host overlay binary is available" >&2
   exit 2
 fi
+if [ -f "$artifact_dir/plugin/agent-history/herdr-plugin.toml" ]; then
+  plugin_source="$artifact_dir/plugin/agent-history/herdr-plugin.toml"
+elif [ -f "$artifact_dir/../plugin/agent-history/herdr-plugin.toml" ]; then
+  plugin_source="$artifact_dir/../plugin/agent-history/herdr-plugin.toml"
+else
+  echo "install: packaged Herdr plugin manifest is missing" >&2
+  exit 2
+fi
 mkdir -p "$prefix"
+plugin_dir="$prefix/../share/agent-history/plugin"
+mkdir -p "$plugin_dir"
+cp "$plugin_source" "$plugin_dir/herdr-plugin.toml"
 cp "$source_dir/agent-history" "$prefix/agent-history"
 cp "$source_dir/agent-history-overlay" "$prefix/agent-history-overlay"
 chmod 755 "$prefix/agent-history" "$prefix/agent-history-overlay"
 echo "installed Agent History binaries in $prefix"
+printf 'Link the plugin from a Herdr-managed pane: herdr plugin link "%s"\n' "$plugin_dir"

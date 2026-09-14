@@ -13,9 +13,12 @@ for name in agent-history agent-history-overlay; do
   printf '#!/bin/sh\n' > "$tmp/package/$name"
   chmod 755 "$tmp/package/$name"
 done
+mkdir -p "$tmp/package/plugin/agent-history"
+printf 'id = "agent-history"\n' > "$tmp/package/plugin/agent-history/herdr-plugin.toml"
 printf native > "$tmp/native-history"
 HOME="$tmp/home" sh "$tmp/package/install" "$tmp/prefix" >/dev/null
 test -x "$tmp/prefix/agent-history"
+test -f "$tmp/share/agent-history/plugin/herdr-plugin.toml"
 printf unrelated > "$tmp/prefix/keep"
 sh "$tmp/package/uninstall" "$tmp/prefix" >/dev/null
 test -f "$tmp/prefix/keep"

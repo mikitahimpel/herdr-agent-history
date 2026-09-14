@@ -9,3 +9,7 @@
 # Never commit native transcripts or local benchmark histories.
 /local-history/
 /local-benchmarks/
+
+/dist/
+*.sqlite-wal
+*.sqlite-shm

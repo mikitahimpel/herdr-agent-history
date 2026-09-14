@@ -10,3 +10,4 @@ path = "src/main.rs"
 
 [dependencies]
 agent-history-core = { path = "../agent-history-core" }
+chrono = { version = "0.4", default-features = false, features = ["std"] }

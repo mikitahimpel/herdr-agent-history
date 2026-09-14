@@ -9,7 +9,7 @@ fn fixture() -> (agent_history_core::test_support::TempDir, PathBuf, PathBuf) {
     let codex = root.path().join("codex");
     fs::create_dir_all(&claude).unwrap();
     fs::create_dir_all(&codex).unwrap();
-    fs::write(claude.join("claude-session.jsonl"), br#"{"type":"user","sessionId":"claude-session","message":{"content":"portfolio visibility"}}
+    fs::write(claude.join("claude-session.jsonl"), br#"{"type":"user","sessionId":"claude-session","timestamp":"2026-09-14T12:00:00Z","message":{"content":"portfolio visibility"}}
 {"type":"assistant","sessionId":"claude-session","message":{"content":"Claude answer"}}
 "#).unwrap();
     fs::write(
@@ -53,6 +53,7 @@ fn index_search_status_preview_and_append_work_across_processes() {
     assert!(out.status.success());
     assert!(text.contains("Claude"));
     assert!(text.contains("Codex"));
+    assert!(text.contains("2026-09-14T12:00:00"));
     let out = run(&db, &claude, &codex, &["status"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("sessions: 2"));

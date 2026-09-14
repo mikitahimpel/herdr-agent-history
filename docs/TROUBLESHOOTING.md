@@ -11,7 +11,7 @@ If `HOME` is unavailable, commands that need the default database fail with an a
 Run an explicit indexing pass with roots containing native JSONL files:
 
 ```sh
-agent-history index --db /tmp/agent-history.sqlite \
+agent-history index --db /tmp/agent-history-private/index.sqlite \
   --claude-root "$HOME/.claude/projects" \
   --codex-root "$HOME/.codex/sessions"
 ```

@@ -8,3 +8,8 @@ for name in agent-history agent-history-overlay; do
     echo "removed $path"
   fi
 done
+plugin_dir="$prefix/../share/agent-history/plugin"
+if [ -f "$plugin_dir/herdr-plugin.toml" ]; then
+  rm -f "$plugin_dir/herdr-plugin.toml"
+fi
+echo "Native histories and index retained. In Herdr: herdr plugin unlink agent-history"
