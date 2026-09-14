@@ -4,26 +4,24 @@ case "$(uname -s):$(uname -m)" in
   Darwin:arm64) ;;
   *) echo "package: only macOS Apple Silicon (Darwin arm64) is supported" >&2; exit 2 ;;
 esac
-out="${1:-dist}"
+out=${1:-dist}
+case "$out" in -*|'') echo "package: output directory must not start with -" >&2; exit 2 ;; esac
 mkdir -p "$out"
 archive="$out/agent-history-macos-arm64.tar.gz"
 if [ -e "$archive" ]; then echo "package: refusing to overwrite $archive" >&2; exit 2; fi
 ./scripts/check
-cargo build --release -p agent-history-cli -p agent-history-herdr
-overlay="target/release/agent-history-overlay"
-if [ ! -x "$overlay" ]; then
-  echo "package: waiting for the agent-history-overlay binary from the host integration" >&2
-  exit 2
-fi
+cargo build --release --locked -p agent-history-cli -p agent-history-herdr
+for name in agent-history agent-history-overlay agent-history-herdr; do
+  if [ ! -x "target/release/$name" ]; then echo "package: required binary target/release/$name is missing" >&2; exit 2; fi
+done
+if [ ! -f plugin/agent-history/herdr-plugin.toml ]; then echo "package: Herdr plugin manifest is missing" >&2; exit 2; fi
 stage=$(mktemp -d "${TMPDIR:-/tmp}/agent-history-package.XXXXXX")
 trap 'rm -rf "$stage"' EXIT INT TERM
-mkdir -p "$stage/agent-history/plugin" "$stage/agent-history/docs"
-cp target/release/agent-history "$stage/agent-history/"
-cp "$overlay" "$stage/agent-history/"
+mkdir -p "$stage/agent-history/plugin/agent-history" "$stage/agent-history/docs"
+for name in agent-history agent-history-overlay agent-history-herdr; do cp "target/release/$name" "$stage/agent-history/"; done
+cp plugin/agent-history/herdr-plugin.toml "$stage/agent-history/plugin/agent-history/"
 cp README.md AGENTS.md scripts/install scripts/uninstall "$stage/agent-history/"
 cp -R docs/. "$stage/agent-history/docs/"
-if [ ! -d plugin ]; then echo "package: host plugin folder is missing" >&2; exit 2; fi
-cp -R plugin/. "$stage/agent-history/plugin/"
 tar -C "$stage" -czf "$archive" agent-history
 (cd "$out" && shasum -a 256 agent-history-macos-arm64.tar.gz) > "$archive.sha256"
 echo "created $archive"

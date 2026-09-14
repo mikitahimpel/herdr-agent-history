@@ -1,15 +1,18 @@
 #!/bin/sh
 set -eu
-prefix="${1:-$HOME/.local/bin}"
-for name in agent-history agent-history-overlay; do
+if [ "$#" -gt 1 ]; then echo "uninstall: expected at most one prefix" >&2; exit 2; fi
+prefix=${1:-${HOME:?}/.local/bin}
+case "$prefix" in /*) ;; *) echo "uninstall: prefix must be an absolute path" >&2; exit 2 ;; esac
+case "$prefix" in /|/usr|/usr/|/bin|/bin/|/sbin|/sbin/|/System|/System/) echo "uninstall: refusing unsafe prefix $prefix" >&2; exit 2 ;; esac
+had_herdr=false
+if [ -f "$prefix/agent-history-herdr" ] || [ -L "$prefix/agent-history-herdr" ] || [ -f "$prefix/../share/agent-history/plugin/herdr-plugin.toml" ]; then
+  had_herdr=true
+fi
+for name in agent-history agent-history-overlay agent-history-herdr; do
   path="$prefix/$name"
-  if [ -e "$path" ]; then
-    rm -f "$path"
-    echo "removed $path"
-  fi
+  if [ -f "$path" ] || [ -L "$path" ]; then rm -f "$path"; echo "removed $path"; fi
 done
 plugin_dir="$prefix/../share/agent-history/plugin"
-if [ -f "$plugin_dir/herdr-plugin.toml" ]; then
-  rm -f "$plugin_dir/herdr-plugin.toml"
-fi
-echo "Native histories and index retained. In Herdr: herdr plugin unlink agent-history"
+if [ -f "$plugin_dir/herdr-plugin.toml" ]; then rm -f "$plugin_dir/herdr-plugin.toml"; echo "removed $plugin_dir/herdr-plugin.toml"; fi
+if $had_herdr; then echo "In Herdr: herdr plugin unlink agent-history"; fi
+echo "Native histories and index retained."

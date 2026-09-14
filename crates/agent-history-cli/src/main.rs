@@ -26,6 +26,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
     let command = args[0].as_str();
+    if command == "browse" {
+        return agent_history_tui::run(args[1..].to_vec(), &mut agent_history_tui::Standalone)
+            .map_err(|error| error.to_string());
+    }
     let options = Options::parse(&args[1..])?;
     if matches!(command, "index" | "status") && !options.positional.is_empty() {
         return Err(format!("{command} does not accept positional arguments"));
@@ -232,7 +236,7 @@ fn role_name(kind: EventKind) -> &'static str {
     }
 }
 fn print_help() {
-    println!("agent-history {VERSION}\n\nUSAGE:\n  agent-history <command> [options]\n\nCOMMANDS:\n  index                 Index Claude and Codex sessions\n  search <query>        Search indexed conversations\n  status                Show index counts and database size\n  preview <agent> <id>  Preview a native session\n\nOPTIONS:\n  --db <path>           SQLite database path\n  --claude-root <path>  Claude projects root\n  --codex-root <path>   Codex sessions root\n  -h, --help            Show help\n  -V, --version         Show version");
+    println!("agent-history {VERSION}\n\nUSAGE:\n  agent-history <command> [options]\n\nCOMMANDS:\n  browse                Open standalone search and preview (no Herdr required)\n  index                 Index Claude and Codex sessions\n  search <query>        Search indexed conversations\n  status                Show index counts and database size\n  preview <agent> <id>  Preview a native session\n\nOPTIONS:\n  --role <role>         Search all, user, or assistant messages\n  --db <path>           SQLite database path\n  --claude-root <path>  Claude projects root\n  --codex-root <path>   Codex sessions root\n  -h, --help            Show help\n  -V, --version         Show version");
 }
 
 #[cfg(test)]

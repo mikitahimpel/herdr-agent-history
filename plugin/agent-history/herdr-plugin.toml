@@ -15,4 +15,4 @@ command = ["herdr", "plugin", "pane", "open", "--plugin", "agent-history", "--en
 id = "search"
 title = "Agent History"
 placement = "overlay"
-command = ["agent-history-overlay"]
+command = ["agent-history-herdr"]

@@ -110,6 +110,36 @@ fn help_version_and_argument_errors_are_deterministic() {
 }
 
 #[test]
+fn standalone_entrypoints_need_no_host_or_index_for_help() {
+    let root = agent_history_core::test_support::TempDir::new("standalone-help").unwrap();
+    for (binary, args) in [
+        (
+            env!("CARGO_BIN_EXE_agent-history"),
+            vec!["browse", "--help"],
+        ),
+        (env!("CARGO_BIN_EXE_agent-history-overlay"), vec!["--help"]),
+    ] {
+        let output = Command::new(binary)
+            .args(args)
+            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_BIN_PATH")
+            .env("HOME", root.path())
+            .env("PATH", root.path().join("no-executables"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let help = String::from_utf8_lossy(&output.stdout);
+        assert!(help.to_lowercase().contains("preview"));
+        assert!(!help.contains("Enter resume"));
+    }
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn missing_home_and_removed_reset_fail_without_modifying_files() {
     let dir = agent_history_core::test_support::TempDir::new("cli-errors").unwrap();
     let native = dir.path().join("history.jsonl");

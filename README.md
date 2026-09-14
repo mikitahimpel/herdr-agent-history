@@ -1,6 +1,6 @@
-# Herdr Agent History
+# Agent History
 
-Local Claude Code and Codex history search for macOS: **search → preview the original conversation → resume in Herdr**.
+Local Claude Code and Codex conversation search for macOS. Search and preview work independently; optional Herdr integration adds session resume and worktree recovery.
 
 ## Status
 
@@ -8,7 +8,7 @@ A local 0.1.0 candidate implements the CLI, terminal overlay, SQLite indexing, a
 
 ## Build and install
 
-Apple Silicon macOS is the packaged target. Herdr, Claude Code, and Codex are separate runtime requirements; they are not bundled. The adapter targets the installed Herdr 0.7.1 CLI, with official native-session integrations enabled. Native compatibility evidence and remaining checks are in [host compatibility](docs/HOST_COMPATIBILITY.md).
+Apple Silicon macOS is the packaged target. Searching existing native history files requires no Herdr installation or running coding agent. Resuming through the optional integration requires Herdr and the corresponding Claude Code or Codex executable; these are not bundled. The adapter targets the installed Herdr 0.7.1 CLI, with official native-session integrations enabled. Native compatibility evidence and remaining checks are in [host compatibility](docs/HOST_COMPATIBILITY.md).
 
 ```sh
 ./scripts/setup
@@ -23,7 +23,9 @@ cd agent-history
 ./install
 ```
 
-The default binaries go in `~/.local/bin`; add that directory to `PATH`. The plugin is copied to `~/.local/share/agent-history/plugin`. From a Herdr-managed pane:
+The default installer places `agent-history` and the standalone `agent-history-overlay` in `~/.local/bin`; add that directory to `PATH`. Run `agent-history browse` in any terminal. Enter and Space on a selected result open its conversation preview.
+
+To also install the optional Herdr executable and plugin, run `./install --with-herdr`. The plugin is copied to `~/.local/share/agent-history/plugin`. From a Herdr-managed pane:
 
 ```sh
 herdr plugin link "$HOME/.local/share/agent-history/plugin"
@@ -32,7 +34,16 @@ herdr plugin pane open --plugin agent-history --entrypoint search
 
 See [overlay controls and recovery](docs/HERDR_PLUGIN.md) for keyboard behavior and the declared plugin action that can be bound in Herdr. Indexing runs on activation; there is no permanent daemon.
 
-## Standalone CLI
+## Standalone app and CLI
+
+Build just the standalone app without compiling the Herdr integration:
+
+```sh
+cargo build --release -p agent-history-cli
+./target/release/agent-history browse
+```
+
+The existing `./target/release/agent-history-overlay` launch command is also standalone. Use `agent-history-herdr` inside a Herdr-managed pane when you want Enter to resume. Its title and controls identify that integration explicitly.
 
 ```sh
 agent-history index
@@ -48,7 +59,7 @@ Search includes user messages and assistant replies, excluding tool calls/result
 
 Search uses SQLite FTS5: ordinary terms, quoted phrases, prefixes such as `portfolio*`, and boolean operators. Shell quoting must preserve FTS phrase quotes, for example `agent-history search '"portfolio visibility"'`.
 
-The default index is `~/Library/Application Support/Herdr Agent History/index.sqlite`. Use a dedicated private directory for `--db`; existing shared directories are refused. Custom histories are supported without changing native files:
+Both apps share the existing index at `~/Library/Application Support/Herdr Agent History/index.sqlite`. The historical directory name is retained to reuse existing data; it does not imply a Herdr dependency. Use a dedicated private directory for `--db`; existing shared directories are refused. Custom histories are supported without changing native files:
 
 ```sh
 agent-history index --db /tmp/agent-history-private/index.sqlite \
@@ -69,8 +80,11 @@ From Herdr, unlink the plugin with `herdr plugin unlink agent-history`. Run the 
 | Crate | Responsibility |
 | --- | --- |
 | `agent-history-core` | Native adapters, chunks, transactional indexing, SQLite/FTS5, Git context, source preview |
-| `agent-history-cli` | Index/search/status/preview debugging interface |
-| `agent-history-herdr` | Terminal overlay, host commands, exact native resume, confirmed recovery |
+| `agent-history-tui` | Shared terminal rendering, progress, role filters, search and preview; no Herdr dependency |
+| `agent-history-cli` | Standalone app (`browse` / `agent-history-overlay`) and index/search/status/preview commands |
+| `agent-history-herdr` | Optional integration executable, host commands, native resume and confirmed recovery |
+
+See [module boundaries and entry points](docs/MODULES.md) for the standalone/integration split.
 
 Run `./scripts/setup` once per checkout and `./scripts/check` after changes. The gate runs formatting, warnings-denied Clippy, all workspace tests, and the release build with the committed lockfile. `./scripts/test-packaging` checks isolated installation/removal behavior. Tests use synthetic histories and temporary repositories; they do not launch native agents.
 

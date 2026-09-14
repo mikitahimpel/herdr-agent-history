@@ -8,6 +8,11 @@ publish.workspace = true
 name = "agent-history"
 path = "src/main.rs"
 
+[[bin]]
+name = "agent-history-overlay"
+path = "src/bin/agent-history-overlay.rs"
+
 [dependencies]
 agent-history-core = { path = "../agent-history-core" }
+agent-history-tui = { path = "../agent-history-tui" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }

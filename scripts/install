@@ -1,33 +1,58 @@
 #!/bin/sh
 set -eu
-prefix="${1:-$HOME/.local/bin}"
-artifact_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+with_herdr=false
+prefix=
+for arg in "$@"; do
+  case "$arg" in
+    --with-herdr) with_herdr=true ;;
+    --*) echo "install: unknown option: $arg" >&2; exit 2 ;;
+    '') echo "install: prefix must not be empty" >&2; exit 2 ;;
+    *) if [ -n "$prefix" ]; then echo "install: expected one prefix" >&2; exit 2; fi; prefix=$arg ;;
+  esac
+done
+prefix=${prefix:-${HOME:?}/.local/bin}
 if [ "$(uname -s):$(uname -m)" != "Darwin:arm64" ]; then
   echo "install: only macOS Apple Silicon (Darwin arm64) is supported" >&2
   exit 2
 fi
+case "$prefix" in /*) ;; *) echo "install: prefix must be an absolute path" >&2; exit 2 ;; esac
+case "$prefix" in /|/usr|/usr/|/bin|/bin/|/sbin|/sbin/|/System|/System/) echo "install: refusing unsafe prefix $prefix" >&2; exit 2 ;; esac
+artifact_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ -x "$artifact_dir/agent-history" ] && [ -x "$artifact_dir/agent-history-overlay" ]; then
-  source_dir="$artifact_dir"
+  source_dir=$artifact_dir
 elif [ -x "$artifact_dir/../target/release/agent-history" ] && [ -x "$artifact_dir/../target/release/agent-history-overlay" ]; then
   source_dir="$artifact_dir/../target/release"
 else
-  echo "install: run ./scripts/package after the host overlay binary is available" >&2
-  exit 2
+  echo "install: agent-history and agent-history-overlay binaries are missing" >&2; exit 2
 fi
-if [ -f "$artifact_dir/plugin/agent-history/herdr-plugin.toml" ]; then
-  plugin_source="$artifact_dir/plugin/agent-history/herdr-plugin.toml"
-elif [ -f "$artifact_dir/../plugin/agent-history/herdr-plugin.toml" ]; then
-  plugin_source="$artifact_dir/../plugin/agent-history/herdr-plugin.toml"
-else
-  echo "install: packaged Herdr plugin manifest is missing" >&2
-  exit 2
+if $with_herdr; then
+  if [ ! -x "$source_dir/agent-history-herdr" ]; then echo "install: --with-herdr requested but agent-history-herdr is missing" >&2; exit 2; fi
+  if [ -f "$artifact_dir/plugin/agent-history/herdr-plugin.toml" ]; then
+    plugin_source="$artifact_dir/plugin/agent-history/herdr-plugin.toml"
+  elif [ -f "$artifact_dir/../plugin/agent-history/herdr-plugin.toml" ]; then
+    plugin_source="$artifact_dir/../plugin/agent-history/herdr-plugin.toml"
+  else
+    plugin_source=
+  fi
+  if [ -z "$plugin_source" ]; then echo "install: --with-herdr requested but the Herdr plugin manifest is missing" >&2; exit 2; fi
 fi
 mkdir -p "$prefix"
-plugin_dir="$prefix/../share/agent-history/plugin"
-mkdir -p "$plugin_dir"
-cp "$plugin_source" "$plugin_dir/herdr-plugin.toml"
 cp "$source_dir/agent-history" "$prefix/agent-history"
 cp "$source_dir/agent-history-overlay" "$prefix/agent-history-overlay"
 chmod 755 "$prefix/agent-history" "$prefix/agent-history-overlay"
-echo "installed Agent History binaries in $prefix"
-printf 'Link the plugin from a Herdr-managed pane: herdr plugin link "%s"\n' "$plugin_dir"
+if $with_herdr; then
+  plugin_dir="$prefix/../share/agent-history/plugin"
+  mkdir -p "$plugin_dir"
+  cp "$source_dir/agent-history-herdr" "$prefix/agent-history-herdr"
+  chmod 755 "$prefix/agent-history-herdr"
+  cp "$plugin_source" "$plugin_dir/herdr-plugin.toml"
+  echo "installed Agent History CLI, overlay, and Herdr integration in $prefix"
+  printf 'Link the plugin from a Herdr-managed pane: herdr plugin link "%s"\n' "$plugin_dir"
+else
+  echo "installed Agent History CLI and standalone overlay in $prefix"
+  plugin_dir="$prefix/../share/agent-history/plugin"
+  if [ -f "$plugin_dir/herdr-plugin.toml" ]; then
+    echo "existing Herdr integration found; rerun with --with-herdr to update it"
+  fi
+  echo "Herdr integration is available with: $0 --with-herdr $prefix"
+fi

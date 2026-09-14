@@ -145,7 +145,7 @@ Space opens original surrounding user/assistant conversation with repository/bra
 
 ## 22. Herdr integration
 
-Independent core (indexing, SQLite, search, agents) → Herdr adapter → overlay. Host integration opens UI, discovers/focuses active workspaces, creates workspaces for existing worktrees, and starts/focuses agent processes. Core is testable through a CLI.
+Product refinement (September 14, 2026): core indexing/search/preview and the shared terminal UI are independent of Herdr. The standalone CLI/app depends on core and UI only; Enter opens preview. A separate optional Herdr executable depends on those same modules and implements the UI integration boundary for native resume and confirmed recovery. Only that integration discovers/focuses/creates Herdr workspaces and starts native agents. Both apps share the disposable index. Herdr installation is optional for standalone use.
 
 ## 23. CLI
 
@@ -157,7 +157,7 @@ agent-history index
 agent-history status
 ```
 
-Search prints agent, repository/branch, date, and snippet. Herdr remains the primary UX.
+Search prints agent, repository/branch, date, and snippet. `agent-history browse` opens the standalone terminal UI; `agent-history-herdr` provides the optional resume-enabled UI inside Herdr.
 
 ## 24. Performance targets
 

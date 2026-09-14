@@ -4,7 +4,7 @@ V1 is **not released** and GitHub issue #13 remains open. The repository now con
 
 ## Architecture
 
-`agent-history-core` owns native adapters, bounded conversation chunks, disposable SQLite/FTS5, transactional indexing, captured Git context, and source-verified previews. `agent-history-cli` provides index/search/status/preview. `agent-history-herdr` provides the terminal plugin, native-session command construction, public Herdr CLI operations, and recovery confirmation. Native files remain read-only; no daemon or transcript network service is introduced.
+`agent-history-core` owns native adapters, bounded conversation chunks, disposable SQLite/FTS5, transactional indexing, captured Git context, and source-verified previews. `agent-history-tui` owns shared terminal browsing, rendering, and progress. `agent-history-cli` provides standalone browse/index/search/status/preview and the compatibility `agent-history-overlay` entry point. The optional `agent-history-herdr` executable adds native-session command construction, public Herdr CLI operations, and recovery confirmation through the shared UI integration boundary. Native files remain read-only; no daemon or transcript network service is introduced.
 
 ## Issue and PR map
 
@@ -29,12 +29,16 @@ All GitHub issues were inspected as the source backlog. No issue was closed, PR 
 ## Validation evidence
 
 - `./scripts/setup` enabled the pre-push hook.
-- `./scripts/check` passed formatting, Clippy with warnings denied, all 74 tests (51 core, 18 host/controller/renderer, 5 CLI), and the release build using the lockfile.
+- `./scripts/check` passed formatting, Clippy with warnings denied, all 79 tests (51 core, 19 Herdr adapter/preflight, 6 CLI, 3 shared TUI), and the release build using the lockfile.
 - Core regressions cover source identity, generation, partial Unicode records, rollback and competing writers, both adapters, normalized previews, and selected-source session context.
 - Host tests cover exact live-session matching, safe command construction, UI effects, explicit recovery cancellation/confirmation, locked and existing worktree targets, and preserving the original checkout.
 - The current release overlay passed a synthetic PTY interaction check: a 200,000-tool-record startup displayed live elapsed/per-agent progress; F2 restricted visible results to User then Assistant; original preview excluded tools and scrolled to the end of a long wrapped reply; Esc preserved the query/filter and Ctrl-C exited cleanly. No native agent was launched.
 - Independent conversation-flow tests verify both agents’ role filters, excluded tool/reasoning traffic, source immutability, append/restart, and schema 2 upgrade with captured context retained.
 - Packaging smoke installs/uninstalls into an isolated prefix and checks that unrelated output files and synthetic native history remain intact.
+
+## Standalone and optional Herdr modules
+
+Standalone CLI and TUI have no dependency on the Herdr crate. Both `agent-history browse` and `agent-history-overlay` passed synthetic PTY search, Enter-preview, role-filter, and exit checks with no Herdr environment or executables on PATH. Their native fixture remained unchanged. The Herdr entry point refuses a missing managed-pane context before opening the database. Packaging tests cover standalone defaults, explicit `--with-herdr`, missing optional artifacts, and retained unrelated/native files. See MODULES.md for the dependency graph and installation choices.
 
 ## Conversation-only update (September 14)
 

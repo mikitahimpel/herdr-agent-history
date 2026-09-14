@@ -24,4 +24,8 @@ Preview reads the canonical transcript at the stored source range. A deleted or 
 
 ## Packaging or installation stops before copying binaries
 
-Packaging currently targets macOS Apple Silicon and requires both `agent-history` and the host-provided `agent-history-overlay` release binaries. The scripts do not claim clean-user installation or real native-session acceptance. See RELEASE_STATUS.md for the remaining release gate.
+Packaging targets macOS Apple Silicon and includes the standalone `agent-history` and `agent-history-overlay` binaries plus the optional `agent-history-herdr` binary. Herdr itself is not needed to build or install the standalone app. Use `--with-herdr` when installing the optional integration. The scripts do not claim clean-user installation or real native-session acceptance. See RELEASE_STATUS.md for the remaining release gate.
+
+## The Herdr executable says it needs a managed pane
+
+For standalone search and preview, run `agent-history browse` or `agent-history-overlay` in any terminal. To resume through Herdr, open a terminal pane inside Herdr and run `agent-history-herdr`, or use the installed plugin. The two entry points have different Enter actions and share the same index.

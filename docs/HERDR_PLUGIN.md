@@ -1,6 +1,8 @@
 # Agent History Herdr plugin contract (#6)
 
-The companion plugin in `plugin/agent-history/herdr-plugin.toml` opens the `agent-history-overlay` terminal pane through Herdr's public plugin surface. It targets the inspected Herdr 0.7.1 CLI. This is a terminal overlay, not an in-process native widget. The executable must be installed on the plugin process's PATH. Keybinding assignment remains a Herdr configuration step.
+The companion plugin in `plugin/agent-history/herdr-plugin.toml` opens the `agent-history-herdr` terminal pane through Herdr's public plugin surface. It targets the inspected Herdr 0.7.1 CLI. This is a terminal overlay, not an in-process native widget. The optional executable must be installed on the plugin process's PATH (`./install --with-herdr`). It requires a Herdr-managed pane (`HERDR_ENV=1`) before opening the index. `agent-history browse` and `agent-history-overlay` are standalone search/preview commands and never dispatch Herdr actions. Keybinding assignment remains a Herdr configuration step.
+
+The integration uses the shared `agent-history-tui` module for rendering, progress, filters, and preview. Host commands and recovery remain in `agent-history-herdr`.
 
 The overlay opens `~/Library/Application Support/Herdr Agent History/index.sqlite` by default. `--db PATH` overrides `AGENT_HISTORY_DB`, which overrides that default. It discovers both native agents and performs an incremental activation scan before accepting queries, showing processed/failure/skipped-record counts and bounded errors. This scan is synchronous: initial indexing delays the interactive screen. A live elapsed timer and per-agent file counters show progress, including work within large files; preparation/migration also displays a ticker. Records count all parsed JSONL records, while chunks contain only conversation text. There is no daemon or claimed async progress/cancellation implementation.
 

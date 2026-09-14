@@ -2,25 +2,54 @@
 set -eu
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/agent-history-package-test.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT INT TERM
-mkdir -p "$tmp/package" "$tmp/prefix" "$tmp/out"
+package="$tmp/package"
+mkdir -p "$package" "$tmp/default-prefix" "$tmp/optional-prefix" "$tmp/home" "$tmp/share/agent-history/plugin" "$tmp/bin" "$tmp/out"
+printf '#!/bin/sh\ncase "$1" in -s) echo Darwin ;; -m) echo arm64 ;; esac\n' > "$tmp/bin/uname"
+chmod 755 "$tmp/bin/uname"
+cp scripts/install scripts/uninstall "$package/"
+for name in agent-history agent-history-overlay; do
+  printf '#!/bin/sh\n' > "$package/$name"
+  chmod 755 "$package/$name"
+done
+
+# A base artifact may omit every Herdr-specific file.
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" "$tmp/default-prefix" >/dev/null
+test -x "$tmp/default-prefix/agent-history"
+test -x "$tmp/default-prefix/agent-history-overlay"
+test ! -e "$tmp/default-prefix/agent-history-herdr"
+test ! -e "$tmp/share/agent-history/plugin/herdr-plugin.toml"
+
+# Opt-in accepts either argument order and requires both optional artifacts.
+if PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" --with-herdr "$tmp/optional-prefix" >/dev/null 2>&1; then exit 1; fi
+printf '#!/bin/sh\n' > "$package/agent-history-herdr"
+chmod 755 "$package/agent-history-herdr"
+if PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" --with-herdr "$tmp/optional-prefix" >/dev/null 2>&1; then exit 1; fi
+mkdir -p "$package/plugin/agent-history"
+printf 'id = "agent-history"\n' > "$package/plugin/agent-history/herdr-plugin.toml"
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" "$tmp/optional-prefix" --with-herdr >/dev/null
+test -x "$tmp/optional-prefix/agent-history-herdr"
+test -f "$tmp/share/agent-history/plugin/herdr-plugin.toml"
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/uninstall" "$tmp/optional-prefix" >/dev/null
+test ! -e "$tmp/optional-prefix/agent-history-herdr"
+test ! -e "$tmp/share/agent-history/plugin/herdr-plugin.toml"
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" --with-herdr "$tmp/optional-prefix" >/dev/null
+test -x "$tmp/optional-prefix/agent-history-herdr"
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/uninstall" "$tmp/optional-prefix" >/dev/null
+test ! -e "$tmp/optional-prefix/agent-history-herdr"
+
+printf unrelated > "$tmp/default-prefix/keep"
+printf native > "$tmp/native-history"
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/uninstall" "$tmp/default-prefix" >/dev/null
+test -f "$tmp/default-prefix/keep"
+test "$(cat "$tmp/native-history")" = native
+
+if PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" --unknown "$tmp/default-prefix" >/dev/null 2>&1; then exit 1; fi
+if sh "$package/uninstall" relative >/dev/null 2>&1; then exit 1; fi
+
+# Packaging refuses to overwrite an existing archive and preserves neighbors.
 printf marker > "$tmp/out/keep"
 printf old > "$tmp/out/agent-history-macos-arm64.tar.gz"
-if scripts/package "$tmp/out" >/dev/null 2>&1; then exit 1; fi
+if PATH="$tmp/bin:$PATH" sh scripts/package "$tmp/out" >/dev/null 2>&1; then exit 1; fi
 test "$(cat "$tmp/out/keep")" = marker
 test "$(cat "$tmp/out/agent-history-macos-arm64.tar.gz")" = old
-cp scripts/install scripts/uninstall "$tmp/package/"
-for name in agent-history agent-history-overlay; do
-  printf '#!/bin/sh\n' > "$tmp/package/$name"
-  chmod 755 "$tmp/package/$name"
-done
-mkdir -p "$tmp/package/plugin/agent-history"
-printf 'id = "agent-history"\n' > "$tmp/package/plugin/agent-history/herdr-plugin.toml"
-printf native > "$tmp/native-history"
-HOME="$tmp/home" sh "$tmp/package/install" "$tmp/prefix" >/dev/null
-test -x "$tmp/prefix/agent-history"
-test -f "$tmp/share/agent-history/plugin/herdr-plugin.toml"
-printf unrelated > "$tmp/prefix/keep"
-sh "$tmp/package/uninstall" "$tmp/prefix" >/dev/null
-test -f "$tmp/prefix/keep"
-test "$(cat "$tmp/native-history")" = native
 echo "packaging smoke passed"

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/agent-history-core", "crates/agent-history-cli", "crates/agent-history-herdr"]
+members = ["crates/agent-history-core", "crates/agent-history-tui", "crates/agent-history-cli", "crates/agent-history-herdr"]
 resolver = "2"
 
 [workspace.package]
