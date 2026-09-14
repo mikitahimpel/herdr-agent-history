@@ -77,7 +77,7 @@ impl<R: CommandRunner> HerdrCli<R> {
         parse_agent_list(&self.list_agents()?)
     }
 
-    fn list_agents(&mut self) -> Result<String> {
+    pub fn list_agents(&mut self) -> Result<String> {
         self.runner.run(&words(["herdr", "agent", "list"]))
     }
     pub fn focus_workspace(&mut self, id: &str) -> Result<String> {
@@ -102,9 +102,6 @@ impl<R: CommandRunner> HerdrCli<R> {
         session: &Session,
     ) -> Result<String> {
         let plan = NativeResumePlan::for_session(session)?;
-        let pane_id = workspace.root_pane_id.as_ref().ok_or_else(|| {
-            CoreError::Unsupported("Herdr workspace response has no root pane".into())
-        })?;
         if workspace.root_pane_occupied {
             return Err(CoreError::Unsupported(
                 "Herdr workspace pane is occupied; refusing to replace a live agent".into(),
@@ -123,8 +120,6 @@ impl<R: CommandRunner> HerdrCli<R> {
             .into(),
             "--workspace".into(),
             workspace.id.clone(),
-            "--pane".into(),
-            pane_id.clone(),
             "--".into(),
         ];
         argv.extend(plan.argv);
@@ -232,16 +227,82 @@ fn parse_envelope<T: for<'de> Deserialize<'de>>(json: &str) -> Result<Envelope<T
         .map_err(|e| CoreError::Unsupported(format!("invalid Herdr response envelope: {e}")))
 }
 
+impl<R: CommandRunner> crate::HostRuntime for HerdrCli<R> {
+    fn workspaces(&mut self) -> Result<Vec<WorkspaceRecord>> {
+        self.workspace_records()
+    }
+
+    fn agents(&mut self) -> Result<Vec<crate::resume::LiveAgent>> {
+        self.live_agents()
+    }
+
+    fn focus_workspace(&mut self, workspace_id: &str) -> Result<()> {
+        self.focus_workspace(workspace_id).map(|_| ())
+    }
+
+    fn focus_agent(&mut self, agent_id: &str) -> Result<()> {
+        self.focus_agent(agent_id).map(|_| ())
+    }
+
+    fn open_workspace(&mut self, cwd: &std::path::Path) -> Result<WorkspaceRecord> {
+        let response: Envelope<WorkspaceCreatedResult> =
+            parse_envelope(&self.create_workspace(cwd)?)?;
+        let root = response.result.root_pane;
+        Ok(WorkspaceRecord {
+            id: response.result.workspace.workspace_id,
+            cwd: root
+                .cwd
+                .map(Into::into)
+                .unwrap_or_else(|| cwd.to_path_buf()),
+            root_pane_id: Some(root.pane_id),
+            root_pane_occupied: root.agent.is_some(),
+        })
+    }
+
+    fn start_agent(
+        &mut self,
+        workspace: &WorkspaceRecord,
+        session: &agent_history_core::Session,
+        _plan: &crate::resume::NativeResumePlan,
+    ) -> Result<()> {
+        self.start_resume(workspace, session).map(|_| ())
+    }
+}
+
+#[derive(Deserialize)]
+struct WorkspaceCreatedResult {
+    workspace: WorkspaceCreatedWorkspace,
+    root_pane: PaneWire,
+}
+#[derive(Deserialize)]
+struct WorkspaceCreatedWorkspace {
+    workspace_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_history_core::{Agent, SessionId, SourceRef};
+    use std::collections::VecDeque;
 
     struct Recorder(Vec<Vec<String>>);
     impl CommandRunner for Recorder {
         fn run(&mut self, argv: &[String]) -> Result<String> {
             self.0.push(argv.to_vec());
             Ok("{}".into())
+        }
+    }
+
+    struct Queued {
+        commands: Vec<Vec<String>>,
+        responses: VecDeque<String>,
+    }
+    impl CommandRunner for Queued {
+        fn run(&mut self, argv: &[String]) -> Result<String> {
+            self.commands.push(argv.to_vec());
+            self.responses
+                .pop_front()
+                .ok_or_else(|| CoreError::Unsupported("mock response queue exhausted".into()))
         }
     }
 
@@ -286,13 +347,89 @@ mod tests {
                 "codex",
                 "--workspace",
                 "w1",
-                "--pane",
-                "w1:p1",
                 "--",
                 "codex",
                 "resume",
                 "00000000-0000-4000-8000-000000000003"
             ]
         );
+    }
+
+    fn queued(responses: &[&str]) -> HerdrCli<Queued> {
+        HerdrCli::new(Queued {
+            commands: Vec::new(),
+            responses: responses.iter().map(|s| (*s).into()).collect(),
+        })
+    }
+
+    #[test]
+    fn coordinator_closed_workspace_creates_then_starts_exact_resume() {
+        let mut cli = queued(&[
+            r#"{"result":{"workspaces":[]}}"#,
+            r#"{"result":{"workspace":{"workspace_id":"w2"},"root_pane":{"pane_id":"w2:p1","cwd":"/tmp/project"}}}"#,
+            r#"{"result":{"agents":[]}}"#,
+            r#"{"result":{"agent":{}}}"#,
+        ]);
+        crate::resume_in_host(
+            &mut cli,
+            &session(Agent::Codex, "00000000-0000-4000-8000-000000000004"),
+        )
+        .unwrap();
+        let commands = cli.into_inner().commands;
+        assert_eq!(commands.len(), 4);
+        assert_eq!(
+            commands[1][..5],
+            ["herdr", "workspace", "create", "--cwd", "/tmp/project"]
+        );
+        assert_eq!(
+            commands[3].last().unwrap(),
+            "00000000-0000-4000-8000-000000000004"
+        );
+    }
+
+    #[test]
+    fn coordinator_matching_live_session_focuses_without_starting() {
+        let mut cli = queued(&[
+            r#"{"result":{"workspaces":[{"workspace_id":"w1"}]}}"#,
+            r#"{"result":{"panes":[{"pane_id":"w1:p1","cwd":"/tmp/project","agent":"codex"}]}}"#,
+            r#"{"result":{}}"#,
+            r#"{"result":{"agents":[{"workspace_id":"w1","pane_id":"w1:p1","agent":"codex","agent_session":{"value":"00000000-0000-4000-8000-000000000005"}}]}}"#,
+            r#"{"result":{}}"#,
+        ]);
+        crate::resume_in_host(
+            &mut cli,
+            &session(Agent::Codex, "00000000-0000-4000-8000-000000000005"),
+        )
+        .unwrap();
+        let commands = cli.into_inner().commands;
+        assert_eq!(commands[2][..4], ["herdr", "workspace", "focus", "w1"]);
+        assert_eq!(commands[4][..4], ["herdr", "agent", "focus", "w1:p1"]);
+        assert!(!commands.iter().any(|c| c.contains(&"start".into())));
+    }
+
+    #[test]
+    fn occupied_workspace_refuses_different_live_agent_before_start() {
+        let mut cli = queued(&[
+            r#"{"result":{"workspaces":[{"workspace_id":"w1"}]}}"#,
+            r#"{"result":{"panes":[{"pane_id":"w1:p1","cwd":"/tmp/project","agent":"claude"}]}}"#,
+            r#"{"result":{}}"#,
+            r#"{"result":{"agents":[{"workspace_id":"w1","pane_id":"w1:p1","agent":"claude","agent_session":{"value":"00000000-0000-4000-8000-000000000006"}}]}}"#,
+        ]);
+        let error = crate::resume_in_host(
+            &mut cli,
+            &session(Agent::Codex, "00000000-0000-4000-8000-000000000007"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("occupied"));
+        assert_eq!(cli.into_inner().commands.len(), 4);
+    }
+
+    #[test]
+    fn malformed_workspace_envelope_maps_to_explicit_error() {
+        let mut cli = queued(&[r#"{"result":{"unexpected":[]}}"#]);
+        let error = crate::HostRuntime::workspaces(&mut cli).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid Herdr response envelope"));
     }
 }

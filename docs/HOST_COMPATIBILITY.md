@@ -72,20 +72,22 @@ The public CLI and socket API provide the operations needed by the host adapter:
    workspace for an existing checkout. Its response includes the workspace,
    tab, and root pane IDs.
 4. `agent list`, `agent get`, and `agent focus` identify/focus a live agent.
-5. `agent start <name> --kind claude|codex --pane <pane-id> -- <argv...>`
-   starts a supported agent in an existing shell pane and waits for Herdr to
-   detect it. Passing the resume argv after `--` is the supported launch path.
+5. On the installed Herdr 0.7.1, `agent start <name> --workspace <id> --
+   <argv...>` starts a supported agent in that workspace. Passing the resume
+   argv after `--` is the supported launch path. The installed command does
+   not accept the newer source checkout's `--kind` or `--pane` options.
 6. `session.snapshot` plus event subscriptions provide a bootstrap cache and
    live updates for a companion client. The raw method names are
    `workspace.list`, `workspace.focus`, `workspace.create`, `agent.list`,
    `agent.focus`, and `agent.start`.
 
-`agent start` does not create layout itself; the caller must use the pane from
-`workspace create` (or an existing available shell pane). A host adapter should
+`agent start` targets a workspace (or tab/cwd) on 0.7.1; the caller must first
+ensure that the target workspace has an available shell. A host adapter should
 match a historical result to a workspace by persisted cwd/worktree metadata,
 focus that workspace, then resolve the target pane/agent before deciding
 whether to start a resume command. The public surface has no direct
-“workspace by cwd” lookup.
+“workspace by cwd” lookup. The sibling 0.7.5 source has a different lower-level
+`AgentStartParams` shape, so it is not evidence for the installed 0.7.1 CLI.
 
 These operations are documented in the sibling source's
 `docs/versions/0.7.5/website/src/content/docs/agent-automation.mdx` and
