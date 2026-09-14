@@ -5,6 +5,7 @@
 use agent_history_core::{
     adapters::{ClaudeAdapter, CodexAdapter},
     index::{index_all, Indexer},
+    test_support::TempDir,
     AgentAdapter, SessionFile, SqliteStore,
 };
 use std::{
@@ -20,7 +21,8 @@ const TURNS_PER_FILE: usize = 100;
 
 fn line(agent: &str, session: &str, turn: usize, role: &str) -> String {
     let text = format!(
-        "{agent} turn {turn}: We are reviewing portfolio visibility, websocket subscriptions, release indexing, and repository restoration. The implementation should preserve searchable context and transactional offsets while keeping native history canonical."
+        "{agent} turn {turn}: We are reviewing portfolio visibility, websocket subscriptions, release indexing, and repository restoration. The implementation should preserve searchable context and transactional offsets while keeping native history canonical.{}",
+        if turn == 101 { " appendmarker7f4c2a" } else { "" }
     );
     if agent == "claude" {
         serde_json::json!({
@@ -78,8 +80,8 @@ fn percentile(sorted: &[u128], p: usize) -> u128 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
-    let temp_path = temp.path.clone();
+    let temp = TempDir::new("performance")?;
+    let temp_path = temp.path().to_owned();
     let claude_root = temp_path.join("claude/projects");
     let codex_root = temp_path.join("codex/sessions");
     fs::create_dir_all(&claude_root)?;
@@ -108,8 +110,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let indexing_ms = indexing_start.elapsed().as_secs_f64() * 1000.0;
     let status = store.status()?;
     assert_eq!(initial.files, FILES_PER_AGENT as u64 * 2);
+    assert_eq!(initial.records, 40_100);
+    assert_eq!(initial.chunks, 20_000);
+    assert_eq!(initial.failed_files, 0);
     assert_eq!(status.sessions, FILES_PER_AGENT as u64 * 2);
-    assert!(status.chunks > 0 && initial.records > 0);
+    assert_eq!(status.chunks, 20_000);
 
     let append_path = &claude_paths[0];
     let append = line(
@@ -130,7 +135,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let incremental_ms = append_start.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(incremental.bytes_read, append_bytes);
-    assert!(!store.search("transactional", 10)?.is_empty());
+    let sentinel_results = store.search("appendmarker7f4c2a", 10)?;
+    assert!(!sentinel_results.is_empty());
+    assert!(sentinel_results
+        .iter()
+        .any(|result| result.source.path == *append_path));
+    let final_status = store.status()?;
+    assert_eq!(incremental.records, 1);
+    assert_eq!(final_status.sessions, 200);
+    assert_eq!(final_status.chunks, 20_001);
 
     let queries = [
         "portfolio",
@@ -162,42 +175,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sum();
     let p50_us = percentile(&timings, 50);
     let p95_us = percentile(&timings, 95);
-    assert!(store.sessions()?.len() >= FILES_PER_AGENT * 2);
+    assert_eq!(store.sessions()?.len(), FILES_PER_AGENT * 2);
+    let final_raw_bytes = raw_bytes + append_bytes;
     drop(store);
     println!(
         "machine_os={} machine_arch={}",
         std::env::consts::OS,
         std::env::consts::ARCH
     );
-    println!("dataset_files={} files_per_agent={} turns_per_file={} raw_jsonl_bytes={} raw_jsonl_mib={:.2}", FILES_PER_AGENT * 2, FILES_PER_AGENT, TURNS_PER_FILE, raw_bytes, raw_bytes as f64 / 1_048_576.0);
-    println!("discovery_ms={discovery_ms:.3} initial_index_ms={indexing_ms:.3} records={} chunks={} sessions={}", initial.records, status.chunks, status.sessions);
+    println!("dataset_files={} files_per_agent={} turns_per_file={} raw_jsonl_bytes={} raw_jsonl_mib={:.2}", FILES_PER_AGENT * 2, FILES_PER_AGENT, TURNS_PER_FILE, final_raw_bytes, final_raw_bytes as f64 / 1_048_576.0);
+    println!("discovery_ms={discovery_ms:.3} initial_index_ms={indexing_ms:.3} records={} chunks={} sessions={}", initial.records + incremental.records, final_status.chunks, final_status.sessions);
     println!("incremental_append_bytes={} incremental_bytes_read={} incremental_index_ms={incremental_ms:.3}", append_bytes, incremental.bytes_read);
     println!("search_queries=200 warm_p50_us={p50_us} warm_p95_us={p95_us}");
     println!(
         "sqlite_db_wal_shm_bytes={} sqlite_to_raw_ratio={:.3}",
         db_bytes,
-        db_bytes as f64 / raw_bytes as f64
+        db_bytes as f64 / final_raw_bytes as f64
     );
     println!("process_exits_after_measurement=true");
     Ok(())
-}
-
-struct TempDir {
-    path: PathBuf,
-}
-impl TempDir {
-    fn new() -> std::io::Result<Self> {
-        let path =
-            std::env::temp_dir().join(format!("agent-history-performance-{}", std::process::id()));
-        if path.exists() {
-            fs::remove_dir_all(&path)?;
-        }
-        fs::create_dir(&path)?;
-        Ok(Self { path })
-    }
-}
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
 }
