@@ -3,3 +3,6 @@ name = "agent-history-herdr"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[dependencies]
+agent-history-core = { path = "../agent-history-core" }

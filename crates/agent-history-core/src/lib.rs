@@ -1,3 +1,9 @@
 //! Search and indexing core, independent of Herdr.
-//!
-//! Implementation is tracked in docs/BACKLOG.md.
+pub mod contracts;
+pub mod domain;
+pub mod test_support;
+pub use contracts::{
+    AgentAdapter, CoreError, GitContextProvider, IndexBatch, Result, SessionResumer, Store,
+    StoreTransaction,
+};
+pub use domain::*;
