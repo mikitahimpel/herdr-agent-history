@@ -1,6 +1,6 @@
-# V1 release status — local 0.1.0 candidate
+# V1 release status — 0.1.0-rc.1 prerelease
 
-V1 is **not released** and GitHub issue #13 remains open. The repository now contains a working local CLI, terminal overlay, verified-source preview, host resume adapter, confirmed Git worktree recreation, installable package scripts, and synthetic measurements. Implementation and local tests do not establish native-agent resume compatibility or clean-user installation acceptance.
+Stable V1 is **not released** and GitHub issue #13 remains open. The 0.1.0-rc.1 prerelease is intended for testing on another Apple Silicon Mac; publication does not establish the remaining acceptance criteria. The repository now contains a working local CLI, terminal overlay, verified-source preview, host resume adapter, confirmed Git worktree recreation, installable package scripts, and synthetic measurements. Implementation and local tests do not establish native-agent resume compatibility or clean-user installation acceptance.
 
 ## Architecture
 
@@ -24,7 +24,7 @@ V1 is **not released** and GitHub issue #13 remains open. The repository now con
 | #12 Documentation | README, indexing/privacy/recovery notes, plugin guide, benchmark and troubleshooting | Real UI screenshots/native acceptance evidence |
 | #13 Release gate | Local quality gate and synthetic integration evidence | Blocked on the acceptance items above; no release tag |
 
-All GitHub issues were inspected as the source backlog. No issue was closed, PR published, branch protection claimed, or release/tag created by this implementation run. Work is on local branch `codex/v1-integration`.
+All GitHub issues were inspected as the source backlog. No issue is closed by this prerelease. GitHub CI passed on integration commit `3dc90cf`; branch protection has not been verified. The integration work is being promoted to `main` for prerelease distribution.
 
 ## Validation evidence
 
@@ -52,7 +52,7 @@ The reproducible synthetic corpus contains 200 files, 40,100 initial records, 20
 
 This Codex task is outside a Herdr-managed pane: checking `HERDR_ENV=1` failed. The configured Herdr control skill prohibits inspecting or controlling the focused Herdr session from outside Herdr. Consequently, real native-agent launches, active/closed workspace focus and resume, and plugin operation in a live host were not attempted here.
 
-Continue acceptance from a Herdr-managed task with installed Claude Code/Codex integrations and isolated native test sessions. Exercise both agents after their original processes exit, an open workspace, a closed workspace with an existing checkout, confirmed deleted-worktree recovery, and an unavailable repository. Also install the candidate under a clean supported macOS user account. Record results before publishing or tagging V1; mocked tests are not substitutes.
+Continue acceptance from a Herdr-managed task with installed Claude Code/Codex integrations and isolated native test sessions. Exercise both agents after their original processes exit, an open workspace, a closed workspace with an existing checkout, confirmed deleted-worktree recovery, and an unavailable repository. Also install the candidate under a clean supported macOS user account. Record results before publishing or tagging stable V1; mocked tests are not substitutes.
 
 ## Material limitations
 
@@ -61,4 +61,4 @@ Continue acceptance from a Herdr-managed task with installed Claude Code/Codex i
 - Initial activation indexing is synchronous; elapsed time and per-agent/file progress are visible, but search waits for the scan and there is no cancellation API. Derived chunks are retained per file until commit, so memory grows with that file's extracted text.
 - The overlay is a terminal plugin, not an in-process native Herdr widget. Herdr 0.7.1 is the target; later CLI changes require compatibility work.
 - Safe worktree recreation uses the captured commit in detached HEAD state; it does not recreate uncommitted changes or reconstruct unavailable commits.
-- The package is a local candidate, not a published, clean-install-certified release.
+- The package is a testing prerelease; clean-user installation acceptance remains pending.

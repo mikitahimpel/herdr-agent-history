@@ -6,6 +6,12 @@ Local Claude Code and Codex conversation search for macOS. Search and preview wo
 
 A local 0.1.0 candidate implements the CLI, terminal overlay, SQLite indexing, and confirmed worktree recovery. **V1 is not released:** real native-agent resume in Herdr and clean-user macOS installation acceptance remain pending. See [release status](docs/RELEASE_STATUS.md), [indexing limitations](docs/INDEXING.md), and [synthetic performance measurements](docs/PERFORMANCE.md).
 
+## Download
+
+Download the Apple Silicon macOS package from [v0.1.0-rc.1](https://github.com/mikitahimpel/herdr-agent-history/releases/tag/v0.1.0-rc.1). This is a prerelease; native resume and clean-user installation acceptance remain pending. Intel macOS, Windows, and Linux binaries are not included.
+
+Extract `agent-history-macos-arm64.tar.gz`, open a terminal in the extracted `agent-history` folder, and run `./install` (standalone) or `./install --with-herdr` (optional integration). Add `~/.local/bin` to your PATH, then run `agent-history browse`. See below for Herdr plugin registration.
+
 ## Build and install
 
 Apple Silicon macOS is the packaged target. Searching existing native history files requires no Herdr installation or running coding agent. Resuming through the optional integration requires Herdr and the corresponding Claude Code or Codex executable; these are not bundled. The adapter targets the installed Herdr 0.7.1 CLI, with official native-session integrations enabled. Native compatibility evidence and remaining checks are in [host compatibility](docs/HOST_COMPATIBILITY.md).
