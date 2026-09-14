@@ -30,14 +30,12 @@ impl GitContextProvider for GitContextResolver {
         }
         let worktree = worktree
             .map(|path| canonical_output_path(cwd, &path).unwrap_or_else(|| PathBuf::from(path)));
-        let linked = git_dir
-            .as_deref()
-            .map(|path| {
-                Path::new(path)
-                    .components()
-                    .any(|component| component.as_os_str() == "worktrees")
-            })
-            .unwrap_or(false);
+        let linked = match (git_dir.as_deref(), common_dir.as_deref()) {
+            (Some(git_dir), Some(common_dir)) => {
+                canonical_output_path(cwd, git_dir) != canonical_output_path(cwd, common_dir)
+            }
+            _ => false,
+        };
         let repository_root = linked
             .then(|| git_worktree_root(cwd))
             .flatten()
@@ -220,6 +218,40 @@ mod tests {
         let context = GitContextResolver.context(&bare).unwrap();
         assert_eq!(context.repository_root, Some(bare.canonicalize().unwrap()));
         assert_eq!(context.worktree, None);
+    }
+
+    #[test]
+    fn linked_worktree_from_bare_repository_keeps_bare_root() {
+        let temp = TempDir::new("git-bare-linked").unwrap();
+        let source = repository(&temp);
+        let bare = temp.path().join("bare repository");
+        run(
+            &source,
+            &[
+                "clone",
+                "--quiet",
+                "--bare",
+                source.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        let linked = temp.path().join("linked from bare");
+        run(
+            &bare,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature/bare",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let context = GitContextResolver.context(&linked).unwrap();
+        assert_eq!(context.repository_root, Some(bare.canonicalize().unwrap()));
+        assert_eq!(context.worktree, Some(linked.canonicalize().unwrap()));
+        assert_eq!(context.branch.as_deref(), Some("feature/bare"));
+        assert!(context.commit.is_some());
     }
 
     #[test]
