@@ -21,17 +21,33 @@ impl GitContextProvider for GitContextResolver {
             observed_at,
         };
 
-        let Some(worktree) = git_value(cwd, ["rev-parse", "--show-toplevel"]) else {
+        let worktree = git_value(cwd, ["rev-parse", "--show-toplevel"]);
+        let common_dir = git_value(cwd, ["rev-parse", "--git-common-dir"]);
+        let git_dir = git_value(cwd, ["rev-parse", "--git-dir"]);
+        let bare = git_value(cwd, ["rev-parse", "--is-bare-repository"]).as_deref() == Some("true");
+        if worktree.is_none() && !bare {
             return Ok(empty());
-        };
-        let worktree =
-            canonical_output_path(cwd, &worktree).unwrap_or_else(|| PathBuf::from(worktree));
-        let Some(common_dir) = git_value(cwd, ["rev-parse", "--git-common-dir"]) else {
-            return Ok(empty());
-        };
-        let common_dir =
-            canonical_output_path(cwd, &common_dir).unwrap_or_else(|| PathBuf::from(common_dir));
-        let repository_root = common_dir.parent().map(Path::to_path_buf);
+        }
+        let worktree = worktree
+            .map(|path| canonical_output_path(cwd, &path).unwrap_or_else(|| PathBuf::from(path)));
+        let linked = git_dir
+            .as_deref()
+            .map(|path| {
+                Path::new(path)
+                    .components()
+                    .any(|component| component.as_os_str() == "worktrees")
+            })
+            .unwrap_or(false);
+        let repository_root = linked
+            .then(|| git_worktree_root(cwd))
+            .flatten()
+            .or_else(|| worktree.clone())
+            .or_else(|| {
+                common_dir
+                    .as_deref()
+                    .and_then(|path| canonical_output_path(cwd, path))
+            })
+            .or_else(|| common_dir.map(PathBuf::from));
         let repository = repository_root
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned());
@@ -41,7 +57,7 @@ impl GitContextProvider for GitContextResolver {
         Ok(GitContext {
             repository,
             repository_root,
-            worktree: Some(worktree),
+            worktree,
             branch,
             commit,
             observed_at,
@@ -59,8 +75,28 @@ fn git_value<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let output = String::from_utf8_lossy(&output.stdout);
+    let output = output.strip_suffix('\n').unwrap_or(&output);
+    let value = output.strip_suffix('\r').unwrap_or(output).to_owned();
     (!value.is_empty()).then_some(value)
+}
+
+fn git_worktree_root(cwd: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let first = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .find_map(|record| record.strip_prefix(b"worktree "))?;
+    let path = String::from_utf8_lossy(first);
+    canonical_output_path(cwd, &path).or_else(|| Some(PathBuf::from(path.into_owned())))
 }
 
 fn canonical_output_path(cwd: &Path, value: &str) -> Option<PathBuf> {
@@ -85,6 +121,8 @@ mod tests {
             .arg("-C")
             .arg(dir)
             .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .status()
             .unwrap();
         assert!(status.success(), "git {:?} failed", args);
@@ -171,5 +209,45 @@ mod tests {
             assert!(context.commit.is_none());
             assert!(context.observed_at <= SystemTime::now());
         }
+    }
+
+    #[test]
+    fn bare_repository_root_is_the_bare_repository() {
+        let temp = TempDir::new("git-bare").unwrap();
+        let bare = temp.path().join("bare repository");
+        fs::create_dir_all(&bare).unwrap();
+        run(&bare, &["init", "--quiet", "--bare"]);
+        let context = GitContextResolver.context(&bare).unwrap();
+        assert_eq!(context.repository_root, Some(bare.canonicalize().unwrap()));
+        assert_eq!(context.worktree, None);
+    }
+
+    #[test]
+    fn separate_git_dir_uses_checkout_as_repository_root() {
+        let temp = TempDir::new("git-separate").unwrap();
+        let checkout = temp.path().join("checkout with trailing-space ");
+        let git_dir = temp.path().join("metadata");
+        fs::create_dir_all(&checkout).unwrap();
+        run(
+            &checkout,
+            &[
+                "init",
+                "--quiet",
+                "--separate-git-dir",
+                git_dir.to_str().unwrap(),
+            ],
+        );
+        run(&checkout, &["config", "user.email", "test@example.invalid"]);
+        run(&checkout, &["config", "user.name", "Agent History Test"]);
+        fs::write(checkout.join("file"), "content").unwrap();
+        run(&checkout, &["add", "file"]);
+        run(&checkout, &["commit", "--quiet", "-m", "initial"]);
+        let context = GitContextResolver.context(&checkout).unwrap();
+        assert_eq!(
+            context.repository_root,
+            Some(checkout.canonicalize().unwrap())
+        );
+        assert_eq!(context.worktree, Some(checkout.canonicalize().unwrap()));
+        assert!(context.commit.is_some());
     }
 }
