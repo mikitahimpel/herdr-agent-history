@@ -10,3 +10,6 @@ pub use contracts::{
 };
 pub use domain::*;
 pub use git::GitContextResolver;
+
+pub mod storage;
+pub use storage::{IndexStatus, IndexedFileState, SqliteStore};

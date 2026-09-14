@@ -8,6 +8,7 @@ pub enum CoreError {
     InvalidRecord(String),
     Io(std::io::Error),
     Unsupported(String),
+    Storage(String),
 }
 impl fmt::Display for CoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -15,6 +16,7 @@ impl fmt::Display for CoreError {
             Self::InvalidRecord(s) => write!(f, "invalid record: {s}"),
             Self::Io(e) => e.fmt(f),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
+            Self::Storage(s) => write!(f, "storage error: {s}"),
         }
     }
 }
@@ -22,6 +24,11 @@ impl Error for CoreError {}
 impl From<std::io::Error> for CoreError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
+    }
+}
+impl From<rusqlite::Error> for CoreError {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Storage(value.to_string())
     }
 }
 pub trait AgentAdapter {
