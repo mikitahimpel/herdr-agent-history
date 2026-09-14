@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const VERSION: i32 = 1;
+const VERSION: i32 = 2;
 const MAX_LIMIT: usize = 1000;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -115,17 +115,23 @@ impl SqliteStore {
                 "database schema version {version} is newer than supported"
             )));
         }
+        if version == 1 {
+            return Err(CoreError::Unsupported(
+                "schema 1 index must be rebuilt (disposable index; native histories are unchanged)"
+                    .into(),
+            ));
+        }
         if version == 0 {
             let tx = self.conn.transaction()?;
             tx.execute_batch("\
                 CREATE TABLE sessions (agent INTEGER NOT NULL, native_id TEXT NOT NULL, source_path TEXT NOT NULL, source_file_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_start INTEGER NOT NULL DEFAULT 0, source_end INTEGER NOT NULL DEFAULT 0, cwd TEXT, repository TEXT, repository_root TEXT, worktree TEXT, branch TEXT, commit_hash TEXT, started_at INTEGER, ended_at INTEGER, git_observed_at INTEGER, PRIMARY KEY(agent,native_id));
                 CREATE TABLE indexed_files (path TEXT PRIMARY KEY, file_id INTEGER NOT NULL, generation INTEGER NOT NULL, committed_offset INTEGER NOT NULL, size INTEGER NOT NULL, modified INTEGER, open_turn_state BLOB);
-                CREATE TABLE search_chunks (rowid INTEGER PRIMARY KEY, agent INTEGER NOT NULL, native_id TEXT NOT NULL, ordinal INTEGER NOT NULL, timestamp INTEGER, source_path TEXT NOT NULL, source_file_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_start INTEGER NOT NULL, source_end INTEGER NOT NULL, text TEXT NOT NULL, FOREIGN KEY(agent,native_id) REFERENCES sessions(agent,native_id) ON DELETE CASCADE, UNIQUE(agent,native_id,ordinal));
+                CREATE TABLE search_chunks (rowid INTEGER PRIMARY KEY, agent INTEGER NOT NULL, native_id TEXT NOT NULL, ordinal INTEGER NOT NULL, timestamp INTEGER, source_path TEXT NOT NULL, source_file_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_start INTEGER NOT NULL, source_end INTEGER NOT NULL, text TEXT NOT NULL, FOREIGN KEY(agent,native_id) REFERENCES sessions(agent,native_id) ON DELETE CASCADE, UNIQUE(agent,native_id,source_file_id,source_generation,ordinal));
                 CREATE VIRTUAL TABLE chunks_fts USING fts5(text, content='search_chunks', content_rowid='rowid', tokenize='unicode61');
                 CREATE TRIGGER chunks_ai AFTER INSERT ON search_chunks BEGIN INSERT INTO chunks_fts(rowid,text) VALUES (new.rowid,new.text); END;
                 CREATE TRIGGER chunks_ad AFTER DELETE ON search_chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES ('delete',old.rowid,old.text); END;
                 CREATE TRIGGER chunks_au AFTER UPDATE ON search_chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES ('delete',old.rowid,old.text); INSERT INTO chunks_fts(rowid,text) VALUES (new.rowid,new.text); END;
-                PRAGMA user_version=1;")?;
+                PRAGMA user_version=2;")?;
             tx.commit()?;
         }
         Ok(())
@@ -171,7 +177,27 @@ impl SqliteStore {
 
 impl Store for SqliteStore {
     fn commit_batch(&mut self, batch: IndexBatch) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let (Some(expected), Some(file)) = (&batch.expected_file, &batch.file) {
+            let actual = tx.query_row("SELECT path,file_id,generation,committed_offset,size,modified FROM indexed_files WHERE path=?", [pstr(&file.path)], row_file).optional()?;
+            if &actual != expected {
+                return Err(CoreError::Storage(
+                    "index progress changed concurrently; retry".into(),
+                ));
+            }
+            let collision: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM indexed_files WHERE file_id=? AND path<>?)",
+                params![file.file_id, pstr(&file.path)],
+                |r| r.get(0),
+            )?;
+            if collision {
+                return Err(CoreError::Storage(
+                    "source identity allocated concurrently; retry".into(),
+                ));
+            }
+        }
         for (fid, gen) in batch.removed_sources {
             tx.execute(
                 "DELETE FROM search_chunks WHERE source_file_id=? AND source_generation=?",
@@ -188,7 +214,7 @@ impl Store for SqliteStore {
             tx.execute("INSERT INTO sessions(agent,native_id,source_path,source_file_id,source_generation,source_start,source_end,cwd,repository,repository_root,worktree,branch,commit_hash,started_at,ended_at,git_observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent,native_id) DO UPDATE SET source_path=excluded.source_path,source_file_id=excluded.source_file_id,source_generation=excluded.source_generation,source_start=excluded.source_start,source_end=excluded.source_end,cwd=excluded.cwd,repository=excluded.repository,repository_root=excluded.repository_root,worktree=excluded.worktree,branch=excluded.branch,commit_hash=excluded.commit_hash,started_at=excluded.started_at,ended_at=excluded.ended_at,git_observed_at=excluded.git_observed_at",params![agent_i(s.id.agent),s.id.native_id,pstr(&s.source.path),s.source.file_id,s.source.generation,s.source.byte_range.start,s.source.byte_range.end,optp(&s.cwd),s.repository,s.repository_root.as_ref().map(|p|pstr(p)),s.worktree.as_ref().map(|p|pstr(p)),s.branch,s.commit,ts(s.started_at),ts(s.ended_at),ts(s.git_observed_at)])?;
         }
         for c in batch.chunks {
-            tx.execute("INSERT INTO search_chunks(agent,native_id,ordinal,timestamp,source_path,source_file_id,source_generation,source_start,source_end,text) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent,native_id,ordinal) DO UPDATE SET timestamp=excluded.timestamp,source_path=excluded.source_path,source_file_id=excluded.source_file_id,source_generation=excluded.source_generation,source_start=excluded.source_start,source_end=excluded.source_end,text=excluded.text",params![agent_i(c.session_id.agent),c.session_id.native_id,c.ordinal,ts(c.timestamp),pstr(&c.source.path),c.source.file_id,c.source.generation,c.source.byte_range.start,c.source.byte_range.end,c.text])?;
+            tx.execute("INSERT INTO search_chunks(agent,native_id,ordinal,timestamp,source_path,source_file_id,source_generation,source_start,source_end,text) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent,native_id,source_file_id,source_generation,ordinal) DO UPDATE SET timestamp=excluded.timestamp,source_path=excluded.source_path,source_file_id=excluded.source_file_id,source_generation=excluded.source_generation,source_start=excluded.source_start,source_end=excluded.source_end,text=excluded.text",params![agent_i(c.session_id.agent),c.session_id.native_id,c.ordinal,ts(c.timestamp),pstr(&c.source.path),c.source.file_id,c.source.generation,c.source.byte_range.start,c.source.byte_range.end,c.text])?;
         }
         if let Some(f) = batch.file {
             tx.execute("INSERT INTO indexed_files(path,file_id,generation,committed_offset,size,modified,open_turn_state) VALUES(?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET file_id=excluded.file_id,generation=excluded.generation,committed_offset=excluded.committed_offset,size=excluded.size,modified=excluded.modified,open_turn_state=excluded.open_turn_state",params![pstr(&f.path),f.file_id,f.generation,f.committed_offset,f.size,ts(f.modified),batch.open_turn_state])?;
@@ -223,6 +249,25 @@ impl Store for SqliteStore {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+}
+
+impl crate::IndexStore for SqliteStore {
+    fn next_file_id(&self) -> Result<u64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(file_id),0)+1 FROM indexed_files",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+    fn indexed_file_state(&self, path: &Path) -> Result<Option<(IndexedFile, Option<Vec<u8>>)>> {
+        SqliteStore::indexed_file_state(self, path).map(|v| v.map(|s| (s.file, s.open_turn_state)))
+    }
+    fn sessions(&self) -> Result<Vec<Session>> {
+        SqliteStore::sessions(self)
+    }
+    fn session(&self, id: &SessionId) -> Result<Option<Session>> {
+        SqliteStore::session(self, id)
     }
 }
 

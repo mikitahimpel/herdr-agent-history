@@ -41,6 +41,17 @@ pub trait AgentAdapter {
         source: SourceRef,
     ) -> Result<ParsedRecord>;
 }
+impl<T: AgentAdapter + ?Sized> AgentAdapter for &T {
+    fn agent(&self) -> Agent {
+        (*self).agent()
+    }
+    fn discover(&self) -> Result<Vec<SessionFile>> {
+        (*self).discover()
+    }
+    fn parse_record(&self, s: &Session, r: &[u8], src: SourceRef) -> Result<ParsedRecord> {
+        (*self).parse_record(s, r, src)
+    }
+}
 pub trait GitContextProvider {
     fn context(&self, cwd: &Path) -> Result<GitContext>;
 }
@@ -51,6 +62,8 @@ pub trait SessionResumer {
 #[derive(Clone, Debug, Default)]
 pub struct IndexBatch {
     pub file: Option<IndexedFile>,
+    /// Compare-and-swap file progress; Some(None) requires a new path.
+    pub expected_file: Option<Option<IndexedFile>>,
     pub sessions: Vec<Session>,
     pub chunks: Vec<ConversationChunk>,
     pub replaced_chunks: Vec<(SessionId, u64)>,
@@ -62,4 +75,32 @@ pub trait Store {
     fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>>;
     /// Commits file progress, metadata, removals, inserts, and open-turn state atomically.
     fn commit_batch(&mut self, batch: IndexBatch) -> Result<()>;
+}
+impl<T: Store + ?Sized> Store for &mut T {
+    fn search(&self, q: &str, l: usize) -> Result<Vec<SearchResult>> {
+        (**self).search(q, l)
+    }
+    fn commit_batch(&mut self, b: IndexBatch) -> Result<()> {
+        (**self).commit_batch(b)
+    }
+}
+pub trait IndexStore: Store {
+    fn next_file_id(&self) -> Result<u64>;
+    fn indexed_file_state(&self, path: &Path) -> Result<Option<(IndexedFile, Option<Vec<u8>>)>>;
+    fn sessions(&self) -> Result<Vec<Session>>;
+    fn session(&self, id: &SessionId) -> Result<Option<Session>>;
+}
+impl<T: IndexStore + ?Sized> IndexStore for &mut T {
+    fn next_file_id(&self) -> Result<u64> {
+        (**self).next_file_id()
+    }
+    fn indexed_file_state(&self, p: &Path) -> Result<Option<(IndexedFile, Option<Vec<u8>>)>> {
+        (**self).indexed_file_state(p)
+    }
+    fn sessions(&self) -> Result<Vec<Session>> {
+        (**self).sessions()
+    }
+    fn session(&self, id: &SessionId) -> Result<Option<Session>> {
+        (**self).session(id)
+    }
 }

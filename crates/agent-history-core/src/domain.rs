@@ -1,16 +1,17 @@
+use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct InvalidSourceRange;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Agent {
     Claude,
     Codex,
 }
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SessionId {
     pub agent: Agent,
     pub native_id: String,
@@ -25,7 +26,7 @@ impl SessionId {
 }
 
 /// `byte_range` is a half-open byte range and is valid only for `file_id` and `generation`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct SourceRef {
     pub path: PathBuf,
     pub file_id: u64,
@@ -50,13 +51,13 @@ impl SourceRef {
         })
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventKind {
     User,
     Assistant,
     ToolResult,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct NormalizedEvent {
     pub session_id: SessionId,
     pub kind: EventKind,
@@ -64,24 +65,24 @@ pub struct NormalizedEvent {
     pub source: SourceRef,
     pub text: String,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct SessionFile {
     pub path: PathBuf,
     pub file_id: u64,
     pub generation: u64,
 }
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, Eq, PartialEq)]
 pub struct SessionMetadataPatch {
     pub native_id: Option<String>,
     pub cwd: Option<PathBuf>,
     pub started_at: Option<SystemTime>,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct ParsedRecord {
     pub metadata: SessionMetadataPatch,
     pub events: Vec<NormalizedEvent>,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct Session {
     pub id: SessionId,
     pub source: SourceRef,
@@ -95,7 +96,7 @@ pub struct Session {
     pub ended_at: Option<SystemTime>,
     pub git_observed_at: Option<SystemTime>,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct ConversationChunk {
     pub session_id: SessionId,
     pub ordinal: u64,
@@ -103,7 +104,7 @@ pub struct ConversationChunk {
     pub source: SourceRef,
     pub text: String,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct SearchResult {
     pub session_id: SessionId,
     pub agent: Agent,
@@ -114,7 +115,7 @@ pub struct SearchResult {
     pub source: SourceRef,
     pub snippet: String,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct IndexedFile {
     pub path: PathBuf,
     pub file_id: u64,
@@ -123,7 +124,7 @@ pub struct IndexedFile {
     pub size: u64,
     pub modified: Option<SystemTime>,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct GitContext {
     pub repository: Option<String>,
     pub repository_root: Option<PathBuf>,
