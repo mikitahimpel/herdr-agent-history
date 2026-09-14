@@ -15,11 +15,10 @@ pub(crate) fn discover_jsonl(roots: &[PathBuf]) -> Result<Vec<crate::SessionFile
     paths.dedup();
     paths
         .into_iter()
-        .enumerate()
-        .map(|(i, path)| {
+        .map(|path| {
             Ok(crate::SessionFile {
                 path,
-                file_id: (i + 1) as u64,
+                file_id: 0,
                 generation: 0,
             })
         })
@@ -50,6 +49,17 @@ pub(crate) fn object(record: &[u8]) -> Result<serde_json::Value> {
 pub(crate) fn string(v: Option<&serde_json::Value>) -> Option<String> {
     v.and_then(|x| x.as_str()).map(ToOwned::to_owned)
 }
+pub(crate) fn timestamp(v: Option<&serde_json::Value>) -> Option<std::time::SystemTime> {
+    let dt = chrono::DateTime::parse_from_rfc3339(v?.as_str()?).ok()?;
+    if dt.timestamp() < 0 {
+        return None;
+    }
+    Some(
+        std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(dt.timestamp() as u64)
+            + std::time::Duration::from_nanos(dt.timestamp_subsec_nanos() as u64),
+    )
+}
 pub(crate) fn text(v: &serde_json::Value) -> Option<String> {
     if let Some(s) = v.as_str() {
         return Some(s.to_owned());
@@ -66,6 +76,7 @@ pub(crate) fn text(v: &serde_json::Value) -> Option<String> {
     }
     None
 }
+#[cfg(test)]
 pub(crate) fn source(path: &Path, file_id: u64, generation: u64, len: usize) -> crate::SourceRef {
     crate::SourceRef::new(path, file_id, generation, 0..len as u64).expect("valid range")
 }

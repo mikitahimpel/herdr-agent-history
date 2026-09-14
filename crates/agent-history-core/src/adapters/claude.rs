@@ -44,7 +44,7 @@ impl AgentAdapter for ClaudeAdapter {
         let metadata = SessionMetadataPatch {
             native_id: native,
             cwd,
-            started_at: None,
+            started_at: timestamp(v.get("timestamp")),
         };
         let mut kind = match string(v.get("type")).as_deref() {
             Some("user") => EventKind::User,
@@ -74,7 +74,7 @@ impl AgentAdapter for ClaudeAdapter {
                 events.push(NormalizedEvent {
                     session_id: session.id.clone(),
                     kind,
-                    timestamp: None,
+                    timestamp: timestamp(v.get("timestamp")),
                     source,
                     text: s,
                 });
@@ -118,7 +118,7 @@ mod tests {
     #[test]
     fn malformed_is_an_error() {
         assert!(ClaudeAdapter::with_root(".")
-            .parse_record(&session(), b"{", source("x".as_ref(), 1, 0, 0..1))
+            .parse_record(&session(), b"{", source("x".as_ref(), 1, 0, 1))
             .is_err());
     }
 }

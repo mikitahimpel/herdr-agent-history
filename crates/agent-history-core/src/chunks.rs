@@ -26,15 +26,17 @@ pub struct SessionIdState {
 pub struct ChunkBuilder {
     max_bytes: usize,
     pending: Option<OpenTurnState>,
+    next_ordinal: u64,
 }
 impl ChunkBuilder {
     pub fn new(max_bytes: usize) -> Self {
         Self {
-            max_bytes: max_bytes.max(1),
+            max_bytes: max_bytes.max(4),
             pending: None,
+            next_ordinal: 0,
         }
     }
-    pub fn default() -> Self {
+    pub fn with_default_limit() -> Self {
         Self::new(DEFAULT_MAX_CHUNK_BYTES)
     }
     pub fn from_state(max_bytes: usize, bytes: &[u8]) -> Result<Self> {
@@ -47,8 +49,9 @@ impl ChunkBuilder {
             )
         };
         Ok(Self {
-            max_bytes: max_bytes.max(1),
+            max_bytes: max_bytes.max(4),
             pending,
+            next_ordinal: 0,
         })
     }
     pub fn state(&self) -> Result<Vec<u8>> {
@@ -70,6 +73,17 @@ impl ChunkBuilder {
         } else {
             text
         };
+        if let Some(p) = &self.pending {
+            let same = p.file_id == event.source.file_id
+                && p.generation == event.source.generation
+                && p.source_path == event.source.path.to_string_lossy();
+            if !same {
+                let old = self.pending.take().unwrap();
+                let mut out = Self::emit(old);
+                out.extend(self.push(event));
+                return out;
+            }
+        }
         if event.kind == EventKind::User
             && self.pending.as_ref().is_some_and(|p| !p.text.is_empty())
         {
@@ -82,7 +96,7 @@ impl ChunkBuilder {
                 agent: format!("{:?}", event.session_id.agent),
                 native_id: event.session_id.native_id.clone(),
             },
-            ordinal: 0,
+            ordinal: self.next_ordinal,
             timestamp_millis: None,
             source_path: event.source.path.to_string_lossy().into_owned(),
             file_id: event.source.file_id,
@@ -104,7 +118,7 @@ impl ChunkBuilder {
                 let mut q = p.clone();
                 q.text = part.to_owned();
                 out.extend(Self::emit(q));
-                p.ordinal += 1;
+                self.next_ordinal += 1;
             }
             self.pending = None;
         }
@@ -127,6 +141,11 @@ impl ChunkBuilder {
             source,
             text: p.text,
         }]
+    }
+}
+impl Default for ChunkBuilder {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_CHUNK_BYTES)
     }
 }
 fn normalize(s: &str) -> String {

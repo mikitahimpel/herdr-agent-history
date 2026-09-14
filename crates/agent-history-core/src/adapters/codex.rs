@@ -42,9 +42,13 @@ impl AgentAdapter for CodexAdapter {
         let typ = string(v.get("type"));
         let payload = v.get("payload").unwrap_or(&v);
         let metadata = SessionMetadataPatch {
-            native_id: string(payload.get("id").or_else(|| v.get("session_id"))),
+            native_id: if typ.as_deref() == Some("session_meta") {
+                string(payload.get("id").or_else(|| v.get("session_id")))
+            } else {
+                None
+            },
             cwd: string(payload.get("cwd")).map(PathBuf::from),
-            started_at: None,
+            started_at: timestamp(v.get("timestamp")),
         };
         // Codex can emit both response_item and event_msg for one message. event_msg is a
         // transport mirror, so only response_item conversational records are indexed.
@@ -76,7 +80,7 @@ impl AgentAdapter for CodexAdapter {
             .map(|text| NormalizedEvent {
                 session_id: session.id.clone(),
                 kind,
-                timestamp: None,
+                timestamp: timestamp(v.get("timestamp")),
                 source,
                 text,
             })

@@ -1,4 +1,6 @@
 //! Search and indexing core, independent of Herdr.
+pub mod adapters;
+pub mod chunks;
 pub mod contracts;
 pub mod domain;
 pub mod git;
