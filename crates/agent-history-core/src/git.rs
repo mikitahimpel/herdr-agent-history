@@ -68,13 +68,34 @@ impl GitContextProvider for GitContextResolver {
     }
 }
 
+/// Variables git exports to its own subprocesses, notably to hooks. Inheriting them
+/// would resolve the surrounding repository instead of the session cwd, and would let
+/// a `git` run in one repository read or write another.
+pub(crate) const INHERITED_GIT_ENVIRONMENT: [&str; 10] = [
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_QUARANTINE_PATH",
+];
+
+/// A read-only `git` invocation scoped to `cwd` alone.
+pub(crate) fn git_command(cwd: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(cwd);
+    for name in INHERITED_GIT_ENVIRONMENT {
+        command.env_remove(name);
+    }
+    command
+}
+
 fn git_value<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .ok()?;
+    let output = git_command(cwd).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -85,9 +106,7 @@ fn git_value<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
 }
 
 fn git_worktree_root(cwd: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
+    let output = git_command(cwd)
         .args(["worktree", "list", "--porcelain", "-z"])
         .output()
         .ok()?;
@@ -117,18 +136,33 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
     use std::fs;
-    use std::process::Command;
 
     fn run(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        let status = crate::test_support::git_command(dir)
             .args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .status()
             .unwrap();
         assert!(status.success(), "git {:?} failed", args);
+    }
+
+    /// Git exports `GIT_DIR` and `GIT_INDEX_FILE` to hooks, and the pre-push hook runs
+    /// this test suite. An invocation that inherited them would resolve, stage, and
+    /// commit in the surrounding repository instead of the path it was given.
+    #[test]
+    fn git_invocations_do_not_inherit_a_surrounding_repository() {
+        for command in [
+            git_command(Path::new("/tmp")),
+            crate::test_support::git_command(Path::new("/tmp")),
+        ] {
+            let cleared: Vec<&str> = command
+                .get_envs()
+                .filter(|(_, value)| value.is_none())
+                .filter_map(|(name, _)| name.to_str())
+                .collect();
+            for name in INHERITED_GIT_ENVIRONMENT {
+                assert!(cleared.contains(&name), "{name} is still inherited");
+            }
+        }
     }
 
     fn repository(temp: &TempDir) -> PathBuf {
