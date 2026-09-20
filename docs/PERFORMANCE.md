@@ -61,7 +61,7 @@ The measurements above use a 200-file, 16.63 MiB synthetic corpus. That is three
 | --- | --- |
 | Machine | Apple M1, macOS 26.6.2 (build 25G83), `arm64` |
 | Toolchain | rustc/cargo 1.93.1, default release profile (no `[profile.release]` override) |
-| Build | `agent-history` release binary at commit `2c4aabf` (this branch's base, unmodified `crates/**`) |
+| Build | `agent-history` release binary at commit `2c4aabf` (`main`, unmodified `crates/**`) for the "Results" and "pre-fix storage defect" measurements below; the "Post-compaction re-measure" further down was run after rebasing onto `claude/herdr-acceptance` (which includes `claude/git-provenance`'s fix), so it uses a different, newer binary — noted again at that measurement |
 | Corpus | 2,347 real JSONL files, 10,071,982,736 bytes (9.38 GiB) raw, from `~/.claude` and `~/.codex` (`sessions` + `archived_sessions`) |
 | Composition | Codex dominates: 2,326 Codex files (1.5 GiB active sessions + 7.9 GiB archived) vs. 21 Claude files (~43 MiB, growing — this session's own transcript is part of it) |
 
@@ -95,14 +95,36 @@ file_bytes=956096512  ->  live_bytes=115511296 (12.1%), free_bytes=840585216 (87
 
 That database was produced by the schema 2 → 3 rebuild described in `docs/INDEXING.md` ("Database file size may remain unchanged because SQLite retains free pages for reuse"). Its live content — 20,073 chunks, 47.65 MB of chunk text, ~115.5 MB of live pages — is essentially the same content this task's fresh run just measured (20,228 chunks, 47.86 MB of chunk text, ~114.8 MB of live pages; the small difference is corpus growth between when that index was built and this run, including the live-session effect above). But the production file is **956,096,512 bytes: 8.31 times larger** than this run's freshly-built, equivalent-content database (115,003,392 bytes including WAL/SHM). The difference is almost entirely unreclaimed freelist pages (87.9% of the file), not live data.
 
-This isolates the defect to the migration/rebuild path specifically: a plain cold-start `index_all` on unmodified current `main` does **not** reproduce meaningful free-page bloat (0.1% here, vs. 87.9% in the migrated index). That is consistent with a missing compaction step after the schema 3 chunk rebuild removes the old mixed-speaker/tool rows, rather than a general defect in ordinary incremental indexing. This is offered as the pre-fix baseline for judging `claude/git-provenance`'s compaction fix, not a fix itself — this task does not touch `crates/**`.
+This isolates the defect to the migration/rebuild path specifically: a plain cold-start `index_all` on unmodified current `main` does **not** reproduce meaningful free-page bloat (0.1% here, vs. 87.9% in the migrated index). That is consistent with a missing compaction step after the schema 3 chunk rebuild removes the old mixed-speaker/tool rows, rather than a general defect in ordinary incremental indexing.
+
+### Post-compaction re-measure
+
+This branch now sits on top of `claude/git-provenance`'s free-space-reclamation fix (schema 4: a one-time `VACUUM` after a schema upgrade when free pages dominate, plus incremental auto-vacuum going forward; see `docs/INDEXING.md`'s "Free space reclamation" section). To measure its effect on the exact pre-fix database above without ever touching the shared installed index, the file (plus its `-wal`/`-shm` sidecars) was `cp`'d to a private, disposable path, and the new `agent-history status --db <copy>` was run once against the copy — opening a database is enough to trigger the schema upgrade and its one-time `VACUUM`, no reindex required. The original file was left untouched (verified after: still `956096512` bytes, still schema 3) and the copy was deleted immediately after this measurement:
+
+```sh
+copy="$(mktemp -d)/index.sqlite"; chmod 700 "$(dirname "$copy")"
+cp "$HOME/Library/Application Support/Herdr Agent History/index.sqlite" "$copy"
+./target/release/agent-history status --db "$copy"
+sqlite3 "$copy" 'PRAGMA page_count; PRAGMA freelist_count; PRAGMA page_size; PRAGMA user_version;'
+rm -rf "$(dirname "$copy")"
+```
+
+```
+before: page_count=233422 freelist_count=205221 (87.9% free) file_bytes=956096512 schema=3
+after:  page_count=27912  freelist_count=0      (0.0% free) file_bytes=114327552 schema=4
+sessions=2291 chunks=20073 chunk_text_bytes=47650600   (unchanged before -> after: no data loss)
+```
+
+The compaction fix took this exact database from 956,096,512 to 114,327,552 bytes: **8.36x smaller, an 88.0% size reduction**, with live content (2,291 sessions, 20,073 chunks, 47,650,600 bytes of chunk text) byte-for-byte unchanged. Freelist pages went from 205,221 (87.9%) to 0. Against this task's measured raw corpus size (10,071,982,736 bytes), the compacted file is 1.135% — matching, to three significant figures, the 1.14% this task's independent fresh-build measurement found above. That agreement is itself evidence the fix works as intended: a migrated-and-compacted database and a fresh cold-start database now converge on the same storage profile, where before the migrated one was 8.31x larger than the fresh one for equivalent content.
+
+This is the before/after pair for #13's "SQLite size relative to raw history" criterion: the pre-fix baseline (88% free, unevidenced ratio) and the post-fix result (0% free, 1.14% of raw, measured on the identical real corpus and identical live content) are now both recorded on the same real data.
 
 ### #13 non-functional criteria: evidenced vs. not
 
 Evidenced by this run:
 - **Initial indexing time** on a real, private, multi-gigabyte corpus: 84.18 s for 9.38 GiB / 2,347 files.
 - **Peak memory during initial indexing**: 76.9 MB max RSS, well bounded relative to the 9.38 GiB corpus (consistent with the per-record streaming design in `docs/INDEXING.md`).
-- **SQLite size relative to raw history**, decomposed into live vs. freelist bytes, on both a freshly-built index (0.1% free, 1.14% of raw) and the existing pre-fix production index (87.9% free) — the storage criterion is no longer unevidenced, and the free-page finding is now quantified rather than asserted.
+- **SQLite size relative to raw history**, decomposed into live vs. freelist bytes, with a full before/after pair on the same real data: the pre-fix production index (956,096,512 bytes, 87.9% free), that identical database after the compaction fix (114,327,552 bytes, 0.0% free, same 2,291 sessions/20,073 chunks/47,650,600 bytes of live text), and a freshly-built index for comparison (0.1% free, 1.14% of raw). The storage criterion is no longer unevidenced, and the fix's effect is quantified rather than asserted.
 - **Discovery cost as file count grows**: a full rescan of 2,347 unchanged (plus a few genuinely-changed) files completed in 1.51 s, versus 84.18 s for the initial parse of all 9.38 GiB — discovery is characterized separately from full-corpus parse cost.
 - **Incremental byte reads**: the isolated append test read exactly the 376 appended bytes (2 records) and made them searchable; `bytes_read` accounting matches the synthetic benchmark's methodology.
 - **Idle resource use** in the sense this CLI supports: every phase's process exits after its own invocation; there is no daemon to hold memory or CPU between commands.
@@ -120,4 +142,4 @@ Not evidenced, or only partially evidenced, by this run:
 - **One machine, one real corpus, one run.** No repeated trials, no other hardware, no cold-vs-warm filesystem cache comparison beyond what the OS did on its own.
 - **Search timing methodology differs between the synthetic and real-corpus sections of this document** (warm in-process vs. cold CLI invocation), as noted above; they are not directly comparable numbers.
 - **This does not cover Herdr overlay activation, native resume, or worktree recovery** against the real corpus — those require a Herdr-managed session and are out of scope for this task (see `docs/RELEASE_STATUS.md`'s own noted external blocker).
-- **This task does not fix the storage defect.** The 87.9%-free finding on the existing production index is reported as the pre-fix baseline for `claude/git-provenance`'s compaction work, not remediated here; `crates/**` is intentionally untouched.
+- **This task does not author the storage fix.** The compaction logic (`crates/**`) is `claude/git-provenance`'s work, merged into this branch's base; this task only measured its effect before and after, on the real corpus and the real pre-fix database, and did not modify `crates/**` itself.
