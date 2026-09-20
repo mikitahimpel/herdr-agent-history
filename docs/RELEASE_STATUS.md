@@ -29,7 +29,7 @@ All GitHub issues were inspected as the source backlog. No issue is closed by th
 ## Validation evidence
 
 - `./scripts/setup` enabled the pre-push hook.
-- `./scripts/check` passed formatting, Clippy with warnings denied, all 102 tests (69 core, 24 Herdr adapter/preflight/hook, 6 CLI, 3 shared TUI), and the release build using the lockfile.
+- `./scripts/check` passed formatting, Clippy with warnings denied, all 103 tests (69 core, 25 Herdr adapter/preflight/hook, 6 CLI, 3 shared TUI), and the release build using the lockfile.
 - Core regressions cover source identity, generation, partial Unicode records, rollback and competing writers, both adapters, normalized previews, and selected-source session context.
 - Host tests cover exact live-session matching, safe command construction, UI effects, explicit recovery cancellation/confirmation, locked and existing worktree targets, and preserving the original checkout.
 - The current release overlay passed a synthetic PTY interaction check: a 200,000-tool-record startup displayed live elapsed/per-agent progress; F2 restricted visible results to User then Assistant; original preview excluded tools and scrolled to the end of a long wrapped reply; Esc preserved the query/filter and Ctrl-C exited cleanly. No native agent was launched.
@@ -147,10 +147,12 @@ it and consumes it:
   while the variables still describe the pushing worktree, then clears the same
   ten names before running the gate. Nothing is skipped — `scripts/check` still
   runs in full; it simply stops leaking Git state into the suite.
-* Two tests keep the hook and the constant from drifting apart: one asserts the
-  hook unsets every name in `INHERITED_GIT_ENVIRONMENT`, the other asserts the
-  hook resolves the root before clearing, runs the gate afterwards, and never
-  weakens or skips it.
+* Three tests keep the arrangement from drifting apart: one asserts the hook
+  unsets every name in `INHERITED_GIT_ENVIRONMENT`; one asserts the hook
+  resolves the root before clearing, runs the gate afterwards, and never weakens
+  or skips it; and one scans the crate's own sources so a future raw
+  `Command::new("git")` fails the gate instead of silently reintroducing the
+  defect.
 
 ## Exact external blocker and next step
 
