@@ -17,19 +17,19 @@ Stable V1 is **not released** and GitHub issue #13 remains open. The 0.1.0-rc.1 
 | #4 Git context | Main/linked/bare/separate Git directory tests; preserved observations | Index-time metadata is not proof of historical branch state |
 | #5 CLI | Cross-process index/search/status/preview/append tests | Real-history user validation |
 | #8 Core integration | Both agents through discovery → index → search → original preview; synthetic benchmark | Representative private-history validation without committing data |
-| #9 Native resume | UUID-only argv, source validation, official session provenance, no plain-session fallback | Actual Claude/Codex resume after process exit on macOS |
-| #6 Herdr | Functional terminal overlay, mocked host effects, synthetic PTY smoke, confirmed isolated Git recovery | Real active/closed Herdr workspace and native-agent acceptance |
+| #9 Native resume | UUID-only argv, source validation, official session provenance, no plain-session fallback; live macOS resume of both agents after process exit, with resumed turns appended to the original transcript and session ID | Codex could not produce a post-resume model turn (account usage limit); historical sessions with absent or non-UUID native IDs remain unexercised |
+| #6 Herdr | Functional terminal overlay, confirmed isolated Git recovery; live active/closed workspace resume, deleted-worktree recreation, unavailable-repository handling, and the linked plugin overlay route | A Herdr-rendered native overlay is still outside plugin v1; overlay placement remains a terminal pane |
 | #11 Safeguards | Private index, safe open/sidecar rejection, rollback/corruption errors, confirmed recovery | Broader security review; see documented source-mutation limits |
 | #10 Packaging | Apple Silicon archive/checksum, extracted installer, durable plugin path, isolated smoke | Clean-user Mac installation and GitHub release artifacts |
 | #12 Documentation | README, indexing/privacy/recovery notes, plugin guide, benchmark and troubleshooting | Real UI screenshots/native acceptance evidence |
-| #13 Release gate | Local quality gate and synthetic integration evidence | Blocked on the acceptance items above; no release tag |
+| #13 Release gate | Local quality gate, synthetic integration evidence, and scenarios 5-8 executed live against a running Herdr host for both agents | Scenarios 1-4 and 9-10 on a real installation, clean-user macOS installation, and remote CI/branch protection; no release tag |
 
 All GitHub issues were inspected as the source backlog. No issue is closed by this prerelease. GitHub CI passed on integration commit `3dc90cf`; branch protection has not been verified. The integration work is being promoted to `main` for prerelease distribution.
 
 ## Validation evidence
 
 - `./scripts/setup` enabled the pre-push hook.
-- `./scripts/check` passed formatting, Clippy with warnings denied, all 79 tests (51 core, 19 Herdr adapter/preflight, 6 CLI, 3 shared TUI), and the release build using the lockfile.
+- `./scripts/check` passed formatting, Clippy with warnings denied, all 82 tests (51 core, 22 Herdr adapter/preflight, 6 CLI, 3 shared TUI), and the release build using the lockfile.
 - Core regressions cover source identity, generation, partial Unicode records, rollback and competing writers, both adapters, normalized previews, and selected-source session context.
 - Host tests cover exact live-session matching, safe command construction, UI effects, explicit recovery cancellation/confirmation, locked and existing worktree targets, and preserving the original checkout.
 - The current release overlay passed a synthetic PTY interaction check: a 200,000-tool-record startup displayed live elapsed/per-agent progress; F2 restricted visible results to User then Assistant; original preview excluded tools and scrolled to the end of a long wrapped reply; Esc preserved the query/filter and Ctrl-C exited cleanly. No native agent was launched.
@@ -48,11 +48,90 @@ The current build excludes tool traffic and supports All/User/Assistant search f
 
 The reproducible synthetic corpus contains 200 files, 40,100 initial records, 20,000 chunks, and about 16.63 MiB of JSONL. The recorded Apple Silicon release run measured initial indexing at 839.899 ms; a uniquely identifiable 449-byte append at 59.716 ms; warm search p50/p95 at 16.145/17.241 ms; and maximum RSS at 12,353,536 bytes. SQLite plus WAL/SHM occupied 22,500,416 bytes, 1.290 times raw input. This is synthetic evidence, not representative private-history acceptance. See [PERFORMANCE.md](PERFORMANCE.md) for reproduction and scope.
 
+## Live Herdr acceptance run (September 20)
+
+Scenarios 5-8 of issue #13 were executed for both agents against the running
+Herdr host, from a Herdr-managed pane (`HERDR_ENV=1`, workspace `wBS`, pane
+`wBS:p2`). Versions were re-confirmed on the machine: Herdr `0.7.1`, Claude
+Code `2.1.278`, Codex CLI `0.153.4`. No behavior below is mocked.
+
+### Test material
+
+A disposable repository at `/Users/mikitahimpel/Developer/hah-acceptance-sandbox`
+(main checkout `repo` plus linked worktrees `wt-claude` and `wt-codex`, commit
+`2d2a67ae8ecea75010aac2f08061f88a3dca34ed`) carried the run. Four real native
+sessions were produced by launching agents in Herdr panes and then letting each
+process exit: Claude `98954618-5750-4e90-99c9-9de33981e3f6` in `wt-claude`,
+Codex `01a0bf48-6de4-70d2-a3db-1496ef1c4747` in `wt-codex`, and Claude
+`c02a0be9-6c2a-493f-b815-ab63701179de` and Codex
+`01a0bf57-d486-78f1-a8f3-61fc5f9d89e4` in throwaway repositories that were then
+deleted. Testing used a private index at `/tmp/hah-acceptance/index.sqlite` over
+the real native roots; the shared index was not modified. Only sandbox
+worktrees were deleted or recreated, and only workspaces created by the run
+were closed.
+
+### Results
+
+- **Scenario 5, active Herdr workspace.** For both agents Enter issued
+  `workspace focus`, `agent list`, `agent focus <pane>` and no `agent start`.
+  Process identity was unchanged across the second Enter (Claude PID `97418`,
+  Codex PID `21663`; totals 8 and 2 before and after). Verified by tracing the
+  adapter's host commands through `HERDR_BIN_PATH`, not by reading UI text.
+- **Scenario 6, closed workspace with an existing worktree.** After closing the
+  workspace and confirming the agent process had exited, Enter created a
+  workspace for the recorded cwd and started `claude --resume <id>` /
+  `codex resume <id>`. The resumed Claude answered a question about the earlier
+  turn without being told the answer, and re-indexing showed the new turns
+  appended to the *original* transcript file under the *original* session ID —
+  the resume continued that conversation rather than forking a new one. Codex
+  replayed the recorded conversation and warned that the session had been
+  recorded under a different model, confirming it loaded the recorded session.
+- **Scenario 7, deleted worktree.** Deleting a sandbox worktree produced the
+  recovery menu with no host command and no filesystem change. Declining the
+  confirmation left the checkout absent, the registration merely prunable, and
+  the main checkout at its original commit and branch. Confirming recreated the
+  checkout in detached HEAD at the captured commit and then resumed the native
+  session. Exercised for both agents.
+- **Scenario 8, repository unavailable.** With the whole repository deleted,
+  both transcripts stayed searchable and previewable from native history, and
+  Enter reported that the recorded workspace is unavailable, offering only
+  viewing and cancelling. No host command was issued and no unrelated agent was
+  started.
+- **Plugin route.** `herdr plugin link` and
+  `herdr plugin pane open --plugin agent-history --entrypoint search` opened a
+  working overlay pane running `agent-history-herdr` against the shared index,
+  and `herdr plugin pane close <pane_id>` closed it. The documented
+  `plugin pane close` invocation takes a pane ID, not the plugin/entrypoint
+  pair.
+
+### Defect found and fixed
+
+Herdr's Codex integration reports a native session ID only when Codex *creates*
+a session; a pane running `codex resume <id>` reports none. The adapter
+therefore failed to recognize its own live Codex resume, issued `agent start`,
+and Herdr refused it with `agent_name_taken`. No duplicate process was created,
+but the overlay reported only a bare Herdr exit status instead of focusing
+the live session. The adapter now names a resumed pane
+`agent-history-<native session id>` and, when the host reports no session ID for
+a pane, matches that name; a pane reporting a *different* session ID is still
+never treated as a match. Host failures now report the subcommand and the
+host's own message. Both changes are covered by new adapter regressions and
+were re-validated live: Codex scenario 5 then issued `agent focus` with no
+`agent start`, and Claude continued to match on its reported session ID.
+
 ## Exact external blocker and next step
 
-This Codex task is outside a Herdr-managed pane: checking `HERDR_ENV=1` failed. The configured Herdr control skill prohibits inspecting or controlling the focused Herdr session from outside Herdr. Consequently, real native-agent launches, active/closed workspace focus and resume, and plugin operation in a live host were not attempted here.
+Codex could not produce a *new* model turn after resume: this machine's Codex
+account is rate limited until September 22, and every Codex turn returned
+`You've hit your usage limit`. Codex resume was therefore verified by recorded
+conversation replay and by Codex's own recorded-model warning, not by asking the
+resumed agent to recall an earlier fact. Repeat the Claude recall check for
+Codex once credits are available.
 
-Continue acceptance from a Herdr-managed task with installed Claude Code/Codex integrations and isolated native test sessions. Exercise both agents after their original processes exit, an open workspace, a closed workspace with an existing checkout, confirmed deleted-worktree recovery, and an unavailable repository. Also install the candidate under a clean supported macOS user account. Record results before publishing or tagging stable V1; mocked tests are not substitutes.
+The remaining V1 acceptance work is unchanged by this run: issue #13 scenarios
+1-4 and 9-10 against a real installation, clean-user macOS installation of the
+Apple Silicon artifact, and verified remote CI and branch protection. Record
+those results before tagging stable V1; mocked tests are not substitutes.
 
 ## Material limitations
 

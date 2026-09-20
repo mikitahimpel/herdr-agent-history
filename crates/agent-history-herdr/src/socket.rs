@@ -28,8 +28,9 @@ impl CommandRunner for ProcessRunner {
             .output()
             .map_err(CoreError::Io)?;
         if !output.status.success() {
+            let (subcommand, detail) = failure_detail(args, &output.stdout, &output.stderr);
             return Err(CoreError::Unsupported(format!(
-                "Herdr command `{program}` failed with {}",
+                "Herdr `{program} {subcommand}` failed with {}: {detail}",
                 output.status
             )));
         }
@@ -109,12 +110,11 @@ impl<R: CommandRunner> HerdrCli<R> {
         let plan = NativeResumePlan::for_session(session)?;
         // Herdr v0.7.1 starts a new split for --workspace; it never replaces
         // an occupied pane. Explicit --focus makes Enter activate that split.
-        let name = format!("agent-history-{}", &session.id.native_id[..8]);
         let mut argv = vec![
             "herdr".into(),
             "agent".into(),
             "start".into(),
-            name,
+            plan.agent_name.clone(),
             "--workspace".into(),
             workspace.id.clone(),
             "--cwd".into(),
@@ -129,6 +129,43 @@ impl<R: CommandRunner> HerdrCli<R> {
 
 fn words<const N: usize>(parts: [&str; N]) -> Vec<String> {
     parts.into_iter().map(str::to_owned).collect()
+}
+
+/// Host failures are otherwise indistinguishable from each other in the
+/// overlay, which reports only an exit status. Only the command name and the
+/// host's own message are surfaced; arguments may contain session paths.
+fn failure_detail(args: &[String], stdout: &[u8], stderr: &[u8]) -> (String, String) {
+    let subcommand = args
+        .iter()
+        .take_while(|arg| !arg.starts_with('-') && *arg != "--")
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let message = host_message(stdout).or_else(|| host_message(stderr));
+    (
+        subcommand,
+        message.unwrap_or_else(|| "no diagnostic output".into()),
+    )
+}
+
+fn host_message(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let message = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")?
+                .get("message")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| text.to_owned());
+    Some(message.chars().take(200).collect())
 }
 
 pub fn parse_workspace_list(json: &str) -> Result<Vec<WorkspaceRecord>> {
@@ -188,6 +225,8 @@ struct AgentWire {
     pane_id: String,
     agent: Option<String>,
     #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
     agent_session: Option<AgentSessionWire>,
 }
 #[derive(Deserialize)]
@@ -220,6 +259,7 @@ pub fn parse_agent_list(json: &str) -> Result<Vec<crate::resume::LiveAgent>> {
                 workspace_id: a.workspace_id,
                 agent,
                 session_id,
+                name: a.name,
             }))
         })
         .filter_map(|item| match item {
@@ -355,7 +395,7 @@ mod tests {
                 "herdr",
                 "agent",
                 "start",
-                "agent-history-00000000",
+                "agent-history-00000000-0000-4000-8000-000000000003",
                 "--workspace",
                 "w1",
                 "--cwd",
@@ -446,7 +486,7 @@ mod tests {
                 "herdr",
                 "agent",
                 "start",
-                "agent-history-00000000",
+                "agent-history-00000000-0000-4000-8000-000000000007",
                 "--workspace",
                 "w1",
                 "--cwd",
@@ -485,6 +525,88 @@ mod tests {
         assert_eq!(
             agents[1].session_id.as_ref().unwrap().native_id,
             "00000000-0000-4000-8000-000000000009"
+        );
+    }
+
+    #[test]
+    fn live_agent_without_reported_session_is_focused_by_its_resume_name() {
+        // Herdr's Codex integration reports a session ID on creation only, so a
+        // pane running `codex resume` reports none. Restarting it would be
+        // refused by the host as a duplicate name instead of focusing it.
+        let mut cli = queued(&[
+            r#"{"result":{"workspaces":[{"workspace_id":"w1"}]}}"#,
+            r#"{"result":{"panes":[{"pane_id":"w1:p1","cwd":"/tmp/project"}]}}"#,
+            r#"{"result":{}}"#,
+            r#"{"result":{"agents":[{"workspace_id":"w1","pane_id":"w1:p2","agent":"codex","name":"agent-history-00000000-0000-4000-8000-000000000011"}]}}"#,
+            r#"{"result":{}}"#,
+        ]);
+        crate::resume_in_host_with_checker(
+            &mut cli,
+            &session(Agent::Codex, "00000000-0000-4000-8000-000000000011"),
+            |_| true,
+        )
+        .unwrap();
+        let commands = cli.into_inner().commands;
+        assert_eq!(commands[4][..4], ["herdr", "agent", "focus", "w1:p2"]);
+        assert!(!commands.iter().any(|c| c.contains(&"start".into())));
+    }
+
+    #[test]
+    fn resume_name_of_another_session_is_never_focused() {
+        let start = |responses: &[&str]| {
+            let mut cli = queued(responses);
+            crate::resume_in_host_with_checker(
+                &mut cli,
+                &session(Agent::Codex, "00000000-0000-4000-8000-000000000012"),
+                |_| true,
+            )
+            .unwrap();
+            cli.into_inner().commands
+        };
+        let listed = |agents: &str| {
+            [
+                r#"{"result":{"workspaces":[{"workspace_id":"w1"}]}}"#.to_owned(),
+                r#"{"result":{"panes":[{"pane_id":"w1:p1","cwd":"/tmp/project"}]}}"#.to_owned(),
+                r#"{"result":{}}"#.to_owned(),
+                format!(r#"{{"result":{{"agents":[{agents}]}}}}"#),
+                r#"{"result":{"agent":{}}}"#.to_owned(),
+            ]
+        };
+        // A pane resuming a different session, and a pane whose reported
+        // session ID contradicts the name, both start a fresh resume instead.
+        for agents in [
+            r#"{"workspace_id":"w1","pane_id":"w1:p2","agent":"codex","name":"agent-history-00000000-0000-4000-8000-000000000013"}"#,
+            r#"{"workspace_id":"w1","pane_id":"w1:p2","agent":"codex","name":"agent-history-00000000-0000-4000-8000-000000000012","agent_session":{"source":"herdr:codex","agent":"codex","kind":"id","value":"00000000-0000-4000-8000-000000000013"}}"#,
+        ] {
+            let responses = listed(agents);
+            let commands = start(&responses.iter().map(String::as_str).collect::<Vec<_>>());
+            assert_eq!(commands[4][..3], ["herdr", "agent", "start"]);
+            assert_eq!(
+                commands[4][3],
+                "agent-history-00000000-0000-4000-8000-000000000012"
+            );
+            assert!(!commands.iter().any(|c| c.contains(&"focus".into())
+                && c.contains(&"agent".into())
+                && c.contains(&"w1:p2".into())));
+        }
+    }
+
+    #[test]
+    fn host_failures_report_the_command_and_the_hosts_own_message() {
+        let (subcommand, detail) = failure_detail(
+            &words(["agent", "start", "agent-history-x", "--workspace", "w1"]),
+            br#"{"error":{"code":"agent_name_taken","message":"agent name agent-history-x is already used"},"id":"cli:agent:start"}"#,
+            b"",
+        );
+        assert_eq!(subcommand, "agent start");
+        assert_eq!(detail, "agent name agent-history-x is already used");
+        assert_eq!(
+            failure_detail(&words(["workspace", "focus"]), b"", b"no such workspace\n").1,
+            "no such workspace"
+        );
+        assert_eq!(
+            failure_detail(&words(["agent", "list"]), b"", b"").1,
+            "no diagnostic output"
         );
     }
 

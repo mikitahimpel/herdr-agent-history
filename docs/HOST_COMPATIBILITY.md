@@ -1,9 +1,9 @@
 # Herdr host compatibility evidence
 
-Research date: 2026-09-14. This records the installed tools and the local
-Herdr source that were inspected for issues #6 (overlay and resume UX) and #9
-(native resume compatibility). No agent process was launched and no native
-transcript was read.
+Research date: 2026-09-14; live host validation added 2026-09-20. This records
+the installed tools and the local Herdr source that were inspected for issues #6
+(overlay and resume UX) and #9 (native resume compatibility), and the behavior
+observed when the adapter was run against the running host.
 
 ## Observed versions
 
@@ -12,7 +12,7 @@ The installed commands report:
 | Component | Evidence |
 | --- | --- |
 | Herdr CLI | `herdr --version` → `herdr 0.7.1` |
-| Claude Code | `claude --version` → `2.1.241 (Claude Code)` |
+| Claude Code | `claude --version` → `2.1.278 (Claude Code)` on 2026-09-20 (`2.1.241` when first researched) |
 | Codex CLI | `codex --version` → `codex-cli 0.153.4` |
 | Herdr Claude integration | `herdr integration status` → current, v7 |
 | Herdr Codex integration | `herdr integration status` → current, v6 |
@@ -31,6 +31,17 @@ The installed integration files are:
 Both hooks report a native `agent_session_id` through the local Herdr socket
 using `pane.report_agent_session`. Claude also reports a transcript path, but
 Herdr's resume planner uses the ID for Claude and Codex.
+
+The two integrations do not report equally. Codex's hook is registered for
+`SessionStart` only (`~/.codex/hooks.json`), and a live pane running
+`codex resume <id>` carries no `agent_session` field in `herdr agent list`;
+Claude's pane reports its session ID on resume as well. The adapter therefore
+cannot identify a resumed Codex pane by native session ID. It names every pane
+it starts `agent-history-<native session id>` and falls back to that name when
+the host reports no session ID, while still refusing to match a pane that
+reports a different one. Herdr 0.7.1 accepts and echoes that 50-character name,
+and it additionally rejects a second `agent start` under a name already in use
+(`agent_name_taken`), which is what surfaced the gap.
 
 ## Verified native resume contract
 
@@ -53,12 +64,18 @@ missing, stale, or unsupported references fall back to an ordinary shell on
 Herdr restore; the product adapter must surface that as an unavailable resume
 capability rather than silently claiming success.
 
-This proves command construction and the CLI's accepted shape. It does not
-prove that a historical session can be resumed on this machine. Manual
-validation remains required for a sanitized test session in each agent, with
-the original process stopped, in the original directory and in a different
-existing checkout. Deleted-worktree recovery also remains unvalidated and must
-continue to require explicit confirmation before Git/filesystem mutation.
+Both invocations were executed live on 2026-09-20 against sessions whose
+original processes had exited. `claude --resume <id>` restored the conversation
+and answered a question that only the earlier turn supported; the new turns were
+appended to the original transcript file under the original session ID, so the
+resume continued that conversation rather than starting an unrelated one.
+`codex resume <id>` restored the recorded conversation and warned that the
+session had been recorded under a different model. Deleted-worktree recovery was
+exercised for both agents against a disposable repository: the recovery menu
+appears with no host command and no filesystem change, declining leaves the
+checkout absent and the main checkout untouched, and confirming recreates the
+checkout in detached HEAD at the captured commit. See
+[release status](RELEASE_STATUS.md) for the full run and its limits.
 
 ## Supported Herdr control surface
 
@@ -111,7 +128,12 @@ popup.
 
 The installed 0.7.1 binary confirms this route with `herdr plugin --help`, which
 exposes `plugin link`, `plugin list`, declared `plugin action`, and
-`plugin pane open|focus|close`. It does not expose `herdr api schema`; schema
+`plugin pane open|focus|close`. The route was run end to end on 2026-09-20:
+`plugin link` on the installed durable path re-registered the plugin,
+`plugin pane open --plugin agent-history --entrypoint search` opened a working
+overlay pane running `agent-history-herdr`, and the pane closed with
+`plugin pane close <pane_id>` — that subcommand takes a pane ID rather than the
+plugin and entrypoint pair. It does not expose `herdr api schema`; schema
 export is present in the inspected 0.7.5 source/docs and must therefore be
 treated as a newer-host convenience rather than a 0.7.1 prerequisite. The
 plugin CLI itself is sufficient for linking and operating a declared pane.
@@ -132,14 +154,17 @@ recorded in an ADR before implementation.
 * Require current integration versions at install/runtime. The observed
   installed versions are current (Claude v7, Codex v6); Herdr 0.7.5's session
   state documentation lists native restore minimums of Claude v6 and Codex v5.
-* Treat native resume command construction as verified, while marking actual
-  historical resume behavior as pending macOS manual validation.
+* Native resume command construction and actual historical resume behavior are
+  both verified on macOS for Claude. Codex resume is verified up to conversation
+  restoration; a post-resume model turn is still unverified because the account
+  is rate limited.
 * A terminal-pane plugin is implementable against the current host contract.
   A native search overlay is blocked on a Herdr companion change because
   plugin v1 has no native non-terminal UI extension point.
-* Live socket/API probing was not performed: this checkout is outside a
-  Herdr-managed pane (`HERDR_ENV` is not set), and the Herdr control skill
-  requires that environment for inspecting a running session. No live server
-  was started.
+* Live socket/API probing has now been performed from a Herdr-managed pane
+  against the user's running server; no server was started or stopped, and only
+  workspaces created by that run were closed. Adapter host commands were
+  captured by pointing `HERDR_BIN_PATH` at a logging wrapper around the real
+  `herdr` binary.
 * No source/API was unavailable: a local Herdr source checkout and published
   source documentation were available for inspection.
