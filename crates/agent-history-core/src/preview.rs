@@ -17,6 +17,14 @@ pub struct Preview {
 /// the same native session ID. Call `preview_source` to also verify the current
 /// native file before starting a resume operation.
 pub fn session_for_source<S: IndexStore>(store: &S, source: &SourceRef) -> Result<crate::Session> {
+    Ok(session_record_for_source(store, source)?.session)
+}
+/// The same metadata with the origin of its Git fields, so a caller can tell a live
+/// observation from a claim the transcript recorded before its worktree was deleted.
+pub fn session_record_for_source<S: IndexStore>(
+    store: &S,
+    source: &SourceRef,
+) -> Result<crate::SessionRecord> {
     let (indexed, bytes) = store.indexed_file_state(&source.path)?.ok_or_else(stale)?;
     if indexed.file_id != source.file_id
         || indexed.generation != source.generation
@@ -25,7 +33,12 @@ pub fn session_for_source<S: IndexStore>(store: &S, source: &SourceRef) -> Resul
     {
         return Err(stale());
     }
-    Ok(crate::index::decode(bytes.as_deref().ok_or_else(stale)?)?.session)
+    let checkpoint = crate::index::decode(bytes.as_deref().ok_or_else(stale)?)?;
+    let git = checkpoint.provenance();
+    Ok(crate::SessionRecord {
+        session: checkpoint.session,
+        git,
+    })
 }
 /// Verify the indexed generation and read complete records in a bounded window.
 /// Context and total read allocation are capped regardless of the source range.

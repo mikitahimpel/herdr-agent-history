@@ -1,7 +1,8 @@
 //! Transactional indexing. Native files are opened read-only.
 use crate::{
-    chunks::ChunkBuilder, AgentAdapter, CoreError, GitContextProvider, IndexBatch, IndexStore,
-    IndexedFile, Result, Session, SessionFile, SessionId, SourceRef,
+    chunks::ChunkBuilder, AgentAdapter, CoreError, GitContextProvider, GitOrigin, GitProvenance,
+    IndexBatch, IndexStore, IndexedFile, RecordedGit, Result, Session, SessionFile, SessionId,
+    SessionRecord, SourceRef,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,8 +12,9 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     os::unix::fs::MetadataExt,
     path::Path,
+    time::SystemTime,
 };
-const CHECKPOINT_FORMAT_VERSION: u32 = 1;
+const CHECKPOINT_FORMAT_VERSION: u32 = 2;
 pub const DEFAULT_MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
 const PROGRESS_RECORD_INTERVAL: u64 = 128;
 const PROGRESS_BYTE_INTERVAL: u64 = 1024 * 1024;
@@ -50,6 +52,13 @@ pub(crate) struct Checkpoint {
     #[serde(default)]
     pub format_version: u32,
     pub session: Session,
+    /// Provenance of `session`'s Git fields. Absent in checkpoints written before
+    /// provenance was labelled, where only live observation could fill them.
+    #[serde(default)]
+    pub git: Option<GitProvenance>,
+    /// Git facts recovered from the transcript so far, preserved across appends.
+    #[serde(default)]
+    pub recorded_git: RecordedGit,
     pub builder: Vec<u8>,
     pub dev: u64,
     pub ino: u64,
@@ -212,7 +221,18 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
                 &checkpoint.as_ref().unwrap().builder,
             )?
         };
-        let mut session = if rebuild && !same_content {
+        let fresh = rebuild && !same_content;
+        let mut recorded = if fresh {
+            RecordedGit::default()
+        } else {
+            checkpoint.as_ref().unwrap().recorded_git.clone()
+        };
+        let previous_provenance = if fresh {
+            None
+        } else {
+            checkpoint.as_ref().unwrap().provenance()
+        };
+        let mut session = if fresh {
             Session::placeholder(self.adapter.agent(), path, fid, generation)
         } else {
             // A format-only rebuild must not erase captured Git context for a deleted cwd.
@@ -262,6 +282,9 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
                     if let Some(cwd) = parsed.metadata.cwd {
                         session.cwd = Some(cwd)
                     }
+                    if let Some(git) = &parsed.metadata.git {
+                        recorded.fill_missing(git)
+                    }
                     if session.started_at.is_none() {
                         session.started_at = parsed.metadata.started_at
                     }
@@ -294,22 +317,39 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
                 "source changed during indexing; retry".into(),
             ));
         }
-        if let Some(cwd) = &session.cwd {
-            let context = if let Some(c) = cache.get(cwd) {
-                c.clone()
-            } else {
-                let c = crate::git::GitContextResolver.context(cwd)?;
-                cache.insert(cwd.clone(), c.clone());
-                c
-            };
-            if context.repository_root.is_some() {
-                session.repository = context.repository;
-                session.repository_root = context.repository_root;
-                session.worktree = context.worktree;
-                session.branch = context.branch;
-                session.commit = context.commit;
-                session.git_observed_at = Some(context.observed_at);
-            }
+        let observed = match &session.cwd {
+            Some(cwd) => match cache.get(cwd) {
+                Some(context) => Some(context.clone()),
+                None => {
+                    let context = crate::git::GitContextResolver.context(cwd)?;
+                    cache.insert(cwd.clone(), context.clone());
+                    Some(context)
+                }
+            },
+            None => None,
+        };
+        // A live observation is the strongest fact and replaces anything held before.
+        // Otherwise a previous observation is kept, because it knows where the worktree
+        // lived; only when neither exists does the transcript's own record apply.
+        let applied = observed
+            .filter(|context| context.repository_root.is_some())
+            .or_else(|| {
+                (previous_provenance.as_ref().map(|p| p.origin) != Some(GitOrigin::Observed))
+                    .then(|| recorded.as_context(SystemTime::now()))
+                    .flatten()
+            });
+        let mut provenance = previous_provenance;
+        if let Some(context) = applied {
+            session.repository = context.repository;
+            session.repository_root = context.repository_root;
+            session.worktree = context.worktree;
+            session.branch = context.branch;
+            session.commit = context.commit;
+            session.git_observed_at = Some(context.observed_at);
+            provenance = Some(GitProvenance {
+                origin: context.origin,
+                repository_url: context.repository_url,
+            });
         }
         session.source = SourceRef::new(path, fid, generation, 0..cursor).unwrap();
         let (head, tail) = sample(&mut file, meta.len())?;
@@ -321,6 +361,8 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
         let state = serde_json::to_vec(&Checkpoint {
             format_version: CHECKPOINT_FORMAT_VERSION,
             session: session.clone(),
+            git: provenance.clone(),
+            recorded_git: recorded,
             builder: builder.state()?,
             dev: meta.dev(),
             ino: meta.ino(),
@@ -345,7 +387,10 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
                 modified: meta.modified().ok(),
             }),
             expected_file: Some(expected.clone()),
-            sessions: vec![session],
+            sessions: vec![SessionRecord {
+                session,
+                git: provenance,
+            }],
             chunks,
             removed_sources: if rebuild {
                 expected
@@ -472,7 +517,28 @@ pub fn index_all_with_progress<S: IndexStore, C: FnMut(IndexProgress)>(
             }
         }
     }
+    // Rebuilt sources leave their replaced pages free; return them to the filesystem.
+    if let Err(e) = store.reclaim_free_pages() {
+        if total.errors.len() < 32 {
+            total.errors.push(format!("index maintenance: {e}"))
+        }
+    }
     Ok(total)
+}
+impl Checkpoint {
+    /// Older checkpoints carry no origin, but only a live `git` invocation could ever
+    /// have filled these fields, so they are observations.
+    pub(crate) fn provenance(&self) -> Option<GitProvenance> {
+        self.git.clone().or_else(|| {
+            self.session
+                .repository_root
+                .is_some()
+                .then_some(GitProvenance {
+                    origin: GitOrigin::Observed,
+                    repository_url: None,
+                })
+        })
+    }
 }
 impl Session {
     fn placeholder(agent: crate::Agent, path: &Path, file_id: u64, generation: u64) -> Self {
@@ -847,7 +913,9 @@ mod tests {
 mod additional_tests {
     use super::*;
     use crate::{
-        adapters::ClaudeAdapter, preview::preview_source, storage::SqliteStore,
+        adapters::{ClaudeAdapter, CodexAdapter},
+        preview::preview_source,
+        storage::SqliteStore,
         test_support::TempDir,
     };
     use std::io::Write;
@@ -908,6 +976,139 @@ mod additional_tests {
         assert!(all.text.contains("first"));
         assert!(all.text.contains("last"));
     }
+    /// A rollout whose worktree no longer exists, as most historical sessions are.
+    fn codex_rollout(d: &TempDir, cwd: &str, git: &str) -> std::path::PathBuf {
+        let p = d.path().join("rollout.jsonl");
+        fs::write(
+            &p,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"native\",\"cwd\":{},{}}}}}\n\
+                 {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"provenancemarker\"}}]}}}}\n",
+                serde_json::to_string(cwd).unwrap(),
+                git
+            ),
+        )
+        .unwrap();
+        p
+    }
+    const RECORDED_GIT: &str = "\"git\":{\"commit_hash\":\"840c046cb65c43ad093bcac2e07736c86a3a8bf8\",\"branch\":\"feature/prices\",\"repository_url\":\"git@github.com:owner/name.git\"}";
+
+    #[test]
+    fn a_deleted_worktree_keeps_the_provenance_its_transcript_recorded() {
+        let d = TempDir::new("recorded-codex").unwrap();
+        let p = codex_rollout(&d, "/gone/worktrees/owner/name", RECORDED_GIT);
+        let mut db = SqliteStore::open(d.path().join("private/index.sqlite")).unwrap();
+        Indexer::new(&CodexAdapter::new([]), &mut db)
+            .index_file(&fixture(&p))
+            .unwrap();
+
+        let id = SessionId::new(crate::Agent::Codex, "native");
+        let record = db.session_record(&id).unwrap().unwrap();
+        assert_eq!(record.origin(), Some(GitOrigin::Recorded));
+        assert!(record.is_recorded_only());
+        assert_eq!(record.session.repository.as_deref(), Some("owner/name"));
+        assert_eq!(record.session.branch.as_deref(), Some("feature/prices"));
+        assert_eq!(
+            record.session.commit.as_deref(),
+            Some("840c046cb65c43ad093bcac2e07736c86a3a8bf8")
+        );
+        assert_eq!(
+            record.session.cwd,
+            Some(std::path::PathBuf::from("/gone/worktrees/owner/name"))
+        );
+        // A remote URL says which repository, never where it lived.
+        assert_eq!(record.session.repository_root, None);
+        assert_eq!(record.session.worktree, None);
+        assert_eq!(
+            record.git.unwrap().repository_url.as_deref(),
+            Some("git@github.com:owner/name.git")
+        );
+
+        let result = db.search("provenancemarker", 1).unwrap().remove(0);
+        assert_eq!(result.git_origin, Some(GitOrigin::Recorded));
+        assert_eq!(result.repository.as_deref(), Some("owner/name"));
+        assert_eq!(
+            result.repository_url.as_deref(),
+            Some("git@github.com:owner/name.git")
+        );
+        assert_eq!(
+            crate::preview::session_record_for_source(&db, &result.source)
+                .unwrap()
+                .origin(),
+            Some(GitOrigin::Recorded)
+        );
+    }
+
+    #[test]
+    fn a_transcript_without_recorded_git_gets_no_provenance() {
+        let d = TempDir::new("recorded-absent").unwrap();
+        let p = codex_rollout(
+            &d,
+            "/gone/worktrees/owner/name",
+            "\"originator\":\"codex_exec\"",
+        );
+        let mut db = SqliteStore::open(d.path().join("private/index.sqlite")).unwrap();
+        Indexer::new(&CodexAdapter::new([]), &mut db)
+            .index_file(&fixture(&p))
+            .unwrap();
+        let record = db
+            .session_record(&SessionId::new(crate::Agent::Codex, "native"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.origin(), None);
+        assert_eq!(record.session.repository, None);
+        assert_eq!(record.session.branch, None);
+        assert_eq!(
+            db.search("provenancemarker", 1).unwrap()[0].git_origin,
+            None
+        );
+    }
+
+    #[test]
+    fn a_live_observation_outranks_what_the_transcript_recorded() {
+        let d = TempDir::new("recorded-observed").unwrap();
+        let repo = d.git_repository().unwrap();
+        let p = codex_rollout(&d, repo.to_str().unwrap(), RECORDED_GIT);
+        let mut db = SqliteStore::open(d.path().join("private/index.sqlite")).unwrap();
+        Indexer::new(&CodexAdapter::new([]), &mut db)
+            .index_file(&fixture(&p))
+            .unwrap();
+        let record = db
+            .session_record(&SessionId::new(crate::Agent::Codex, "native"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.origin(), Some(GitOrigin::Observed));
+        assert_eq!(
+            record.session.repository_root,
+            Some(repo.canonicalize().unwrap())
+        );
+        assert_ne!(record.session.branch.as_deref(), Some("feature/prices"));
+    }
+
+    #[test]
+    fn claude_records_a_branch_without_claiming_a_repository_path() {
+        let d = TempDir::new("recorded-claude").unwrap();
+        let p = d.path().join("f.jsonl");
+        fs::write(
+            &p,
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"cwd\":\"/gone/worktree\",\"gitBranch\":\"feature/prices\",\"message\":{\"content\":\"provenancemarker\"}}\n",
+        )
+        .unwrap();
+        let mut db = SqliteStore::open(d.path().join("private/index.sqlite")).unwrap();
+        Indexer::new(&ClaudeAdapter::new([]), &mut db)
+            .index_file(&fixture(&p))
+            .unwrap();
+        let record = db
+            .session_record(&SessionId::new(crate::Agent::Claude, "s"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.origin(), Some(GitOrigin::Recorded));
+        assert_eq!(record.session.branch.as_deref(), Some("feature/prices"));
+        assert_eq!(record.session.repository, None);
+        assert_eq!(record.session.repository_root, None);
+        assert_eq!(record.git.unwrap().repository_url, None);
+    }
+
     #[test]
     fn git_context_is_retained_after_cwd_disappears() {
         let d = TempDir::new("git-index").unwrap();
@@ -915,6 +1116,7 @@ mod additional_tests {
         let p = d.path().join("f.jsonl");
         let mut record: serde_json::Value = serde_json::from_str(line("original").trim()).unwrap();
         record["cwd"] = serde_json::json!(repo);
+        record["gitBranch"] = serde_json::json!("recorded-branch");
         fs::write(&p, format!("{record}\n")).unwrap();
         let mut db = SqliteStore::open(d.path().join("private/index.sqlite")).unwrap();
         let a = ClaudeAdapter::new([]);
@@ -923,6 +1125,7 @@ mod additional_tests {
         let before = db.session(&id).unwrap().unwrap();
         assert!(before.repository_root.is_some());
         assert!(before.git_observed_at.is_some());
+        assert_ne!(before.branch.as_deref(), Some("recorded-branch"));
         fs::remove_dir_all(&repo).unwrap();
         fs::OpenOptions::new()
             .append(true)
@@ -934,6 +1137,13 @@ mod additional_tests {
         let after = db.session(&id).unwrap().unwrap();
         assert_eq!(before.repository_root, after.repository_root);
         assert_eq!(before.git_observed_at, after.git_observed_at);
+        assert_eq!(before.branch, after.branch);
+        // The observation knows where the worktree lived; a recorded branch must not
+        // replace it just because the directory is gone.
+        assert_eq!(
+            db.session_record(&id).unwrap().unwrap().origin(),
+            Some(GitOrigin::Observed)
+        );
     }
     #[test]
     fn competing_writers_cannot_overwrite_progress_or_reuse_file_id() {

@@ -44,6 +44,7 @@ impl AgentAdapter for ClaudeAdapter {
             native_id: native,
             cwd,
             started_at: timestamp(v.get("timestamp")),
+            git: recorded_git(&v),
         };
         if v.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
             || v.get("is_meta").and_then(|v| v.as_bool()) == Some(true)
@@ -95,6 +96,20 @@ impl AgentAdapter for ClaudeAdapter {
     }
 }
 
+/// Claude Code records the branch on every conversational line and the repository
+/// identity only when a pull request is in play. It records no commit.
+fn recorded_git(v: &serde_json::Value) -> Option<RecordedGit> {
+    let git = RecordedGit {
+        repository_url: None,
+        repository: non_empty(string(
+            v.get("prRepository").or_else(|| v.get("pr_repository")),
+        )),
+        branch: branch_name(string(v.get("gitBranch").or_else(|| v.get("git_branch")))),
+        commit: None,
+    };
+    (!git.is_empty()).then_some(git)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +140,36 @@ mod tests {
             .unwrap();
         assert_eq!(parsed.events[0].text, "Unicode ☃ answer");
         assert!(!parsed.events[0].text.contains("secret"));
+    }
+    #[test]
+    fn records_transcript_branch_and_pull_request_repository() {
+        let adapter = ClaudeAdapter::with_root(".");
+        let r = br#"{"type":"user","sessionId":"s","cwd":"/gone/worktree","gitBranch":"feature/prices","prRepository":"owner/name","message":{"content":"question"}}"#;
+        let parsed = adapter
+            .parse_record(&session(), r, source("x".as_ref(), 1, 0, r.len()))
+            .unwrap();
+        let git = parsed.metadata.git.unwrap();
+        assert_eq!(git.branch.as_deref(), Some("feature/prices"));
+        assert_eq!(git.repository.as_deref(), Some("owner/name"));
+        assert_eq!(git.repository_url, None);
+        assert_eq!(git.commit, None);
+        assert_eq!(parsed.metadata.cwd, Some(PathBuf::from("/gone/worktree")));
+    }
+    #[test]
+    fn a_non_git_cwd_records_no_provenance() {
+        let adapter = ClaudeAdapter::with_root(".");
+        for r in [
+            &br#"{"type":"user","cwd":"/tmp/plain","gitBranch":"","message":{"content":"hi"}}"#[..],
+            &br#"{"type":"user","cwd":"/tmp/plain","message":{"content":"hi"}}"#[..],
+            &br#"{"type":"user","cwd":"/tmp/plain","gitBranch":"HEAD","message":{"content":"hi"}}"#
+                [..],
+            &br#"{"type":"user","cwd":"/tmp/plain","gitBranch":7,"message":{"content":"hi"}}"#[..],
+        ] {
+            let parsed = adapter
+                .parse_record(&session(), r, source("x".as_ref(), 1, 0, r.len()))
+                .unwrap();
+            assert_eq!(parsed.metadata.git, None);
+        }
     }
     #[test]
     fn malformed_is_an_error() {

@@ -59,6 +59,32 @@ pub(crate) fn timestamp(v: Option<&serde_json::Value>) -> Option<std::time::Syst
             + std::time::Duration::from_nanos(dt.timestamp_subsec_nanos() as u64),
     )
 }
+pub(crate) fn non_empty(v: Option<String>) -> Option<String> {
+    v.filter(|s| !s.trim().is_empty())
+}
+/// Recorded branch names. Agents write the literal `HEAD` for a detached checkout,
+/// which is not a branch and must not be presented as one.
+pub(crate) fn branch_name(v: Option<String>) -> Option<String> {
+    non_empty(v).filter(|s| s != "HEAD")
+}
+/// Derives `owner/name` from a recorded remote URL for display. The URL itself is
+/// persisted unchanged; this is a label, never a local path.
+pub(crate) fn repository_label(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let (path, hosted) = match url.split_once("://") {
+        Some((_, rest)) => (rest.split_once('/').map_or("", |(_, p)| p), true),
+        None => match url.split_once(':') {
+            // scp-like syntax, `git@host:owner/name`, only when the colon precedes any slash.
+            Some((host, rest)) if !host.contains('/') => (rest, true),
+            _ => (url, false),
+        },
+    };
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let keep = if hosted { 2 } else { 1 };
+    let label = segments[segments.len().saturating_sub(keep)..].join("/");
+    (!label.is_empty()).then_some(label)
+}
 pub(crate) fn text(v: &serde_json::Value) -> Option<String> {
     if let Some(s) = v.as_str() {
         return Some(s.to_owned());
@@ -111,6 +137,29 @@ mod tests {
         let found = discover_jsonl(&[dir.path().to_owned(), a]).unwrap();
         assert_eq!(found.len(), 2);
         assert!(found[0].path < found[1].path);
+    }
+    #[test]
+    fn repository_labels_come_only_from_recorded_urls() {
+        for (url, expected) in [
+            (
+                "git@github.com:mikitahimpel/memoxia.git",
+                Some("mikitahimpel/memoxia"),
+            ),
+            ("https://github.com/owner/name.git", Some("owner/name")),
+            ("ssh://git@github.com/owner/name", Some("owner/name")),
+            ("https://example.invalid/a/b/c/name.git/", Some("c/name")),
+            ("/srv/mirrors/name.git", Some("name")),
+            ("", None),
+            ("   ", None),
+        ] {
+            assert_eq!(repository_label(url).as_deref(), expected, "{url}");
+        }
+    }
+    #[test]
+    fn detached_head_is_not_a_recorded_branch() {
+        assert_eq!(branch_name(Some("HEAD".into())), None);
+        assert_eq!(branch_name(Some(" ".into())), None);
+        assert_eq!(branch_name(Some("main".into())).as_deref(), Some("main"));
     }
     #[test]
     fn timestamp_preserves_offset_and_subseconds() {

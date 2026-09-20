@@ -1,6 +1,6 @@
 //! Read-only Git context discovery for session indexing.
 
-use crate::{GitContext, GitContextProvider, Result};
+use crate::{GitContext, GitContextProvider, GitOrigin, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
@@ -13,8 +13,10 @@ impl GitContextProvider for GitContextResolver {
     fn context(&self, cwd: &Path) -> Result<GitContext> {
         let observed_at = SystemTime::now();
         let empty = || GitContext {
+            origin: GitOrigin::Observed,
             repository: None,
             repository_root: None,
+            repository_url: None,
             worktree: None,
             branch: None,
             commit: None,
@@ -51,10 +53,13 @@ impl GitContextProvider for GitContextResolver {
             .map(|path| path.to_string_lossy().into_owned());
         let branch = git_value(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
         let commit = git_value(cwd, ["rev-parse", "--verify", "HEAD"]);
+        let repository_url = git_value(cwd, ["config", "--get", "remote.origin.url"]);
 
         Ok(GitContext {
+            origin: GitOrigin::Observed,
             repository,
             repository_root,
+            repository_url,
             worktree,
             branch,
             commit,
@@ -155,6 +160,27 @@ mod tests {
             context.repository,
             Some(repo.canonicalize().unwrap().to_string_lossy().into_owned())
         );
+        assert_eq!(context.origin, crate::GitOrigin::Observed);
+    }
+
+    #[test]
+    fn observed_context_reports_a_configured_remote() {
+        let temp = TempDir::new("git-remote").unwrap();
+        let repo = repository(&temp);
+        assert_eq!(
+            GitContextResolver.context(&repo).unwrap().repository_url,
+            None
+        );
+        run(
+            &repo,
+            &["remote", "add", "origin", "git@github.com:owner/name.git"],
+        );
+        let context = GitContextResolver.context(&repo).unwrap();
+        assert_eq!(
+            context.repository_url.as_deref(),
+            Some("git@github.com:owner/name.git")
+        );
+        assert_eq!(context.origin, crate::GitOrigin::Observed);
     }
 
     #[test]

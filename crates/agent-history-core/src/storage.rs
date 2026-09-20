@@ -1,6 +1,7 @@
 //! Disposable local SQLite index. Native transcript files are never written here.
 use crate::{
-    Agent, CoreError, IndexBatch, IndexedFile, Result, SearchResult, Session, SessionId, Store,
+    Agent, CoreError, GitOrigin, GitProvenance, IndexBatch, IndexedFile, Result, SearchResult,
+    Session, SessionId, SessionRecord, Store,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
@@ -9,8 +10,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const VERSION: i32 = 3;
+const VERSION: i32 = 4;
 const MAX_LIMIT: usize = 1000;
+/// Below this many free pages a rebuild is not worth the cost of rewriting the file.
+const RECLAIM_MIN_FREE_PAGES: i64 = 64;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexStatus {
@@ -107,6 +110,16 @@ impl SqliteStore {
         Ok(())
     }
     fn migrate(&mut self) -> Result<()> {
+        // A never-populated database is the only moment auto-vacuum can be enabled without
+        // rewriting the file, so claim it before any table exists.
+        if self
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0))?
+            == 0
+        {
+            self.conn
+                .pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        }
         // Serialize migration and re-read the version after acquiring the writer lock.
         let tx = self
             .conn
@@ -133,19 +146,96 @@ impl SqliteStore {
                 ALTER TABLE search_chunks ADD COLUMN kind INTEGER NOT NULL DEFAULT -1 CHECK(kind IN (0,1));
                 PRAGMA user_version=3;")?;
         }
+        if version == 2 || version == 3 {
+            // Existing rows hold live observations; recorded provenance only appears once the
+            // checkpoint format marker has driven each source through the new parsers.
+            tx.execute_batch("\
+                ALTER TABLE sessions ADD COLUMN git_origin INTEGER CHECK(git_origin IS NULL OR git_origin IN (0,1));
+                ALTER TABLE sessions ADD COLUMN repository_url TEXT;
+                UPDATE sessions SET git_origin=0 WHERE repository_root IS NOT NULL;
+                PRAGMA user_version=4;")?;
+        }
         if version == 0 {
             tx.execute_batch("\
-                CREATE TABLE sessions (agent INTEGER NOT NULL, native_id TEXT NOT NULL, source_path TEXT NOT NULL, source_file_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_start INTEGER NOT NULL DEFAULT 0, source_end INTEGER NOT NULL DEFAULT 0, cwd TEXT, repository TEXT, repository_root TEXT, worktree TEXT, branch TEXT, commit_hash TEXT, started_at INTEGER, ended_at INTEGER, git_observed_at INTEGER, PRIMARY KEY(agent,native_id));
+                CREATE TABLE sessions (agent INTEGER NOT NULL, native_id TEXT NOT NULL, source_path TEXT NOT NULL, source_file_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_start INTEGER NOT NULL DEFAULT 0, source_end INTEGER NOT NULL DEFAULT 0, cwd TEXT, repository TEXT, repository_root TEXT, worktree TEXT, branch TEXT, commit_hash TEXT, started_at INTEGER, ended_at INTEGER, git_observed_at INTEGER, git_origin INTEGER CHECK(git_origin IS NULL OR git_origin IN (0,1)), repository_url TEXT, PRIMARY KEY(agent,native_id));
                 CREATE TABLE indexed_files (path TEXT PRIMARY KEY, file_id INTEGER NOT NULL, generation INTEGER NOT NULL, committed_offset INTEGER NOT NULL, size INTEGER NOT NULL, modified INTEGER, open_turn_state BLOB);
                 CREATE TABLE search_chunks (rowid INTEGER PRIMARY KEY, agent INTEGER NOT NULL, native_id TEXT NOT NULL, ordinal INTEGER NOT NULL, timestamp INTEGER, kind INTEGER NOT NULL CHECK(kind IN (0,1)), source_path TEXT NOT NULL, source_file_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_start INTEGER NOT NULL, source_end INTEGER NOT NULL, text TEXT NOT NULL, FOREIGN KEY(agent,native_id) REFERENCES sessions(agent,native_id) ON DELETE CASCADE, UNIQUE(agent,native_id,source_file_id,source_generation,ordinal));
                 CREATE VIRTUAL TABLE chunks_fts USING fts5(text, content='search_chunks', content_rowid='rowid', tokenize='unicode61');
                 CREATE TRIGGER chunks_ai AFTER INSERT ON search_chunks BEGIN INSERT INTO chunks_fts(rowid,text) VALUES (new.rowid,new.text); END;
                 CREATE TRIGGER chunks_ad AFTER DELETE ON search_chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES ('delete',old.rowid,old.text); END;
                 CREATE TRIGGER chunks_au AFTER UPDATE ON search_chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES ('delete',old.rowid,old.text); INSERT INTO chunks_fts(rowid,text) VALUES (new.rowid,new.text); END;
-                PRAGMA user_version=3;")?;
+                PRAGMA user_version=4;")?;
         }
         tx.commit()?;
+        if version != 0 && version != VERSION {
+            self.compact()?;
+        }
         Ok(())
+    }
+
+    fn page_counts(&self) -> Result<(i64, i64, i64)> {
+        let value = |name| {
+            self.conn
+                .pragma_query_value(None, name, |r| r.get::<_, i64>(0))
+        };
+        Ok((
+            value("page_count")?,
+            value("freelist_count")?,
+            value("page_size")?,
+        ))
+    }
+
+    /// Rewrites the file when free pages dominate it, which is what a migration that
+    /// mass-deletes rows leaves behind. `VACUUM` is chosen over incremental vacuum alone
+    /// because only a full rewrite can also switch an existing database to incremental
+    /// auto-vacuum, after which routine rebuild churn is reclaimable without a rewrite.
+    /// It cannot run inside a transaction and needs scratch space about the size of the
+    /// database, so it runs after the migration commits and only when the filesystem has
+    /// room; skipping it leaves a correct index that is merely larger than necessary.
+    fn compact(&mut self) -> Result<()> {
+        let (pages, free, page_size) = self.page_counts()?;
+        if free < RECLAIM_MIN_FREE_PAGES || free.saturating_mul(4) < pages {
+            return Ok(());
+        }
+        let required = (pages.max(0) as u64).saturating_mul(page_size.max(0) as u64);
+        let path = self
+            .conn
+            .path()
+            .map(PathBuf::from)
+            .ok_or_else(|| CoreError::Storage("database path is unavailable".into()))?;
+        if free_disk_bytes(&path).is_some_and(|available| available < required) {
+            return Ok(());
+        }
+        // VACUUM cannot change the auto-vacuum mode of a WAL database; open() restores WAL.
+        self.conn
+            .pragma_update(None, "journal_mode", "DELETE")
+            .and_then(|()| self.conn.pragma_update(None, "auto_vacuum", "INCREMENTAL"))
+            .and_then(|()| self.conn.execute_batch("VACUUM"))?;
+        Ok(())
+    }
+
+    /// Returns free pages released to the filesystem. Databases created before
+    /// incremental auto-vacuum was adopted keep their free pages for reuse instead.
+    pub fn reclaim_free_pages(&mut self) -> Result<u64> {
+        if self
+            .conn
+            .pragma_query_value(None, "auto_vacuum", |r| r.get::<_, i64>(0))?
+            != 2
+        {
+            return Ok(0);
+        }
+        let (_, before, _) = self.page_counts()?;
+        if before == 0 {
+            return Ok(0);
+        }
+        // Each step of the pragma releases one page, so the statement is drained.
+        let mut statement = self.conn.prepare("PRAGMA incremental_vacuum")?;
+        let mut rows = statement.query([])?;
+        while rows.next()?.is_some() {}
+        drop(rows);
+        drop(statement);
+        let (_, after, _) = self.page_counts()?;
+        Ok(before.saturating_sub(after).max(0) as u64)
     }
 
     pub fn indexed_file(&self, path: impl AsRef<Path>) -> Result<Option<IndexedFile>> {
@@ -158,12 +248,24 @@ impl SqliteStore {
         Ok(self.conn.query_row("SELECT path,file_id,generation,committed_offset,size,modified,open_turn_state FROM indexed_files WHERE path=?", [p], |r| Ok(IndexedFileState { file: row_file(r)?, open_turn_state: r.get(6)? })).optional()?)
     }
     pub fn session(&self, id: &SessionId) -> Result<Option<Session>> {
-        self.conn.query_row("SELECT agent,native_id,source_path,source_file_id,source_generation,source_start,source_end,cwd,repository,repository_root,worktree,branch,commit_hash,started_at,ended_at,git_observed_at FROM sessions WHERE agent=? AND native_id=?", params![agent_i(id.agent), id.native_id], row_session).optional().map_err(Into::into)
+        Ok(self.session_record(id)?.map(|r| r.session))
     }
     pub fn sessions(&self) -> Result<Vec<Session>> {
-        let mut s=self.conn.prepare("SELECT agent,native_id,source_path,source_file_id,source_generation,source_start,source_end,cwd,repository,repository_root,worktree,branch,commit_hash,started_at,ended_at,git_observed_at FROM sessions ORDER BY native_id")?;
+        Ok(self
+            .session_records()?
+            .into_iter()
+            .map(|r| r.session)
+            .collect())
+    }
+    /// Returns the session together with whether its Git fields were observed live
+    /// or recorded by the agent, which restoration must not confuse.
+    pub fn session_record(&self, id: &SessionId) -> Result<Option<SessionRecord>> {
+        self.conn.query_row("SELECT agent,native_id,source_path,source_file_id,source_generation,source_start,source_end,cwd,repository,repository_root,worktree,branch,commit_hash,started_at,ended_at,git_observed_at,git_origin,repository_url FROM sessions WHERE agent=? AND native_id=?", params![agent_i(id.agent), id.native_id], row_session_record).optional().map_err(Into::into)
+    }
+    pub fn session_records(&self) -> Result<Vec<SessionRecord>> {
+        let mut s=self.conn.prepare("SELECT agent,native_id,source_path,source_file_id,source_generation,source_start,source_end,cwd,repository,repository_root,worktree,branch,commit_hash,started_at,ended_at,git_observed_at,git_origin,repository_url FROM sessions ORDER BY native_id")?;
         let rows = s
-            .query_map([], row_session)?
+            .query_map([], row_session_record)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -235,8 +337,9 @@ impl Store for SqliteStore {
                 params![agent_i(id.0.agent), id.0.native_id, id.1],
             )?;
         }
-        for s in batch.sessions {
-            tx.execute("INSERT INTO sessions(agent,native_id,source_path,source_file_id,source_generation,source_start,source_end,cwd,repository,repository_root,worktree,branch,commit_hash,started_at,ended_at,git_observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent,native_id) DO UPDATE SET source_path=excluded.source_path,source_file_id=excluded.source_file_id,source_generation=excluded.source_generation,source_start=excluded.source_start,source_end=excluded.source_end,cwd=excluded.cwd,repository=excluded.repository,repository_root=excluded.repository_root,worktree=excluded.worktree,branch=excluded.branch,commit_hash=excluded.commit_hash,started_at=excluded.started_at,ended_at=excluded.ended_at,git_observed_at=excluded.git_observed_at",params![agent_i(s.id.agent),s.id.native_id,pstr(&s.source.path),s.source.file_id,s.source.generation,s.source.byte_range.start,s.source.byte_range.end,optp(&s.cwd),s.repository,s.repository_root.as_ref().map(|p|pstr(p)),s.worktree.as_ref().map(|p|pstr(p)),s.branch,s.commit,ts(s.started_at),ts(s.ended_at),ts(s.git_observed_at)])?;
+        for record in batch.sessions {
+            let (s, git) = (record.session, record.git);
+            tx.execute("INSERT INTO sessions(agent,native_id,source_path,source_file_id,source_generation,source_start,source_end,cwd,repository,repository_root,worktree,branch,commit_hash,started_at,ended_at,git_observed_at,git_origin,repository_url) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent,native_id) DO UPDATE SET source_path=excluded.source_path,source_file_id=excluded.source_file_id,source_generation=excluded.source_generation,source_start=excluded.source_start,source_end=excluded.source_end,cwd=excluded.cwd,repository=excluded.repository,repository_root=excluded.repository_root,worktree=excluded.worktree,branch=excluded.branch,commit_hash=excluded.commit_hash,started_at=excluded.started_at,ended_at=excluded.ended_at,git_observed_at=excluded.git_observed_at,git_origin=excluded.git_origin,repository_url=excluded.repository_url",params![agent_i(s.id.agent),s.id.native_id,pstr(&s.source.path),s.source.file_id,s.source.generation,s.source.byte_range.start,s.source.byte_range.end,optp(&s.cwd),s.repository,s.repository_root.as_ref().map(|p|pstr(p)),s.worktree.as_ref().map(|p|pstr(p)),s.branch,s.commit,ts(s.started_at),ts(s.ended_at),ts(s.git_observed_at),git.as_ref().map(|g|origin_i(g.origin)),git.and_then(|g|g.repository_url)])?;
         }
         for c in batch.chunks {
             tx.execute("INSERT INTO search_chunks(agent,native_id,ordinal,timestamp,kind,source_path,source_file_id,source_generation,source_start,source_end,text) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent,native_id,source_file_id,source_generation,ordinal) DO UPDATE SET timestamp=excluded.timestamp,kind=excluded.kind,source_path=excluded.source_path,source_file_id=excluded.source_file_id,source_generation=excluded.source_generation,source_start=excluded.source_start,source_end=excluded.source_end,text=excluded.text",params![agent_i(c.session_id.agent),c.session_id.native_id,c.ordinal,ts(c.timestamp),kind_i(c.kind),pstr(&c.source.path),c.source.file_id,c.source.generation,c.source.byte_range.start,c.source.byte_range.end,c.text])?;
@@ -260,7 +363,7 @@ impl Store for SqliteStore {
             return Ok(Vec::new());
         }
         let limit = limit.min(MAX_LIMIT);
-        let mut st=self.conn.prepare("SELECT c.agent,c.native_id,s.repository,s.branch,s.cwd,c.timestamp,c.kind,c.source_path,c.source_file_id,c.source_generation,c.source_start,c.source_end,snippet(chunks_fts,0,'','', ' … ', 24) FROM chunks_fts JOIN search_chunks c ON c.rowid=chunks_fts.rowid JOIN sessions s ON s.agent=c.agent AND s.native_id=c.native_id WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?) ORDER BY bm25(chunks_fts),c.agent,c.native_id,c.ordinal LIMIT ?")?;
+        let mut st=self.conn.prepare("SELECT c.agent,c.native_id,s.repository,s.branch,s.cwd,c.timestamp,c.kind,c.source_path,c.source_file_id,c.source_generation,c.source_start,c.source_end,snippet(chunks_fts,0,'','', ' … ', 24),s.repository_url,s.git_origin FROM chunks_fts JOIN search_chunks c ON c.rowid=chunks_fts.rowid JOIN sessions s ON s.agent=c.agent AND s.native_id=c.native_id WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?) ORDER BY bm25(chunks_fts),c.agent,c.native_id,c.ordinal LIMIT ?")?;
         let rows = st
             .query_map(
                 params![query, role.map(kind_i), role.map(kind_i), limit as i64],
@@ -269,6 +372,8 @@ impl Store for SqliteStore {
                         session_id: SessionId::new(agent_from(r.get(0)?)?, r.get::<_, String>(1)?),
                         agent: agent_from(r.get(0)?)?,
                         repository: r.get(2)?,
+                        repository_url: r.get(13)?,
+                        git_origin: r.get::<_, Option<i64>>(14)?.map(origin_from).transpose()?,
                         branch: r.get(3)?,
                         cwd: r.get::<_, Option<String>>(4)?.map(PathBuf::from),
                         timestamp: from_ts(r.get(5)?),
@@ -306,6 +411,12 @@ impl crate::IndexStore for SqliteStore {
     fn session(&self, id: &SessionId) -> Result<Option<Session>> {
         SqliteStore::session(self, id)
     }
+    fn session_record(&self, id: &SessionId) -> Result<Option<SessionRecord>> {
+        SqliteStore::session_record(self, id)
+    }
+    fn reclaim_free_pages(&mut self) -> Result<u64> {
+        SqliteStore::reclaim_free_pages(self)
+    }
 }
 
 fn row_file(r: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedFile> {
@@ -316,6 +427,19 @@ fn row_file(r: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedFile> {
         committed_offset: r.get(3)?,
         size: r.get(4)?,
         modified: from_ts(r.get(5)?),
+    })
+}
+fn row_session_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+    Ok(SessionRecord {
+        session: row_session(r)?,
+        git: r
+            .get::<_, Option<i64>>(16)?
+            .map(origin_from)
+            .transpose()?
+            .map(|origin| GitProvenance {
+                origin,
+                repository_url: r.get(17).unwrap_or(None),
+            }),
     })
 }
 fn row_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
@@ -376,6 +500,30 @@ fn agent_from(v: i64) -> rusqlite::Result<Agent> {
         1 => Ok(Agent::Codex),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
+}
+fn origin_i(o: GitOrigin) -> i64 {
+    match o {
+        GitOrigin::Observed => 0,
+        GitOrigin::Recorded => 1,
+    }
+}
+fn origin_from(v: i64) -> rusqlite::Result<GitOrigin> {
+    match v {
+        0 => Ok(GitOrigin::Observed),
+        1 => Ok(GitOrigin::Recorded),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+/// Bytes available to this user on the filesystem holding `path`.
+fn free_disk_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = unsafe { std::mem::zeroed::<libc::statvfs>() };
+    // Safety: `path` is a valid NUL-terminated C string and `stat` is owned here.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    (stat.f_bavail as u64).checked_mul(stat.f_frsize)
 }
 fn kind_i(k: crate::EventKind) -> i64 {
     match k {
@@ -442,7 +590,7 @@ mod tests {
         let mut db = SqliteStore::open(&path).unwrap();
         let s = session(Agent::Claude, "one", 7, 1);
         db.commit_batch(IndexBatch {
-            sessions: vec![s.clone()],
+            sessions: vec![s.clone().into()],
             chunks: vec![chunk(&s.id, 7, 1, 0, "portfolio visibility")],
             ..Default::default()
         })
@@ -484,7 +632,7 @@ mod tests {
         .unwrap();
         assert!(db.search("portfolio", 10).unwrap().is_empty());
         db.commit_batch(IndexBatch {
-            sessions: vec![s.clone()],
+            sessions: vec![s.clone().into()],
             chunks: vec![chunk(&s.id, 7, 2, 0, "unrelated replacement")],
             ..Default::default()
         })
@@ -507,7 +655,7 @@ mod tests {
         };
         // Duplicate session insertion with an invalid foreign key chunk forces rollback.
         let result = db.commit_batch(IndexBatch {
-            sessions: vec![s],
+            sessions: vec![s.into()],
             chunks: vec![ConversationChunk {
                 session_id: SessionId::new(Agent::Codex, "missing"),
                 ..bad
@@ -524,7 +672,7 @@ mod tests {
         let a = session(Agent::Claude, "a", 1, 1);
         let b = session(Agent::Codex, "b", 2, 1);
         db.commit_batch(IndexBatch {
-            sessions: vec![a.clone(), b.clone()],
+            sessions: vec![a.clone().into(), b.clone().into()],
             chunks: vec![
                 chunk(&a.id, 1, 1, 0, "alpha beta"),
                 chunk(&b.id, 2, 1, 0, "alpha alpha beta"),
@@ -577,7 +725,7 @@ mod tests {
                 modified: None,
             }),
             open_turn_state: Some(b"old".to_vec()),
-            sessions: vec![s.clone()],
+            sessions: vec![s.clone().into()],
             chunks: vec![chunk(&s.id, 3, 1, 0, "keep me")],
             ..Default::default()
         })
@@ -620,6 +768,173 @@ mod tests {
         db.connection().execute("INSERT INTO sessions(agent,native_id,source_path,source_file_id,source_generation) VALUES(9,'x','p',1,1)",[]).unwrap();
         assert!(db.sessions().is_err());
     }
+    /// Builds the schema 2 index exactly as the released build left it: no `kind`
+    /// column, no provenance columns, and no auto-vacuum.
+    fn legacy_schema_two(path: &Path, chunks: usize) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("\
+            CREATE TABLE sessions (agent INTEGER NOT NULL, native_id TEXT NOT NULL, source_path TEXT NOT NULL, source_file_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_start INTEGER NOT NULL DEFAULT 0, source_end INTEGER NOT NULL DEFAULT 0, cwd TEXT, repository TEXT, repository_root TEXT, worktree TEXT, branch TEXT, commit_hash TEXT, started_at INTEGER, ended_at INTEGER, git_observed_at INTEGER, PRIMARY KEY(agent,native_id));
+            CREATE TABLE indexed_files (path TEXT PRIMARY KEY, file_id INTEGER NOT NULL, generation INTEGER NOT NULL, committed_offset INTEGER NOT NULL, size INTEGER NOT NULL, modified INTEGER, open_turn_state BLOB);
+            CREATE TABLE search_chunks (rowid INTEGER PRIMARY KEY, agent INTEGER NOT NULL, native_id TEXT NOT NULL, ordinal INTEGER NOT NULL, timestamp INTEGER, source_path TEXT NOT NULL, source_file_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_start INTEGER NOT NULL, source_end INTEGER NOT NULL, text TEXT NOT NULL, FOREIGN KEY(agent,native_id) REFERENCES sessions(agent,native_id) ON DELETE CASCADE, UNIQUE(agent,native_id,source_file_id,source_generation,ordinal));
+            CREATE VIRTUAL TABLE chunks_fts USING fts5(text, content='search_chunks', content_rowid='rowid', tokenize='unicode61');
+            CREATE TRIGGER chunks_ai AFTER INSERT ON search_chunks BEGIN INSERT INTO chunks_fts(rowid,text) VALUES (new.rowid,new.text); END;
+            CREATE TRIGGER chunks_ad AFTER DELETE ON search_chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES ('delete',old.rowid,old.text); END;
+            CREATE TRIGGER chunks_au AFTER UPDATE ON search_chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES ('delete',old.rowid,old.text); INSERT INTO chunks_fts(rowid,text) VALUES (new.rowid,new.text); END;
+            INSERT INTO sessions(agent,native_id,source_path,source_file_id,source_generation,repository_root,repository,branch) VALUES(0,'legacy','/tmp/native.jsonl',1,1,'/captured/repository','/captured/repository','main');
+            INSERT INTO indexed_files(path,file_id,generation,committed_offset,size) VALUES('/tmp/native.jsonl',1,1,10,10);
+            PRAGMA user_version=2;")
+            .unwrap();
+        for ordinal in 0..chunks {
+            conn.execute("INSERT INTO search_chunks(agent,native_id,ordinal,source_path,source_file_id,source_generation,source_start,source_end,text) VALUES(0,'legacy',?,'/tmp/native.jsonl',1,1,0,1,?)",
+                params![ordinal as i64, format!("legacymarker {ordinal} {}", "conversation text ".repeat(32))]).unwrap();
+        }
+        drop(conn);
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fn pragma(db: &SqliteStore, name: &str) -> i64 {
+        db.connection()
+            .pragma_query_value(None, name, |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn provenance_round_trips_and_is_replaced_with_the_session_row() {
+        let d = crate::test_support::TempDir::new("provenance").unwrap();
+        let mut db = SqliteStore::open(d.path().join("private/index.sqlite")).unwrap();
+        let s = Session {
+            repository_root: None,
+            repository: Some("owner/name".into()),
+            ..session(Agent::Codex, "recorded", 4, 1)
+        };
+        db.commit_batch(IndexBatch {
+            sessions: vec![SessionRecord {
+                session: s.clone(),
+                git: Some(GitProvenance {
+                    origin: GitOrigin::Recorded,
+                    repository_url: Some("git@github.com:owner/name.git".into()),
+                }),
+            }],
+            chunks: vec![chunk(&s.id, 4, 1, 0, "provenancemarker")],
+            ..Default::default()
+        })
+        .unwrap();
+        let record = db.session_record(&s.id).unwrap().unwrap();
+        assert_eq!(record.origin(), Some(GitOrigin::Recorded));
+        assert_eq!(
+            record.git.unwrap().repository_url.as_deref(),
+            Some("git@github.com:owner/name.git")
+        );
+        assert_eq!(db.session_records().unwrap().len(), 1);
+        let result = db.search("provenancemarker", 1).unwrap().remove(0);
+        assert_eq!(result.git_origin, Some(GitOrigin::Recorded));
+        assert_eq!(
+            result.repository_url.as_deref(),
+            Some("git@github.com:owner/name.git")
+        );
+        // Rewriting the session without provenance must not leave the old label behind.
+        db.commit_batch(IndexBatch {
+            sessions: vec![s.into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let record = db
+            .session_record(&SessionId::new(Agent::Codex, "recorded"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.origin(), None);
+        assert_eq!(
+            db.search("provenancemarker", 1).unwrap()[0].git_origin,
+            None
+        );
+        assert_eq!(
+            db.search("provenancemarker", 1).unwrap()[0].repository_url,
+            None
+        );
+    }
+
+    #[test]
+    fn migrating_a_mass_deleting_schema_reclaims_its_free_pages() {
+        let d = crate::test_support::TempDir::new("compaction").unwrap();
+        let p = d.path().join("private/index.sqlite");
+        legacy_schema_two(&p, 2000);
+        let before = fs::metadata(&p).unwrap().len();
+
+        let db = SqliteStore::open(&p).unwrap();
+        assert_eq!(pragma(&db, "user_version"), 4);
+        // The upgrade drops every mixed-speaker chunk; the file must not keep the pages.
+        assert_eq!(db.status().unwrap().chunks, 0);
+        let (pages, free) = (pragma(&db, "page_count"), pragma(&db, "freelist_count"));
+        assert!(
+            free * 4 <= pages,
+            "free pages {free} dominate {pages} after migration"
+        );
+        // Incremental auto-vacuum is now available for ordinary rebuild churn.
+        assert_eq!(pragma(&db, "auto_vacuum"), 2);
+        drop(db);
+        let after = fs::metadata(&p).unwrap().len();
+        assert!(after * 2 < before, "{after} did not shrink from {before}");
+
+        // Identities, checkpoints, and captured Git context survive the rewrite.
+        let db = SqliteStore::open(&p).unwrap();
+        let session = db
+            .session(&SessionId::new(Agent::Claude, "legacy"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.repository_root,
+            Some(PathBuf::from("/captured/repository"))
+        );
+        assert_eq!(
+            db.indexed_file("/tmp/native.jsonl")
+                .unwrap()
+                .unwrap()
+                .committed_offset,
+            10
+        );
+        assert!(db.search("legacymarker", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rebuild_churn_is_reclaimed_without_rewriting_the_file() {
+        let d = crate::test_support::TempDir::new("reclaim").unwrap();
+        let p = d.path().join("private/index.sqlite");
+        let mut db = SqliteStore::open(&p).unwrap();
+        let s = session(Agent::Claude, "one", 7, 1);
+        db.commit_batch(IndexBatch {
+            sessions: vec![s.clone().into()],
+            chunks: (0..2000)
+                .map(|ordinal| {
+                    chunk(
+                        &s.id,
+                        7,
+                        1,
+                        ordinal,
+                        &format!("reclaimmarker {}", "conversation text ".repeat(32)),
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(db.reclaim_free_pages().unwrap(), 0);
+        // Measured in pages: in WAL mode the main file only shrinks at a checkpoint.
+        let full = pragma(&db, "page_count");
+        db.commit_batch(IndexBatch {
+            removed_sources: vec![(7, 1)],
+            ..Default::default()
+        })
+        .unwrap();
+        let reclaimed = db.reclaim_free_pages().unwrap();
+        assert!(reclaimed > 0, "no pages were released");
+        assert!(pragma(&db, "freelist_count") * 4 <= pragma(&db, "page_count"));
+        assert!(
+            pragma(&db, "page_count") * 2 < full,
+            "the index kept its replaced pages"
+        );
+    }
+
     #[test]
     fn permissions_and_sidecar_symlinks() {
         use std::os::unix::fs::PermissionsExt;

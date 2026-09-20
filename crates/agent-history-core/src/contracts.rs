@@ -64,7 +64,8 @@ pub struct IndexBatch {
     pub file: Option<IndexedFile>,
     /// Compare-and-swap file progress; Some(None) requires a new path.
     pub expected_file: Option<Option<IndexedFile>>,
-    pub sessions: Vec<Session>,
+    /// Sessions with the provenance of their Git fields; `Session` converts with `into()`.
+    pub sessions: Vec<SessionRecord>,
     pub chunks: Vec<ConversationChunk>,
     pub replaced_chunks: Vec<(SessionId, u64)>,
     /// Source identities whose derived chunks must be removed before inserts.
@@ -110,6 +111,15 @@ pub trait IndexStore: Store {
     fn indexed_file_state(&self, path: &Path) -> Result<Option<(IndexedFile, Option<Vec<u8>>)>>;
     fn sessions(&self) -> Result<Vec<Session>>;
     fn session(&self, id: &SessionId) -> Result<Option<Session>>;
+    /// The session with the origin of its Git fields. Stores that cannot distinguish
+    /// observed from recorded provenance report none.
+    fn session_record(&self, id: &SessionId) -> Result<Option<SessionRecord>> {
+        Ok(self.session(id)?.map(SessionRecord::from))
+    }
+    /// Releases free pages left by rebuilds; returns how many were released.
+    fn reclaim_free_pages(&mut self) -> Result<u64> {
+        Ok(0)
+    }
 }
 impl<T: IndexStore + ?Sized> IndexStore for &mut T {
     fn next_file_id(&self) -> Result<u64> {
@@ -123,5 +133,11 @@ impl<T: IndexStore + ?Sized> IndexStore for &mut T {
     }
     fn session(&self, id: &SessionId) -> Result<Option<Session>> {
         (**self).session(id)
+    }
+    fn session_record(&self, id: &SessionId) -> Result<Option<SessionRecord>> {
+        (**self).session_record(id)
+    }
+    fn reclaim_free_pages(&mut self) -> Result<u64> {
+        (**self).reclaim_free_pages()
     }
 }

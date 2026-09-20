@@ -76,6 +76,8 @@ pub struct SessionMetadataPatch {
     pub native_id: Option<String>,
     pub cwd: Option<PathBuf>,
     pub started_at: Option<SystemTime>,
+    /// Git facts the record carries about itself, if any.
+    pub git: Option<RecordedGit>,
 }
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct ParsedRecord {
@@ -110,6 +112,10 @@ pub struct SearchResult {
     pub session_id: SessionId,
     pub agent: Agent,
     pub repository: Option<String>,
+    /// Remote URL when the session's Git facts were recorded rather than observed.
+    pub repository_url: Option<String>,
+    /// Which kind of Git fact `repository`, `branch`, and `commit` are.
+    pub git_origin: Option<GitOrigin>,
     pub branch: Option<String>,
     pub cwd: Option<PathBuf>,
     pub timestamp: Option<SystemTime>,
@@ -126,19 +132,120 @@ pub struct IndexedFile {
     pub size: u64,
     pub modified: Option<SystemTime>,
 }
+/// Where a persisted Git fact came from.
+///
+/// The two are never interchangeable: `Observed` describes the repository as it
+/// was when the indexer ran, `Recorded` repeats what the agent wrote into its own
+/// transcript while the session was live.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum GitOrigin {
+    /// Resolved by running read-only `git` against the session cwd while indexing.
+    Observed,
+    /// Copied from the native transcript. A historical claim, not a current fact,
+    /// and it never carries a local `repository_root`.
+    Recorded,
+}
+
+/// Git facts a native transcript records about its own session.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, Eq, PartialEq)]
+pub struct RecordedGit {
+    /// Remote URL exactly as the agent wrote it. Never a local path.
+    pub repository_url: Option<String>,
+    /// Display identity such as `owner/name`, derived from what was recorded.
+    pub repository: Option<String>,
+    pub branch: Option<String>,
+    pub commit: Option<String>,
+}
+impl RecordedGit {
+    pub fn is_empty(&self) -> bool {
+        self.repository_url.is_none()
+            && self.repository.is_none()
+            && self.branch.is_none()
+            && self.commit.is_none()
+    }
+    /// Keeps the earliest recorded value for each field, so a branch switch late in
+    /// a session cannot rewrite the context the session started in.
+    pub fn fill_missing(&mut self, other: &RecordedGit) {
+        for (slot, value) in [
+            (&mut self.repository_url, &other.repository_url),
+            (&mut self.repository, &other.repository),
+            (&mut self.branch, &other.branch),
+            (&mut self.commit, &other.commit),
+        ] {
+            if slot.is_none() {
+                slot.clone_from(value);
+            }
+        }
+    }
+    /// Presents recorded provenance as a context. `repository_root` and `worktree`
+    /// stay empty because a remote URL says which repository, never where it lived.
+    pub fn as_context(&self, captured_at: SystemTime) -> Option<GitContext> {
+        (!self.is_empty()).then(|| GitContext {
+            origin: GitOrigin::Recorded,
+            repository: self.repository.clone(),
+            repository_root: None,
+            repository_url: self.repository_url.clone(),
+            worktree: None,
+            branch: self.branch.clone(),
+            commit: self.commit.clone(),
+            observed_at: captured_at,
+        })
+    }
+}
+
+/// `observed_at` is when the indexer captured this context, which for
+/// `GitOrigin::Recorded` is when the transcript was read and not when the facts held.
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct GitContext {
+    pub origin: GitOrigin,
     pub repository: Option<String>,
     pub repository_root: Option<PathBuf>,
+    /// Remote URL; only recorded provenance supplies one on most sessions.
+    pub repository_url: Option<String>,
     pub worktree: Option<PathBuf>,
     pub branch: Option<String>,
     pub commit: Option<String>,
     pub observed_at: SystemTime,
 }
 
+/// Provenance persisted beside a session's flat Git fields.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct GitProvenance {
+    pub origin: GitOrigin,
+    /// Remote URL when one was recorded. Never a local path, and never a
+    /// substitute for `Session::repository_root`.
+    pub repository_url: Option<String>,
+}
+
+/// A session together with the provenance of its Git fields.
+///
+/// `Session` keeps the shape older callers depend on; ask for the record when the
+/// difference between an observed and a recorded fact matters, such as before
+/// offering to recreate a deleted worktree.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct SessionRecord {
+    pub session: Session,
+    pub git: Option<GitProvenance>,
+}
+impl SessionRecord {
+    pub fn origin(&self) -> Option<GitOrigin> {
+        self.git.as_ref().map(|g| g.origin)
+    }
+    /// True when the repository and commit are known but the local path is not.
+    pub fn is_recorded_only(&self) -> bool {
+        self.origin() == Some(GitOrigin::Recorded)
+    }
+}
+impl From<Session> for SessionRecord {
+    fn from(session: Session) -> Self {
+        Self { session, git: None }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::UNIX_EPOCH;
     #[test]
     fn agent_qualifies_identity() {
         assert_ne!(
@@ -168,6 +275,59 @@ mod tests {
             git_observed_at: None,
         };
         assert!(s.cwd.is_none());
+    }
+    #[test]
+    fn recorded_git_keeps_the_earliest_value_for_each_field() {
+        let mut first = RecordedGit {
+            branch: Some("feature/prices".into()),
+            ..Default::default()
+        };
+        first.fill_missing(&RecordedGit {
+            repository_url: Some("git@github.com:owner/name.git".into()),
+            repository: Some("owner/name".into()),
+            branch: Some("main".into()),
+            commit: Some("a".repeat(40)),
+        });
+        assert_eq!(first.branch.as_deref(), Some("feature/prices"));
+        assert_eq!(first.repository.as_deref(), Some("owner/name"));
+        assert_eq!(first.commit, Some("a".repeat(40)));
+    }
+    #[test]
+    fn recorded_context_never_fabricates_a_local_path() {
+        assert_eq!(RecordedGit::default().as_context(UNIX_EPOCH), None);
+        let context = RecordedGit {
+            repository_url: Some("git@github.com:owner/name.git".into()),
+            repository: Some("owner/name".into()),
+            branch: None,
+            commit: Some("b".repeat(40)),
+        }
+        .as_context(UNIX_EPOCH)
+        .unwrap();
+        assert_eq!(context.origin, GitOrigin::Recorded);
+        assert!(context.repository_root.is_none());
+        assert!(context.worktree.is_none());
+        assert_eq!(
+            context.repository_url.as_deref(),
+            Some("git@github.com:owner/name.git")
+        );
+    }
+    #[test]
+    fn a_session_record_defaults_to_unlabelled_provenance() {
+        let record = SessionRecord::from(Session {
+            id: SessionId::new(Agent::Claude, "id"),
+            source: SourceRef::new("x", 1, 0, 0..0).unwrap(),
+            cwd: None,
+            repository: None,
+            repository_root: None,
+            worktree: None,
+            branch: None,
+            commit: None,
+            started_at: None,
+            ended_at: None,
+            git_observed_at: None,
+        });
+        assert_eq!(record.origin(), None);
+        assert!(!record.is_recorded_only());
     }
     #[test]
     fn invalid_ranges_are_rejected() {
