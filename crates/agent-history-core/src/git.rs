@@ -71,7 +71,11 @@ impl GitContextProvider for GitContextResolver {
 /// Variables git exports to its own subprocesses, notably to hooks. Inheriting them
 /// would resolve the surrounding repository instead of the session cwd, and would let
 /// a `git` run in one repository read or write another.
-pub(crate) const INHERITED_GIT_ENVIRONMENT: [&str; 10] = [
+///
+/// Every `git` invocation in this workspace must clear these, including the ones that
+/// mutate, such as `git worktree add` during confirmed recovery. Build commands with
+/// [`git_command`] rather than repeating the list.
+pub const INHERITED_GIT_ENVIRONMENT: [&str; 10] = [
     "GIT_DIR",
     "GIT_COMMON_DIR",
     "GIT_WORK_TREE",
@@ -84,8 +88,11 @@ pub(crate) const INHERITED_GIT_ENVIRONMENT: [&str; 10] = [
     "GIT_QUARANTINE_PATH",
 ];
 
-/// A read-only `git` invocation scoped to `cwd` alone.
-pub(crate) fn git_command(cwd: &Path) -> Command {
+/// A `git` invocation scoped to `cwd` alone, with [`INHERITED_GIT_ENVIRONMENT`] cleared.
+///
+/// Use this for every `git` call, not only read-only ones: a command that inherits
+/// `GIT_DIR` stages and commits in the surrounding repository instead of `cwd`.
+pub fn git_command(cwd: &Path) -> Command {
     let mut command = Command::new("git");
     command.arg("-C").arg(cwd);
     for name in INHERITED_GIT_ENVIRONMENT {
