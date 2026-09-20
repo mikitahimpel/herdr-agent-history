@@ -170,7 +170,7 @@ impl<H: HostRuntime> Integration for HerdrIntegration<H> {
 mod tests {
     use super::*;
     use agent_history_core::{
-        adapters::ClaudeAdapter, index::index_all, AgentAdapter, Session, SqliteStore,
+        adapters::ClaudeAdapter, git_command, index::index_all, AgentAdapter, Session, SqliteStore,
     };
     use agent_history_tui::{BrowserState, Key, Mode};
     use std::{
@@ -334,14 +334,11 @@ mod tests {
     fn linked(t: &Temp) -> (PathBuf, PathBuf) {
         let root = t.0.join("repo");
         fs::create_dir(&root).unwrap();
+        // Fixtures use the same isolation as production: a suite run from a
+        // Git hook inherits GIT_DIR, which overrides `-C` and would point these
+        // commands at the surrounding repository.
         let git = |a: &[&str]| {
-            assert!(std::process::Command::new("git")
-                .arg("-C")
-                .arg(&root)
-                .args(a)
-                .status()
-                .unwrap()
-                .success());
+            assert!(git_command(&root).args(a).status().unwrap().success());
         };
         git(&["init", "--quiet"]);
         fs::write(root.join("tracked"), "preserved").unwrap();
@@ -357,9 +354,7 @@ mod tests {
             "--quiet",
         ]);
         let target = t.0.join("linked");
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
+        assert!(git_command(&root)
             .args([
                 "worktree",
                 "add",
@@ -392,9 +387,7 @@ mod tests {
         let t = Temp::new();
         let (root, target) = linked(&t);
         let before = String::from_utf8(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&root)
+            git_command(&root)
                 .args(["rev-parse", "HEAD"])
                 .output()
                 .unwrap()
@@ -430,9 +423,7 @@ mod tests {
             "preserved"
         );
         let after = String::from_utf8(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&root)
+            git_command(&root)
                 .args(["rev-parse", "HEAD"])
                 .output()
                 .unwrap()
@@ -444,9 +435,7 @@ mod tests {
             fs::read_to_string(root.join("tracked")).unwrap(),
             "preserved"
         );
-        let recreated = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&target)
+        let recreated = git_command(&target)
             .args(["rev-parse", "HEAD"])
             .output()
             .unwrap();
@@ -468,9 +457,7 @@ mod tests {
             fs::read_to_string(target.join("tracked")).unwrap(),
             "preserved"
         );
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
+        assert!(git_command(&root)
             .args(["worktree", "lock", target.to_str().unwrap()])
             .status()
             .unwrap()
@@ -483,9 +470,7 @@ mod tests {
                 .contains("locked")
         );
         assert!(!target.exists());
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
+        assert!(git_command(&root)
             .args(["worktree", "unlock", target.to_str().unwrap()])
             .status()
             .unwrap()

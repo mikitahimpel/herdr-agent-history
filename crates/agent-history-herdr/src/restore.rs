@@ -1,9 +1,6 @@
 //! Explicit, non-destructive recovery of a missing workspace.
-use agent_history_core::{CoreError, Result, Session};
-use std::{
-    path::{Component, Path, PathBuf},
-    process::Command,
-};
+use agent_history_core::{git_command, CoreError, Result, Session};
+use std::path::{Component, Path, PathBuf};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryChoice {
     RecreateWorktree,
@@ -122,17 +119,13 @@ pub fn execute_recreate(plan: &GitRecreationPlan, _confirmation: Confirmation) -
         .last()
         .filter(|v| matches!(v.len(), 40 | 64) && v.bytes().all(|b| b.is_ascii_hexdigit()))
         .ok_or_else(|| fail("invalid commit hash"))?;
-    let checked = Command::new("git")
-        .arg("-C")
-        .arg(&root)
+    let checked = git_command(&root)
         .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
         .output()?;
     if !checked.status.success() {
         return Err(fail("recorded commit is unavailable in the repository"));
     }
-    let listed = Command::new("git")
-        .arg("-C")
-        .arg(&root)
+    let listed = git_command(&root)
         .args(["worktree", "list", "--porcelain", "-z"])
         .output()?;
     if !listed.status.success() {
@@ -158,11 +151,8 @@ pub fn execute_recreate(plan: &GitRecreationPlan, _confirmation: Confirmation) -
     }
     // --force is used solely to replace the exact missing, unlocked registration.
     // It is never a branch force, and no existing path is accepted.
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(&root)
-        .args(["worktree", "add", "--detach"]);
+    let mut command = git_command(&root);
+    command.args(["worktree", "add", "--detach"]);
     if registered {
         command.arg("--force");
     }

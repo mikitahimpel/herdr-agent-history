@@ -1,4 +1,20 @@
 #!/bin/sh
+# Git exports its directory variables to hooks, and they override `git -C`. A
+# suite launched from here would therefore run against this repository instead
+# of its own fixtures, and could commit to it. Resolve the root while the
+# variables still describe this worktree, then clear them before running the
+# gate. Nothing is skipped: scripts/check still runs in full.
 set -eu
 root=$(git rev-parse --show-toplevel)
+unset \
+	GIT_DIR \
+	GIT_COMMON_DIR \
+	GIT_WORK_TREE \
+	GIT_INDEX_FILE \
+	GIT_OBJECT_DIRECTORY \
+	GIT_ALTERNATE_OBJECT_DIRECTORIES \
+	GIT_NAMESPACE \
+	GIT_PREFIX \
+	GIT_CEILING_DIRECTORIES \
+	GIT_QUARANTINE_PATH
 exec "$root/scripts/check"

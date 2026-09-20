@@ -29,7 +29,7 @@ All GitHub issues were inspected as the source backlog. No issue is closed by th
 ## Validation evidence
 
 - `./scripts/setup` enabled the pre-push hook.
-- `./scripts/check` passed formatting, Clippy with warnings denied, all 82 tests (51 core, 22 Herdr adapter/preflight, 6 CLI, 3 shared TUI), and the release build using the lockfile.
+- `./scripts/check` passed formatting, Clippy with warnings denied, all 102 tests (69 core, 24 Herdr adapter/preflight/hook, 6 CLI, 3 shared TUI), and the release build using the lockfile.
 - Core regressions cover source identity, generation, partial Unicode records, rollback and competing writers, both adapters, normalized previews, and selected-source session context.
 - Host tests cover exact live-session matching, safe command construction, UI effects, explicit recovery cancellation/confirmation, locked and existing worktree targets, and preserving the original checkout.
 - The current release overlay passed a synthetic PTY interaction check: a 200,000-tool-record startup displayed live elapsed/per-agent progress; F2 restricted visible results to User then Assistant; original preview excluded tools and scrolled to the end of a long wrapped reply; Esc preserved the query/filter and Ctrl-C exited cleanly. No native agent was launched.
@@ -104,7 +104,7 @@ were closed.
   `plugin pane close` invocation takes a pane ID, not the plugin/entrypoint
   pair.
 
-### Defect found and fixed
+### Defect found and fixed: a resumed Codex pane was not recognized
 
 Herdr's Codex integration reports a native session ID only when Codex *creates*
 a session; a pane running `codex resume <id>` reports none. The adapter
@@ -118,6 +118,39 @@ never treated as a match. Host failures now report the subcommand and the
 host's own message. Both changes are covered by new adapter regressions and
 were re-validated live: Codex scenario 5 then issued `agent focus` with no
 `agent start`, and Claude continued to match on its reported session ID.
+
+### Defect found and fixed: the quality gate mutated the repository it guarded
+
+Git exports its directory variables to hooks, and pushing **from a linked
+worktree** exports `GIT_DIR` — which is how every agent worktree in this
+repository is arranged (verified against a disposable repository: a plain
+checkout exports nothing, a linked worktree exports the worktree's Git
+directory). Those variables override `git -C`, so the pre-push hook ran the
+whole suite against the real repository: it failed core's `git::tests` *and*
+wrote to the repository it was guarding, producing a fixture commit titled
+`initial` on the branch being pushed and a fixture identity in the shared
+`.git/config`. The gate passed and left the repository untouched when run
+directly, which is why this stayed invisible until a push. Nothing reached the
+remote; the repository owner has since restored the local state.
+
+The canonical fix is `agent-history-core`'s published `git_command` helper and
+its `INHERITED_GIT_ENVIRONMENT` list of ten variables, delivered separately by
+the `claude/git-provenance` work that owns that crate. This branch is stacked on
+it and consumes it:
+
+* Every `git` invocation in `agent-history-herdr` now goes through
+  `agent_history_core::git_command`, including the `git worktree add` that
+  performs confirmed recovery, so a recorded repository is the only repository
+  recreation can reach. The crate no longer contains an unisolated `git` call,
+  and it does not keep a second copy of the variable list.
+* `.githooks/pre-push`, which no crate owns, now resolves the repository root
+  while the variables still describe the pushing worktree, then clears the same
+  ten names before running the gate. Nothing is skipped — `scripts/check` still
+  runs in full; it simply stops leaking Git state into the suite.
+* Two tests keep the hook and the constant from drifting apart: one asserts the
+  hook unsets every name in `INHERITED_GIT_ENVIRONMENT`, the other asserts the
+  hook resolves the root before clearing, runs the gate afterwards, and never
+  weakens or skips it.
 
 ## Exact external blocker and next step
 
