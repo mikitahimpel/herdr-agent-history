@@ -4,16 +4,11 @@ use agent_history_core::{
     adapters::{ClaudeAdapter, CodexAdapter},
     index::{index_all_with_progress, IndexProgress},
     preview::preview_source,
-    Agent, CoreError, EventKind, Result, SearchResult, SqliteStore,
+    CoreError, EventKind, Result, SearchResult, SourceRef, SqliteStore,
 };
-use crossterm::{
-    cursor,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    execute,
-    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
-    io::{self, Write},
+    io,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -22,7 +17,19 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+mod terminal;
+mod text;
+mod theme;
+mod ui;
+
+pub use text::{safe, wrap};
+pub use theme::{Color, Palette};
+pub use ui::draw;
+
+/// Maximum results fetched per query.
+pub const RESULT_LIMIT: usize = 50;
+const PREVIEW_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Key {
@@ -30,6 +37,8 @@ pub enum Key {
     Backspace,
     Up,
     Down,
+    PageUp,
+    PageDown,
     Space,
     Enter,
     Esc,
@@ -37,6 +46,7 @@ pub enum Key {
     F2,
 }
 
+/// Which pane has keyboard focus, or the integration's action screen.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Mode {
     #[default]
@@ -54,6 +64,7 @@ pub enum RoleFilter {
     Assistant,
 }
 impl RoleFilter {
+    pub const ALL: [Self; 3] = [Self::All, Self::User, Self::Assistant];
     pub fn next(self) -> Self {
         match self {
             Self::All => Self::User,
@@ -83,8 +94,17 @@ pub struct BrowserState {
     pub results: Vec<SearchResult>,
     pub selected: usize,
     pub mode: Mode,
+    /// Original conversation around the selected result.
     pub preview: String,
+    /// The source `preview` was read from; `None` when nothing is loaded.
+    pub preview_for: Option<SourceRef>,
+    /// Why the selected result's conversation could not be read.
+    pub preview_error: Option<String>,
     pub preview_scroll: usize,
+    /// Scroll the preview to the first matched term on the next render.
+    pub preview_anchor: bool,
+    /// First result shown in the results pane.
+    pub list_offset: usize,
     pub error: Option<String>,
     pub closed: bool,
     pub status: String,
@@ -92,7 +112,7 @@ pub struct BrowserState {
 }
 impl BrowserState {
     pub fn refresh(&mut self, store: &SqliteStore) {
-        match store.search_with_role(&self.query, 50, self.role_filter.kind()) {
+        match store.search_with_role(&self.query, RESULT_LIMIT, self.role_filter.kind()) {
             Ok(items) => {
                 self.results = items;
                 self.selected = self.selected.min(self.results.len().saturating_sub(1));
@@ -100,36 +120,97 @@ impl BrowserState {
             }
             Err(e) => {
                 self.results.clear();
+                self.selected = 0;
                 self.error = Some(e.to_string());
             }
         }
+        self.sync_preview(store);
     }
     pub fn selected_result(&self) -> Option<&SearchResult> {
         self.results.get(self.selected)
     }
+
+    /// Loads the conversation for the selected result unless it is already
+    /// loaded. Failures are kept for the preview pane rather than reported as
+    /// errors, because browsing past an unreadable result is normal.
+    pub fn sync_preview(&mut self, store: &SqliteStore) {
+        match self.selected_result().map(|r| r.source.clone()) {
+            Some(source) if self.preview_for.as_ref() != Some(&source) => {
+                let _ = self.load_preview(store, source);
+            }
+            Some(_) => {}
+            None => {
+                self.preview.clear();
+                self.preview_for = None;
+                self.preview_error = None;
+                self.preview_scroll = 0;
+            }
+        }
+    }
+
+    fn load_preview(&mut self, store: &SqliteStore, source: SourceRef) -> Result<()> {
+        self.preview.clear();
+        self.preview_error = None;
+        self.preview_scroll = 0;
+        self.preview_anchor = true;
+        self.preview_for = Some(source.clone());
+        match preview_source(store, &source, PREVIEW_BYTES) {
+            Ok(p) => {
+                self.preview = p.text;
+                if p.truncated_before || p.truncated_after {
+                    self.preview
+                        .push_str("\n\n[Surrounding context is limited]");
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.preview_error = Some(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    /// Focuses the preview of the selected result, re-reading the source if
+    /// the loaded preview belongs to another result or failed.
     pub fn show_preview(&mut self, store: &SqliteStore) -> Result<()> {
         let source = self
             .selected_result()
             .ok_or_else(|| CoreError::Unsupported("no session selected".into()))?
             .source
             .clone();
-        let p = preview_source(store, &source, 64 * 1024)?;
-        self.preview = p.text;
-        self.preview_scroll = 0;
-        if p.truncated_before || p.truncated_after {
-            self.preview
-                .push_str("\n\n[Surrounding context is limited]");
+        if self.preview_for.as_ref() != Some(&source) || self.preview_error.is_some() {
+            self.load_preview(store, source)?;
         }
         self.mode = Mode::Preview;
         Ok(())
     }
+
+    fn requery(&mut self, store: &SqliteStore) {
+        self.selected = 0;
+        self.list_offset = 0;
+        self.refresh(store);
+    }
+
+    fn select(&mut self, index: usize, store: &SqliteStore) {
+        self.selected = index.min(self.results.len().saturating_sub(1));
+        self.sync_preview(store);
+    }
+
     pub fn handle(&mut self, key: Key, store: &SqliteStore) -> Result<()> {
         self.error = None;
         match self.mode {
             Mode::Preview => match key {
                 Key::Esc => self.mode = Mode::Results,
+                Key::Tab => self.mode = Mode::Query,
                 Key::Up => self.preview_scroll = self.preview_scroll.saturating_sub(1),
                 Key::Down => self.preview_scroll = self.preview_scroll.saturating_add(1),
+                Key::PageUp => self.preview_scroll = self.preview_scroll.saturating_sub(10),
+                Key::PageDown => self.preview_scroll = self.preview_scroll.saturating_add(10),
+                Key::F2 => {
+                    self.role_filter = self.role_filter.next();
+                    self.mode = Mode::Results;
+                    self.requery(store);
+                }
                 _ => {}
             },
             Mode::Action => {}
@@ -138,43 +219,46 @@ impl BrowserState {
                 Key::Esc => self.closed = true,
                 Key::Down => {
                     if self.mode == Mode::Results {
-                        self.selected = self
-                            .selected
-                            .saturating_add(1)
-                            .min(self.results.len().saturating_sub(1));
+                        self.select(self.selected.saturating_add(1), store);
                     }
                     self.mode = Mode::Results;
                 }
                 Key::Up => {
                     self.mode = Mode::Results;
-                    self.selected = self.selected.saturating_sub(1);
+                    self.select(self.selected.saturating_sub(1), store);
                 }
+                Key::PageDown => {
+                    self.mode = Mode::Results;
+                    self.select(self.selected.saturating_add(5), store);
+                }
+                Key::PageUp => {
+                    self.mode = Mode::Results;
+                    self.select(self.selected.saturating_sub(5), store);
+                }
+                Key::Tab if self.mode == Mode::Query => self.mode = Mode::Results,
                 Key::Tab => {
-                    self.mode = if self.mode == Mode::Query {
-                        Mode::Results
-                    } else {
-                        Mode::Query
+                    if self.show_preview(store).is_err() {
+                        self.mode = Mode::Query;
                     }
                 }
                 Key::F2 => {
                     self.role_filter = self.role_filter.next();
-                    self.selected = 0;
-                    self.refresh(store);
+                    self.requery(store);
                 }
                 Key::Space if self.mode == Mode::Results => self.show_preview(store)?,
                 Key::Space => {
                     self.query.push(' ');
-                    self.refresh(store);
+                    self.requery(store);
                 }
                 Key::Char(c) => {
                     self.mode = Mode::Query;
                     self.query.push(c);
-                    self.refresh(store);
+                    self.requery(store);
                 }
                 Key::Backspace => {
                     self.mode = Mode::Query;
                     self.query.pop();
-                    self.refresh(store);
+                    self.requery(store);
                 }
                 Key::Enter => self.show_preview(store)?,
             },
@@ -186,6 +270,15 @@ impl BrowserState {
 pub trait Integration {
     fn title(&self) -> &str;
     fn enter_label(&self) -> &str;
+    /// What Enter does while the preview pane is focused, if anything.
+    fn preview_enter_label(&self) -> Option<&str> {
+        None
+    }
+    /// Colors for the browser. The default follows the terminal's own
+    /// ANSI palette; integrations may supply their host's theme.
+    fn palette(&self) -> Palette {
+        Palette::terminal()
+    }
     fn handle(&mut self, key: Key, state: &mut BrowserState, store: &SqliteStore) -> Result<bool>;
     fn action_lines(&self) -> Vec<String>;
 }
@@ -209,7 +302,7 @@ impl Integration for Standalone {
 
 pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<()> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{}\n\nOptions: --db PATH --claude-root PATH --codex-root PATH\nExplicit root options disable default history discovery for both agents.\nType a query; arrows/Tab focus results; F2 filters role; Space previews; Enter {}; Esc goes back.", integration.title(), integration.enter_label().to_lowercase());
+        println!("{}\n\nOptions: --db PATH --claude-root PATH --codex-root PATH\nExplicit root options disable default history discovery for both agents.\nType a query; arrows/Tab focus results and preview; F2 filters role; Space previews; Enter {}; Esc goes back; Ctrl-C closes.", integration.title(), integration.enter_label().to_lowercase());
         return Ok(());
     }
     let (db, claude, codex) = parse_args(args)?;
@@ -225,66 +318,72 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
             Box::new(CodexAdapter::default()),
         ]
     };
+    let palette = integration.palette();
+    let title = integration.title().to_string();
+    terminal::install_signal_handlers();
+    let mut screen = terminal::Screen::enter()?;
+
     let started = Instant::now();
-    let progress = Arc::new(Mutex::new(String::from("Preparing conversation index…")));
+    let progress: Arc<Mutex<Option<IndexProgress>>> = Arc::new(Mutex::new(None));
     let done = Arc::new(AtomicBool::new(false));
-    let ticker_progress = Arc::clone(&progress);
-    let ticker_done = Arc::clone(&done);
-    let ticker_started = started;
-    let ticker = thread::spawn(move || {
-        let glyphs = ['·', '•', '●', '•'];
-        let mut i = 0;
-        while !ticker_done.load(Ordering::Acquire) {
-            let text = ticker_progress
-                .lock()
-                .map(|p| p.clone())
-                .unwrap_or_default();
-            let width = terminal::size()
-                .map(|(w, _)| w.saturating_sub(1) as usize)
-                .unwrap_or(100);
-            eprint!(
-                "\r\x1b[2K{}",
-                safe(
-                    &format!(
-                        "Agent History {} ({:.1}s) {}",
-                        glyphs[i % glyphs.len()],
-                        ticker_started.elapsed().as_secs_f32(),
-                        text
-                    ),
-                    width
-                )
-            );
-            let _ = io::stderr().flush();
-            i += 1;
-            thread::sleep(Duration::from_millis(150));
-        }
-    });
+    let ticker = {
+        let progress = Arc::clone(&progress);
+        let done = Arc::clone(&done);
+        let mut term = screen.take();
+        thread::spawn(move || {
+            let mut typed = Vec::new();
+            let mut frame = 0usize;
+            while !done.load(Ordering::Acquire) {
+                let snapshot = progress.lock().map(|p| p.clone()).unwrap_or_default();
+                let _ = term.draw(|f| {
+                    ui::draw_progress(
+                        f,
+                        &palette,
+                        &title,
+                        frame,
+                        started.elapsed(),
+                        snapshot.as_ref(),
+                    )
+                });
+                frame += 1;
+                if terminal::interrupted() {
+                    terminal::abort(term);
+                }
+                if event::poll(Duration::from_millis(120)).unwrap_or(false) {
+                    if let Ok(Event::Key(k)) = event::read() {
+                        if is_interrupt(&k) {
+                            terminal::abort(term);
+                        }
+                        if k.kind != KeyEventKind::Release {
+                            typed.extend(map_key(k.code));
+                        }
+                    }
+                }
+            }
+            (term, typed)
+        })
+    };
+    let finish = |ticker: thread::JoinHandle<_>| {
+        done.store(true, Ordering::Release);
+        ticker
+            .join()
+            .map_err(|_| io::Error::other("progress display failed"))
+    };
     let mut store = match SqliteStore::open(db) {
         Ok(store) => store,
         Err(e) => {
-            done.store(true, Ordering::Release);
-            let _ = ticker.join();
-            eprintln!();
+            finish(ticker)?;
             return Err(core_io(e));
         }
     };
     let progress_for_index = Arc::clone(&progress);
     let report = index_all_with_progress(&mut store, &adapters, |p: IndexProgress| {
         if let Ok(mut progress) = progress_for_index.lock() {
-            *progress = format!(
-                "{} files {}/{} · {} MB read · {} records · {} chunks",
-                agent_name(p.agent),
-                p.agent_completed_files,
-                p.agent_total_files,
-                p.bytes_read / (1024 * 1024),
-                p.records,
-                p.chunks
-            );
+            *progress = Some(p);
         }
     });
-    done.store(true, Ordering::Release);
-    let _ = ticker.join();
-    eprintln!();
+    let (term, typed) = finish(ticker)?;
+    screen.put_back(term);
     let report = report.map_err(core_io)?;
     let mut state = BrowserState {
         status: format!(
@@ -301,34 +400,51 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
         state.status.push_str(" — ");
         state.status.push_str(&report.errors.join("; "));
     }
-    let _screen = Screen::enter()?;
-    let mut out = io::stdout();
+    // Replay what was typed while indexing, but never an action key.
+    for key in typed {
+        if matches!(key, Key::Char(_) | Key::Space | Key::Backspace) {
+            let _ = state.handle(key, &store);
+        }
+    }
+    let term = screen.terminal();
     while !state.closed {
-        render(&mut out, &mut state, integration)?;
-        if let Event::Key(k) = event::read()? {
-            if k.kind == KeyEventKind::Release {
-                continue;
-            }
-            if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
-                break;
-            }
-            if let Some(key) = map_key(k.code) {
-                let handled = match integration.handle(key, &mut state, &store) {
-                    Ok(handled) => handled,
-                    Err(e) => {
-                        state.error = Some(e.to_string());
-                        continue;
-                    }
-                };
-                if !handled {
-                    if let Err(e) = state.handle(key, &store) {
-                        state.error = Some(e.to_string());
-                    }
+        term.draw(|f| draw(f, &mut state, integration))?;
+        if terminal::interrupted() {
+            break;
+        }
+        if !event::poll(Duration::from_millis(200))? {
+            continue;
+        }
+        let Event::Key(k) = event::read()? else {
+            continue;
+        };
+        if k.kind == KeyEventKind::Release {
+            continue;
+        }
+        if is_interrupt(&k) {
+            break;
+        }
+        if let Some(key) = map_key(k.code) {
+            let handled = match integration.handle(key, &mut state, &store) {
+                Ok(handled) => handled,
+                Err(e) => {
+                    state.error = Some(e.to_string());
+                    continue;
+                }
+            };
+            if !handled {
+                if let Err(e) = state.handle(key, &store) {
+                    state.error = Some(e.to_string());
                 }
             }
+            state.sync_preview(&store);
         }
     }
     Ok(())
+}
+
+fn is_interrupt(k: &KeyEvent) -> bool {
+    k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c')
 }
 
 fn parse_args(args: Vec<String>) -> io::Result<(PathBuf, Option<PathBuf>, Option<PathBuf>)> {
@@ -365,12 +481,6 @@ fn parse_args(args: Vec<String>) -> io::Result<(PathBuf, Option<PathBuf>, Option
 fn core_io(e: agent_history_core::CoreError) -> io::Error {
     io::Error::other(e.to_string())
 }
-fn agent_name(a: Agent) -> &'static str {
-    match a {
-        Agent::Claude => "Claude",
-        Agent::Codex => "Codex",
-    }
-}
 fn map_key(k: KeyCode) -> Option<Key> {
     Some(match k {
         KeyCode::Char(' ') => Key::Space,
@@ -378,198 +488,14 @@ fn map_key(k: KeyCode) -> Option<Key> {
         KeyCode::Backspace => Key::Backspace,
         KeyCode::Up => Key::Up,
         KeyCode::Down => Key::Down,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
         KeyCode::Enter => Key::Enter,
         KeyCode::Esc => Key::Esc,
         KeyCode::Tab => Key::Tab,
         KeyCode::F(2) => Key::F2,
         _ => return None,
     })
-}
-
-struct Screen;
-impl Screen {
-    fn enter() -> io::Result<Self> {
-        terminal::enable_raw_mode()?;
-        let guard = Self;
-        execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?;
-        Ok(guard)
-    }
-}
-impl Drop for Screen {
-    fn drop(&mut self) {
-        let _ = execute!(io::stdout(), cursor::Show, LeaveAlternateScreen);
-        let _ = terminal::disable_raw_mode();
-    }
-}
-
-pub fn render(
-    out: &mut impl Write,
-    state: &mut BrowserState,
-    integration: &impl Integration,
-) -> io::Result<()> {
-    let (width, height) = terminal::size()?;
-    let width = width.saturating_sub(1) as usize;
-    let mut lines = vec![
-        format!("{}  {}", integration.title(), state.query),
-        format!(
-            "Role: {}   (F2 changes)   {}",
-            state.role_filter.label(),
-            state.status
-        ),
-        format!(
-            "Type query · ↑↓/Tab results · F2 role · Space preview · Enter {} · Esc back · Ctrl-C close",
-            integration.enter_label()
-        ),
-    ];
-    if let Some(e) = &state.error {
-        lines.push(format!("Error: {e}"));
-    }
-    match state.mode {
-        Mode::Preview => {
-            lines.push(format!(
-                "Original conversation — Enter {} · Esc results",
-                integration.enter_label()
-            ));
-            if let Some(r) = state.selected_result() {
-                lines.push(format!(
-                    "{} · {}",
-                    agent_name(r.agent),
-                    r.repository.as_deref().map(compact_repo).unwrap_or("-")
-                ));
-            }
-            let wrapped: Vec<String> = state
-                .preview
-                .lines()
-                .flat_map(|l| wrap(l, width.saturating_sub(1).max(12)))
-                .collect();
-            let visible = height.saturating_sub(lines.len() as u16 + 1) as usize;
-            let skip = state
-                .preview_scroll
-                .min(wrapped.len().saturating_sub(visible.max(1)));
-            state.preview_scroll = skip;
-            lines.extend(wrapped.into_iter().skip(skip));
-        }
-        Mode::Action => lines.extend(integration.action_lines()),
-        _ => {
-            if state.results.is_empty() {
-                lines.push(
-                    if state.query.is_empty() {
-                        "Type words from a conversation."
-                    } else {
-                        "No matching sessions."
-                    }
-                    .into(),
-                );
-            }
-            let visible = height.saturating_sub(lines.len() as u16 + 1) as usize / 4;
-            let start = state.selected.saturating_sub(visible.saturating_sub(1));
-            for (i, r) in state.results.iter().enumerate().skip(start).take(visible) {
-                let date = r
-                    .timestamp
-                    .map(|t| {
-                        let d: chrono::DateTime<chrono::Utc> = t.into();
-                        d.format("%Y-%m-%d").to_string()
-                    })
-                    .unwrap_or_else(|| "unknown date".into());
-                let context = match (r.repository.as_deref(), r.branch.as_deref()) {
-                    (Some(a), Some(b)) => format!("{} / {b}", compact_repo(a)),
-                    (Some(a), None) => compact_repo(a).into(),
-                    (None, Some(b)) => b.into(),
-                    _ => "-".into(),
-                };
-                lines.push(format!(
-                    "{} {} · {} · {}",
-                    if i == state.selected && state.mode == Mode::Results {
-                        "▶"
-                    } else {
-                        " "
-                    },
-                    agent_name(r.agent),
-                    role_name(r.kind),
-                    context
-                ));
-                lines.push(format!("  {date}"));
-                let mut snippet = wrap(&r.snippet, width.saturating_sub(6).max(12));
-                snippet.truncate(2);
-                lines.extend(snippet.into_iter().map(|x| format!("    {x}")));
-            }
-        }
-    }
-    execute!(out, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
-    for line in lines.into_iter().take(height.saturating_sub(1) as usize) {
-        writeln!(out, "{}\r", safe(&line, width))?;
-    }
-    out.flush()
-}
-pub fn safe(value: &str, width: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    for c in value.chars() {
-        let c = if c.is_control() { ' ' } else { c };
-        let w = c.width().unwrap_or(0);
-        if used + w > width {
-            break;
-        }
-        out.push(c);
-        used += w;
-    }
-    out
-}
-pub fn wrap(text: &str, width: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    for p in text.lines() {
-        if p.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let mut line = String::new();
-        for word in p.split_whitespace() {
-            if UnicodeWidthStr::width(word) > width {
-                if !line.is_empty() {
-                    out.push(std::mem::take(&mut line));
-                }
-                let mut part = String::new();
-                let mut used = 0;
-                for c in word.chars() {
-                    let cw = c.width().unwrap_or(0);
-                    if used + cw > width && !part.is_empty() {
-                        out.push(std::mem::take(&mut part));
-                        used = 0;
-                    }
-                    part.push(c);
-                    used += cw;
-                }
-                line = part;
-                continue;
-            }
-            if !line.is_empty()
-                && UnicodeWidthStr::width(line.as_str()) + 1 + UnicodeWidthStr::width(word) > width
-            {
-                out.push(std::mem::take(&mut line));
-            }
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(word);
-        }
-        if !line.is_empty() {
-            out.push(line);
-        }
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
-}
-fn compact_repo(repo: &str) -> &str {
-    repo.rsplit('/').next().unwrap_or(repo)
-}
-fn role_name(k: EventKind) -> &'static str {
-    match k {
-        EventKind::User => "User",
-        EventKind::Assistant => "Assistant",
-        EventKind::ToolResult => "Tool",
-    }
 }
 
 #[cfg(test)]
@@ -586,26 +512,45 @@ mod tests {
         assert_eq!(RoleFilter::User.kind(), Some(EventKind::User));
     }
 
-    #[test]
-    fn standalone_has_no_actions_and_enter_opens_preview() {
-        let temp = agent_history_core::test_support::TempDir::new("tui").unwrap();
-        let root = temp.path().to_path_buf();
+    pub(crate) fn fixture_store(root: &std::path::Path, records: &[&str]) -> SqliteStore {
         fs::create_dir_all(root.join("history")).unwrap();
         fs::create_dir(root.join("private")).unwrap();
         let mut permissions = fs::metadata(root.join("private")).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
         fs::set_permissions(root.join("private"), permissions).unwrap();
-        let cwd = root.to_string_lossy();
-        let source = root.join("history/session.jsonl");
-        fs::write(&source, format!(r##"{{"type":"user","sessionId":"00000000-0000-4000-8000-000000000001","cwd":"{cwd}","message":{{"content":"rememberable topic"}}}}
-{{"type":"assistant","message":{{"content":"rememberable answer"}}}}
-"##)).unwrap();
+        let mut body = String::new();
+        for record in records {
+            body.push_str(record);
+            body.push('\n');
+        }
+        fs::write(root.join("history/session.jsonl"), body).unwrap();
         let mut store = SqliteStore::open(root.join("private/index.sqlite")).unwrap();
         index_all(
             &mut store,
             &[Box::new(ClaudeAdapter::with_root(root.join("history")))],
         )
         .unwrap();
+        store
+    }
+
+    pub(crate) fn rememberable(root: &std::path::Path) -> SqliteStore {
+        let cwd = root.to_string_lossy();
+        let user = format!(
+            r#"{{"type":"user","sessionId":"00000000-0000-4000-8000-000000000001","cwd":"{cwd}","message":{{"content":"rememberable topic"}}}}"#
+        );
+        fixture_store(
+            root,
+            &[
+                &user,
+                r#"{"type":"assistant","message":{"content":"rememberable answer"}}"#,
+            ],
+        )
+    }
+
+    #[test]
+    fn standalone_has_no_actions_and_enter_opens_preview() {
+        let temp = agent_history_core::test_support::TempDir::new("tui").unwrap();
+        let store = rememberable(temp.path());
         let mut state = BrowserState {
             query: "rememberable".into(),
             ..Default::default()
@@ -623,18 +568,63 @@ mod tests {
         assert_eq!(state.mode, Mode::Preview);
         assert!(state.preview.contains("User: rememberable topic"));
         assert!(Standalone.action_lines().is_empty());
+        assert_eq!(Standalone.preview_enter_label(), None);
         state.handle(Key::Esc, &store).unwrap();
         assert_eq!(state.query, "rememberable");
+        assert_eq!(state.mode, Mode::Results);
         state.handle(Key::F2, &store).unwrap();
         assert_eq!(state.results.len(), 1);
         assert_eq!(state.results[0].kind, EventKind::Assistant);
+        assert_eq!(state.role_filter, RoleFilter::Assistant);
     }
 
     #[test]
-    fn terminal_helpers_sanitize_and_wrap_wide_text() {
-        assert_eq!(safe("a\n雪雪x", 4), "a 雪");
-        assert!(wrap("abcdefghij 雪", 4)
-            .iter()
-            .all(|s| UnicodeWidthStr::width(s.as_str()) <= 4));
+    fn preview_follows_selection_and_tab_cycles_focus() {
+        let temp = agent_history_core::test_support::TempDir::new("tui-follow").unwrap();
+        let store = rememberable(temp.path());
+        let mut state = BrowserState::default();
+        for c in "rememberable".chars() {
+            state.handle(Key::Char(c), &store).unwrap();
+        }
+        assert_eq!(state.mode, Mode::Query);
+        assert_eq!(
+            state.preview_for.as_ref(),
+            Some(&state.results[0].source),
+            "preview is loaded without leaving the query box"
+        );
+        state.handle(Key::Tab, &store).unwrap();
+        assert_eq!(state.mode, Mode::Results);
+        state.handle(Key::Down, &store).unwrap();
+        assert_eq!(state.preview_for.as_ref(), Some(&state.results[1].source));
+        state.handle(Key::Tab, &store).unwrap();
+        assert_eq!(state.mode, Mode::Preview);
+        state.handle(Key::Tab, &store).unwrap();
+        assert_eq!(state.mode, Mode::Query);
+        state.handle(Key::Backspace, &store).unwrap();
+        assert_eq!(state.selected, 0, "a new query starts at the top");
+        state.query = "absent".into();
+        state.refresh(&store);
+        assert!(state.results.is_empty());
+        assert!(state.preview_for.is_none() && state.preview.is_empty());
+    }
+
+    #[test]
+    fn unreadable_source_is_reported_in_the_preview_not_as_a_crash() {
+        let temp = agent_history_core::test_support::TempDir::new("tui-stale").unwrap();
+        let store = rememberable(temp.path());
+        fs::write(temp.path().join("history/session.jsonl"), "replaced\n").unwrap();
+        let mut state = BrowserState {
+            query: "rememberable".into(),
+            ..Default::default()
+        };
+        state.refresh(&store);
+        assert!(state.preview_error.is_some());
+        assert!(
+            state.handle(Key::Space, &store).is_ok(),
+            "space types in the query"
+        );
+        state.mode = Mode::Results;
+        assert!(state.handle(Key::Space, &store).is_err());
+        assert_eq!(state.mode, Mode::Results);
     }
 }

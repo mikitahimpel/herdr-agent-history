@@ -8,4 +8,6 @@ publish.workspace = true
 agent-history-core = { path = "../agent-history-core" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossterm = "0.29"
+libc = "0.2"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 unicode-width = "0.2"
