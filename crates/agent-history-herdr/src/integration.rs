@@ -1,7 +1,7 @@
 //! Herdr-specific actions for the shared Agent History browser.
 use crate::{restore, resume_in_host, HostRuntime};
 use agent_history_core::{preview::preview_source, CoreError, Result, SqliteStore};
-use agent_history_tui::{BrowserState, Integration, Key, Mode};
+use agent_history_tui::{BrowserState, Integration, Key, Mode, Palette};
 
 /// The Herdr adapter owns restoration choices and host side effects. Search,
 /// selection, and rendering remain in `agent-history-tui`.
@@ -9,6 +9,7 @@ pub struct HerdrIntegration<H> {
     host: H,
     recovery: Vec<restore::RecoveryChoice>,
     confirmation_text: Option<String>,
+    palette: Palette,
 }
 
 impl<H> HerdrIntegration<H> {
@@ -17,7 +18,15 @@ impl<H> HerdrIntegration<H> {
             host,
             recovery: Vec::new(),
             confirmation_text: None,
+            palette: Palette::terminal(),
         }
+    }
+
+    /// Colors the browser with `palette`, normally Herdr's configured theme
+    /// from [`crate::theme::palette_from_env`].
+    pub fn with_palette(mut self, palette: Palette) -> Self {
+        self.palette = palette;
+        self
     }
 
     pub fn host(&self) -> &H {
@@ -74,6 +83,14 @@ impl<H: HostRuntime> Integration for HerdrIntegration<H> {
 
     fn enter_label(&self) -> &str {
         "Resume"
+    }
+
+    fn preview_enter_label(&self) -> Option<&str> {
+        Some("Resume")
+    }
+
+    fn palette(&self) -> Palette {
+        self.palette
     }
 
     fn action_lines(&self) -> Vec<String> {

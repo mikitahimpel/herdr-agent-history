@@ -6,6 +6,7 @@ pub mod integration;
 pub mod restore;
 pub mod resume;
 pub mod socket;
+pub mod theme;
 
 /// A narrow, mockable host surface used by the restoration coordinator. The
 /// implementation may be backed by Herdr's CLI or socket API.

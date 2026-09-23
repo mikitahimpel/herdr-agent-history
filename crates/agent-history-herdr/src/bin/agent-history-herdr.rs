@@ -1,6 +1,7 @@
 use agent_history_herdr::{
     integration::HerdrIntegration,
     socket::{HerdrCli, ProcessRunner},
+    theme,
 };
 use agent_history_tui::run;
 use std::io;
@@ -20,6 +21,7 @@ fn main() -> io::Result<()> {
     }
     run(
         args,
-        &mut HerdrIntegration::new(HerdrCli::new(ProcessRunner)),
+        &mut HerdrIntegration::new(HerdrCli::new(ProcessRunner))
+            .with_palette(theme::palette_from_env()),
     )
 }

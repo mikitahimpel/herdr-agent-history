@@ -9,7 +9,11 @@ The repository contains four Rust crates. Herdr is an optional application integ
 | `agent-history-cli` | Standalone browser and index/search/status/preview commands | Core, TUI |
 | `agent-history-herdr` | Herdr workspace discovery/focus, native resume, recovery choices and confirmed Git mutation | Core, TUI |
 
-The shared TUI accepts an integration that supplies its title, Enter action, and optional action screen. The standalone integration uses the ordinary preview action and performs no host operations. The Herdr integration intercepts Enter to resume and owns recovery confirmation state. Shared UI code contains no Herdr commands, process launcher, or worktree mutation.
+The shared TUI accepts an integration that supplies its title, Enter action, optional action screen, and color palette. The standalone integration uses the ordinary preview action, performs no host operations, and keeps the default palette: ANSI-16 plus the terminal's own foreground and background. The Herdr integration intercepts Enter to resume, owns recovery confirmation state, and resolves Herdr's configured theme (`agent-history-herdr/src/theme.rs`) into the palette it passes to the TUI. Shared UI code contains no Herdr commands, process launcher, worktree mutation, or Herdr config reading.
+
+### Theme resolution
+
+Herdr does not pass its theme to the panes it hosts, so the Herdr integration reads `config.toml` itself, from `HERDR_CONFIG_PATH`, `$XDG_CONFIG_HOME/herdr/`, or `~/.config/herdr/`, the same order Herdr uses. `[theme] name` selects a copy of one of Herdr's built-in palettes; `[theme.custom]` tokens and a legacy `[ui] accent` are applied on top, read live from the file. The built-in tables are copied from Herdr v0.7.5 `src/app/state.rs` (identical in v0.7.1) and can drift when Herdr changes them. A theme name missing from the copy, the `terminal` theme, and a missing or malformed config all fall back to the terminal palette; an unparseable custom color keeps the base theme's token. With `auto_switch`, the dark theme is used, because this process does not query the terminal's background the way Herdr does.
 
 ## Running and building
 
