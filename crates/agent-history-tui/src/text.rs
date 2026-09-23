@@ -121,14 +121,10 @@ pub(crate) fn matches(line: &str, terms: &[String]) -> Vec<(usize, usize)> {
             chars[i].1.is_alphanumeric() && (i == 0 || !chars[i - 1].1.is_alphanumeric());
         if at_word_start {
             let found = terms.iter().any(|term| {
-                let mut j = i;
-                for t in term.chars() {
-                    if j >= chars.len() || fold(chars[j].1) != t {
-                        return false;
-                    }
-                    j += 1;
-                }
-                true
+                let n = term.chars().count();
+                chars
+                    .get(i..i + n)
+                    .is_some_and(|word| word.iter().map(|&(_, c)| fold(c)).eq(term.chars()))
             });
             if found {
                 let mut end = i;
