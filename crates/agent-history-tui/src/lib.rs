@@ -2,9 +2,10 @@
 //! This crate deliberately contains no host or workspace integration.
 use agent_history_core::{
     adapters::{ClaudeAdapter, CodexAdapter},
+    availability::Availability,
     index::{index_all_with_progress, IndexProgress},
     preview::preview_source,
-    CoreError, EventKind, Result, SearchResult, SourceRef, SqliteStore,
+    CoreError, EventKind, Result, SearchResult, Session, SessionId, SourceRef, SqliteStore,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
@@ -18,12 +19,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod availability;
 mod markdown;
 mod terminal;
 mod text;
 mod theme;
 mod ui;
 
+pub use availability::{Availabilities, SessionState};
 pub use text::{safe, wrap};
 pub use theme::{Color, Palette};
 pub use ui::draw;
@@ -110,6 +113,9 @@ pub struct BrowserState {
     pub closed: bool,
     pub status: String,
     pub role_filter: RoleFilter,
+    /// Whether each result's session still exists on disk, filled in by a
+    /// background check.
+    pub availability: Availabilities,
 }
 impl BrowserState {
     pub fn refresh(&mut self, store: &SqliteStore) {
@@ -282,6 +288,21 @@ pub trait Integration {
     }
     fn handle(&mut self, key: Key, state: &mut BrowserState, store: &SqliteStore) -> Result<bool>;
     fn action_lines(&self) -> Vec<String>;
+    /// Sessions the host already runs, asked once when the browser opens.
+    fn live_sessions(&mut self, _sessions: &[Session]) -> Vec<SessionId> {
+        Vec::new()
+    }
+    /// Short wording for a result's availability marker. The default only
+    /// describes what exists on disk; it never promises that Enter resumes.
+    fn availability_label(&self, state: SessionState) -> &str {
+        match state {
+            SessionState::Live => "running",
+            SessionState::Stored(Availability::OnDisk) => "on disk",
+            SessionState::Stored(Availability::Recoverable) => "repo only",
+            SessionState::Stored(Availability::RepositoryKnown) => "repo gone",
+            SessionState::Stored(Availability::TranscriptOnly) => "transcript",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -407,13 +428,28 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
             let _ = state.handle(key, &store);
         }
     }
+    // One read of the session table and one host query; after this, only the
+    // worker touches the filesystem, and only for sessions not seen before.
+    let sessions = store.sessions().unwrap_or_default();
+    state
+        .availability
+        .set_live(integration.live_sessions(&sessions));
+    let worker =
+        availability::Worker::spawn(sessions, agent_history_core::availability::availability);
     let term = screen.terminal();
     while !state.closed {
+        worker.drain(&mut state.availability);
+        worker.request(state.availability.wanted(&state.results));
         term.draw(|f| draw(f, &mut state, integration))?;
         if terminal::interrupted() {
             break;
         }
-        if !event::poll(Duration::from_millis(200))? {
+        let wait = if state.availability.pending() {
+            50
+        } else {
+            200
+        };
+        if !event::poll(Duration::from_millis(wait))? {
             continue;
         }
         let Event::Key(k) = event::read()? else {

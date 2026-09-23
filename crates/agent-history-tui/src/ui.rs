@@ -4,12 +4,14 @@ use crate::{
     markdown,
     text::{self, matches, query_terms, safe, width},
     theme::Palette,
-    BrowserState, Integration, Mode, RoleFilter, RESULT_LIMIT,
+    BrowserState, Integration, Mode, RoleFilter, SessionState, RESULT_LIMIT,
 };
-use agent_history_core::{index::IndexProgress, Agent, EventKind, SearchResult};
+use agent_history_core::{
+    availability::Availability, index::IndexProgress, Agent, EventKind, SearchResult,
+};
 use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Clear, LineGauge, Paragraph},
     Frame,
@@ -53,7 +55,7 @@ pub fn draw(frame: &mut Frame, state: &mut BrowserState, integration: &impl Inte
 
     let (results_area, preview_area) = split_body(body, state.mode);
     if let Some(r) = results_area {
-        draw_results(frame, r, state, &p);
+        draw_results(frame, r, state, integration, &p);
     }
     if let Some(r) = preview_area {
         draw_preview(frame, r, state, &p);
@@ -316,7 +318,26 @@ fn result_row(bar: &Span<'static>, content: Vec<Span<'static>>, w: usize) -> Lin
     fit(spans, w)
 }
 
-fn draw_results(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Palette) {
+/// Glyph and color for a session's availability. Each state has its own
+/// shape, so it reads without color too.
+pub(crate) fn marker(state: Option<SessionState>, p: &Palette) -> (&'static str, Color) {
+    match state {
+        None => ("·", p.overlay0),
+        Some(SessionState::Live) => ("◉", p.teal),
+        Some(SessionState::Stored(Availability::OnDisk)) => ("●", p.green),
+        Some(SessionState::Stored(Availability::Recoverable)) => ("◐", p.yellow),
+        Some(SessionState::Stored(Availability::RepositoryKnown)) => ("○", p.red),
+        Some(SessionState::Stored(Availability::TranscriptOnly)) => ("◌", p.overlay0),
+    }
+}
+
+fn draw_results(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut BrowserState,
+    integration: &impl Integration,
+    p: &Palette,
+) {
     let focused = state.mode == Mode::Results;
     let mut block = pane("Results", focused, p);
     if !state.results.is_empty() {
@@ -369,11 +390,24 @@ fn draw_results(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Pal
             Span::raw(" ")
         };
         let d = date(r);
+        let availability = state.availability.state(&r.session_id);
+        let (glyph, color) = marker(availability, p);
         let mut head = vec![
+            Span::styled(glyph, Style::new().fg(color).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
             agent_span(r.agent, p),
             Span::raw("  "),
             role_span(r.kind, p),
         ];
+        if let Some(availability) = availability {
+            let label = integration.availability_label(availability).to_string();
+            let used: usize = head.iter().map(|s| width_of(&s.content)).sum();
+            // The label is dropped, never truncated, when the row is narrow.
+            if used + 2 + width_of(&label) + 1 + width_of(&d) <= content_w {
+                head.push(Span::raw("  "));
+                head.push(Span::styled(label, Style::new().fg(color)));
+            }
+        }
         let used: usize = head.iter().map(|s| width_of(&s.content)).sum();
         let gap = content_w.saturating_sub(used + width_of(&d)).max(1);
         head.push(Span::raw(" ".repeat(gap)));
@@ -819,6 +853,7 @@ mod tests {
     use crate::{tests::rememberable, Key, Standalone};
     use agent_history_core::{test_support::TempDir, SqliteStore};
     use ratatui::{backend::TestBackend, buffer::Buffer, style::Color, Terminal};
+    use std::collections::HashSet;
 
     struct Themed(Palette);
     impl Integration for Themed {
@@ -841,6 +876,12 @@ mod tests {
             _: &SqliteStore,
         ) -> agent_history_core::Result<bool> {
             Ok(false)
+        }
+        fn availability_label(&self, state: SessionState) -> &str {
+            match state {
+                SessionState::Live => "focus running",
+                _ => "other",
+            }
         }
         fn action_lines(&self) -> Vec<String> {
             vec![
@@ -903,7 +944,7 @@ mod tests {
         let second = find(&buf, "Claude  ASSISTANT").expect("second result header");
         assert_eq!(buf[(first.0 + 2, first.1)].bg, Color::DarkGray);
         assert_eq!(buf[(second.0 + 2, second.1)].bg, Color::Reset);
-        assert_eq!(buf[(first.0 - 2, first.1)].symbol(), "▌");
+        assert_eq!(buf[(first.0 - 4, first.1)].symbol(), "▌");
         // The whole row is covered, not only the text.
         assert_eq!(buf[(first.0 + 30, first.1)].bg, Color::DarkGray);
 
@@ -1149,8 +1190,10 @@ mod tests {
         let inner = results_inner(&buf);
         let (hx, hy) = find(&buf, "Claude  USER").unwrap();
         let (_, ay) = find(&buf, "Claude  ASSISTANT").unwrap();
-        // Header, context and snippet share one gutter: two columns in.
-        assert_eq!(hx, inner.x + 2);
+        // Header, context and snippet share one gutter: two columns in. The
+        // header starts with the availability marker, then the agent.
+        assert_eq!(hx, inner.x + 4);
+        assert_eq!(buf[(inner.x + 2, hy)].symbol(), "·", "pending marker");
         let snippet_row: String = (inner.x + 2..inner.right())
             .map(|x| buf[(x, hy + 2)].symbol())
             .collect();
@@ -1288,5 +1331,145 @@ mod tests {
                 assert!(!(0..h).any(|y| row(&buf, y).contains("javascript")));
             }
         }
+    }
+
+    /// Five results for five distinct sessions, one per availability state.
+    fn five_sessions(temp: &TempDir) -> (SqliteStore, BrowserState, Vec<SessionState>) {
+        let (store, mut state) = searched(temp);
+        let template = state.results[0].clone();
+        let states = vec![
+            SessionState::Live,
+            SessionState::Stored(Availability::OnDisk),
+            SessionState::Stored(Availability::Recoverable),
+            SessionState::Stored(Availability::RepositoryKnown),
+            SessionState::Stored(Availability::TranscriptOnly),
+        ];
+        state.results = (0..states.len())
+            .map(|i| {
+                let mut r = template.clone();
+                r.session_id.native_id = format!("00000000-0000-4000-8000-00000000009{i}");
+                r
+            })
+            .collect();
+        for (r, s) in state.results.iter().zip(&states) {
+            match s {
+                SessionState::Live => state.availability.set_live([r.session_id.clone()]),
+                SessionState::Stored(a) => state.availability.record(r.session_id.clone(), *a),
+            }
+        }
+        (store, state, states)
+    }
+
+    /// (glyph, glyph color, header text) of every result row, top to bottom.
+    fn headers(buf: &Buffer) -> Vec<(String, Color, String)> {
+        let inner = results_inner(buf);
+        (inner.y..inner.bottom())
+            .filter_map(|y| {
+                let text: String = (inner.x + 2..inner.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect();
+                text.contains("Claude").then(|| {
+                    let cell = &buf[(inner.x + 2, y)];
+                    (
+                        cell.symbol().to_string(),
+                        cell.fg,
+                        text.trim_end().to_string(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_availability_state_has_its_own_glyph_color_and_label() {
+        let temp = TempDir::new("ui-availability").unwrap();
+        let (_store, mut state, states) = five_sessions(&temp);
+        state.mode = Mode::Results;
+        let buf = render(&mut state, &Standalone, 120, 40);
+        let rows = headers(&buf);
+        assert_eq!(rows.len(), states.len(), "{rows:?}");
+        let p = Palette::terminal();
+        for ((glyph, fg, text), s) in rows.iter().zip(&states) {
+            let (want, color) = marker(Some(*s), &p);
+            assert_eq!((glyph.as_str(), *fg), (want, color), "{s:?}");
+            assert!(text.contains(Standalone.availability_label(*s)), "{text}");
+            // Standalone wording describes the disk, never a resume.
+            assert!(!text.to_lowercase().contains("resum"), "{text}");
+        }
+        // Distinct in shape, so monochrome terminals and colour-blind users
+        // can tell them apart, and distinct in wording.
+        let glyphs: HashSet<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(glyphs.len(), states.len());
+        let labels: HashSet<&str> = states
+            .iter()
+            .map(|s| Standalone.availability_label(*s))
+            .collect();
+        assert_eq!(labels.len(), states.len());
+
+        // An integration supplies its own wording through the same boundary.
+        let buf = render(&mut state, &Themed(Palette::terminal()), 120, 40);
+        assert!(headers(&buf)[0].2.contains("focus running"));
+    }
+
+    #[test]
+    fn narrow_rows_keep_the_glyph_and_drop_the_label() {
+        let temp = TempDir::new("ui-availability-narrow").unwrap();
+        let (_store, mut state, states) = five_sessions(&temp);
+        state.mode = Mode::Results;
+        let buf = render(&mut state, &Standalone, 36, 60);
+        assert_eq!(headers(&buf).len(), states.len());
+        for ((glyph, _, text), s) in headers(&buf).iter().zip(&states) {
+            assert_eq!(glyph, marker(Some(*s), &Palette::terminal()).0);
+            assert!(!text.contains(Standalone.availability_label(*s)), "{text}");
+        }
+    }
+
+    #[test]
+    fn availability_is_computed_once_per_session_not_per_frame() {
+        use crate::availability::Worker;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let temp = TempDir::new("ui-availability-once").unwrap();
+        let (_store, mut state, _) = five_sessions(&temp);
+        state.availability = Default::default();
+        let template = state_session(&temp);
+        let sessions: Vec<_> = state
+            .results
+            .iter()
+            .map(|r| agent_history_core::Session {
+                id: r.session_id.clone(),
+                ..template.clone()
+            })
+            .collect();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let worker = Worker::spawn(sessions, move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Availability::OnDisk
+        });
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut frames = 0;
+        // The run loop's per-iteration work: drain, request, draw.
+        while frames < 50 || state.availability.pending() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never answered"
+            );
+            worker.drain(&mut state.availability);
+            worker.request(state.availability.wanted(&state.results));
+            terminal.draw(|f| draw(f, &mut state, &Standalone)).unwrap();
+            frames += 1;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), state.results.len());
+        let buf = terminal.backend().buffer().clone();
+        assert!(headers(&buf).iter().all(|(g, _, _)| g == "●"));
+    }
+
+    fn state_session(temp: &TempDir) -> agent_history_core::Session {
+        let store = SqliteStore::open(temp.path().join("private/index.sqlite")).unwrap();
+        store.sessions().unwrap().remove(0)
     }
 }
