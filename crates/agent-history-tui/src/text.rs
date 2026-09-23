@@ -89,16 +89,25 @@ fn fold(c: char) -> char {
 }
 
 /// Terms from an FTS5 query worth highlighting: words, with phrase quotes,
-/// prefix stars, grouping, column filters and boolean operators removed.
+/// grouping, column filters and boolean operators removed. A prefix query
+/// keeps its trailing `*`, because only it matches longer words.
 pub(crate) fn query_terms(query: &str) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
     for token in query.split_whitespace() {
         if matches!(token, "AND" | "OR" | "NOT" | "NEAR") {
             continue;
         }
-        for word in token.split(|c: char| !c.is_alphanumeric()) {
-            let word: String = word.chars().map(fold).collect();
-            if !word.is_empty() && !terms.contains(&word) {
+        let prefix = token.trim_end_matches(['"', ')']).ends_with('*');
+        let words: Vec<&str> = token
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        for (i, word) in words.iter().enumerate() {
+            let mut word: String = word.chars().map(fold).collect();
+            if prefix && i + 1 == words.len() {
+                word.push('*');
+            }
+            if !terms.contains(&word) {
                 terms.push(word);
             }
         }
@@ -106,9 +115,9 @@ pub(crate) fn query_terms(query: &str) -> Vec<String> {
     terms
 }
 
-/// Byte ranges of `line` to highlight: each word that starts with a query
-/// term, extended to the end of that word (FTS matches whole tokens and
-/// prefixes, so the whole word is what matched).
+/// Byte ranges of `line` to highlight. The search tokenizer (`unicode61`)
+/// matches whole words case-insensitively, and a `term*` query matches
+/// words starting with `term`; the whole matching word is highlighted.
 pub(crate) fn matches(line: &str, terms: &[String]) -> Vec<(usize, usize)> {
     if terms.is_empty() {
         return Vec::new();
@@ -120,17 +129,16 @@ pub(crate) fn matches(line: &str, terms: &[String]) -> Vec<(usize, usize)> {
         let at_word_start =
             chars[i].1.is_alphanumeric() && (i == 0 || !chars[i - 1].1.is_alphanumeric());
         if at_word_start {
-            let found = terms.iter().any(|term| {
-                let n = term.chars().count();
-                chars
-                    .get(i..i + n)
-                    .is_some_and(|word| word.iter().map(|&(_, c)| fold(c)).eq(term.chars()))
+            let mut end = i;
+            while end < chars.len() && chars[end].1.is_alphanumeric() {
+                end += 1;
+            }
+            let word = || chars[i..end].iter().map(|&(_, c)| fold(c));
+            let found = terms.iter().any(|term| match term.strip_suffix('*') {
+                Some(prefix) => word().take(prefix.chars().count()).eq(prefix.chars()),
+                None => word().eq(term.chars()),
             });
             if found {
-                let mut end = i;
-                while end < chars.len() && chars[end].1.is_alphanumeric() {
-                    end += 1;
-                }
                 let end_byte = chars.get(end).map_or(line.len(), |(b, _)| *b);
                 out.push((chars[i].0, end_byte));
                 i = end;
@@ -166,20 +174,30 @@ mod tests {
     fn query_terms_drop_fts_syntax() {
         assert_eq!(
             query_terms(r#""Portfolio visibility" OR portf* NOT (x:y)"#),
-            vec!["portfolio", "visibility", "portf", "x", "y"]
+            vec!["portfolio", "visibility", "portf*", "x", "y"]
         );
         assert!(query_terms("  ").is_empty());
     }
 
     #[test]
-    fn matches_whole_words_by_prefix_case_insensitively() {
-        let line = "Portfolio visibility; notportfolio portfolios";
+    fn matches_whole_words_and_explicit_prefixes_case_insensitively() {
+        let line = "Portfolio visibility; notportfolio portfolios PortfolioFilter";
+        let found = |query: &str| -> Vec<&str> {
+            matches(line, &query_terms(query))
+                .into_iter()
+                .map(|(a, b)| &line[a..b])
+                .collect()
+        };
+        assert_eq!(found("portfolio"), vec!["Portfolio"]);
+        assert_eq!(
+            found("portf*"),
+            vec!["Portfolio", "portfolios", "PortfolioFilter"]
+        );
+        assert_eq!(
+            found(r#""portfolio visib*""#),
+            vec!["Portfolio", "visibility"]
+        );
         let terms = query_terms("portfolio");
-        let spans: Vec<&str> = matches(line, &terms)
-            .into_iter()
-            .map(|(a, b)| &line[a..b])
-            .collect();
-        assert_eq!(spans, vec!["Portfolio", "portfolios"]);
         assert!(matches("雪 portfolio", &terms)
             .iter()
             .all(|&(a, b)| "雪 portfolio".is_char_boundary(a) && b <= "雪 portfolio".len()));

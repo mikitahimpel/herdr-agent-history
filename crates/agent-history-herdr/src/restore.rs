@@ -1,88 +1,35 @@
 //! Explicit, non-destructive recovery of a missing workspace.
+use agent_history_core::availability::{clean_absolute, recreation_target};
+pub use agent_history_core::availability::{recovery_options, RecoveryChoice, RecoveryOptions};
 use agent_history_core::{git_command, CoreError, Result, Session};
-use std::path::{Component, Path, PathBuf};
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RecoveryChoice {
-    RecreateWorktree,
-    ExistingRepository,
-    ViewConversation,
-    Cancel,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecoveryOptions {
-    pub choices: Vec<RecoveryChoice>,
-}
+use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitRecreationPlan {
     pub repository_root: PathBuf,
     pub worktree: PathBuf,
     pub argv: Vec<String>,
 }
-pub fn recovery_options(
-    session: &Session,
-    repository_exists: bool,
-    worktree_exists: bool,
-) -> RecoveryOptions {
-    let mut choices = Vec::new();
-    if repository_exists && !worktree_exists && plan_recreate(session).is_ok() {
-        choices.push(RecoveryChoice::RecreateWorktree)
-    }
-    if repository_exists {
-        choices.push(RecoveryChoice::ExistingRepository)
-    }
-    choices.extend([RecoveryChoice::ViewConversation, RecoveryChoice::Cancel]);
-    RecoveryOptions { choices }
-}
 fn fail(message: &str) -> CoreError {
     CoreError::Unsupported(message.into())
 }
-fn clean_absolute(path: &Path) -> bool {
-    path.is_absolute()
-        && path
-            .components()
-            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
-        && !path.components().any(|c| c.as_os_str() == ".git")
-}
+/// The Git command that would recreate the session's worktree, after the
+/// recorded facts pass `recreation_target` validation.
 pub fn plan_recreate(session: &Session) -> Result<GitRecreationPlan> {
-    let root = session
-        .repository_root
-        .clone()
-        .ok_or_else(|| fail("repository root is unavailable"))?;
-    let target = session
-        .worktree
-        .clone()
-        .ok_or_else(|| fail("recorded worktree path is unavailable"))?;
-    let commit = session
-        .commit
-        .as_deref()
-        .filter(|v| matches!(v.len(), 40 | 64) && v.bytes().all(|b| b.is_ascii_hexdigit()))
-        .ok_or_else(|| {
-            fail("a recorded full commit hash is required for safe detached recreation")
-        })?;
-    if !clean_absolute(&root) || !clean_absolute(&target) || root == target {
-        return Err(fail("invalid recorded repository or worktree path"));
-    }
-    if session
-        .cwd
-        .as_deref()
-        .is_none_or(|cwd| !clean_absolute(cwd) || !cwd.starts_with(&target))
-    {
-        return Err(fail("session cwd is outside the recorded worktree"));
-    }
+    let target = recreation_target(session)?;
     Ok(GitRecreationPlan {
         argv: vec![
             "git".into(),
             "-C".into(),
-            root.to_string_lossy().into(),
+            target.repository_root.to_string_lossy().into(),
             "worktree".into(),
             "add".into(),
             "--detach".into(),
             "--".into(),
-            target.to_string_lossy().into(),
-            commit.into(),
+            target.worktree.to_string_lossy().into(),
+            target.commit,
         ],
-        repository_root: root,
-        worktree: target,
+        repository_root: target.repository_root,
+        worktree: target.worktree,
     })
 }
 /// Only construct this token after an explicit affirmative runtime response.

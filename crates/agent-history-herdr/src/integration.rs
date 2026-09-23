@@ -1,7 +1,10 @@
 //! Herdr-specific actions for the shared Agent History browser.
 use crate::{restore, resume_in_host, HostRuntime};
-use agent_history_core::{preview::preview_source, CoreError, Result, SqliteStore};
-use agent_history_tui::{BrowserState, Integration, Key, Mode, Palette};
+use agent_history_core::{
+    availability::Availability, preview::preview_source, CoreError, Result, Session, SessionId,
+    SqliteStore,
+};
+use agent_history_tui::{BrowserState, Integration, Key, Mode, Palette, SessionState};
 
 /// The Herdr adapter owns restoration choices and host side effects. Search,
 /// selection, and rendering remain in `agent-history-tui`.
@@ -91,6 +94,25 @@ impl<H: HostRuntime> Integration for HerdrIntegration<H> {
 
     fn palette(&self) -> Palette {
         self.palette
+    }
+
+    /// Asks Herdr once for its workspaces and agents. A failed query only
+    /// means no session is marked live; Enter still checks again.
+    fn live_sessions(&mut self, sessions: &[Session]) -> Vec<SessionId> {
+        match (self.host.workspaces(), self.host.agents()) {
+            (Ok(workspaces), Ok(agents)) => crate::live_sessions(sessions, &workspaces, &agents),
+            _ => Vec::new(),
+        }
+    }
+
+    fn availability_label(&self, state: SessionState) -> &str {
+        match state {
+            SessionState::Live => "running",
+            SessionState::Stored(Availability::OnDisk) => "resumable",
+            SessionState::Stored(Availability::Recoverable) => "recoverable",
+            SessionState::Stored(Availability::RepositoryKnown) => "repo gone",
+            SessionState::Stored(Availability::TranscriptOnly) => "transcript",
+        }
     }
 
     fn action_lines(&self) -> Vec<String> {

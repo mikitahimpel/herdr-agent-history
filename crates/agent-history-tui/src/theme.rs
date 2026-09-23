@@ -117,6 +117,14 @@ impl Palette {
     pub(crate) fn key(&self) -> Style {
         Style::new().fg(self.accent).add_modifier(Modifier::BOLD)
     }
+    /// The key-hint bar. ANSI blue on ANSI dark gray is unreadable in many
+    /// terminal schemes, so on the terminal's own background the bar has none.
+    pub(crate) fn bar(&self) -> Style {
+        match self.panel_bg {
+            Color::Reset => Style::new(),
+            _ => Style::new().bg(self.surface_dim),
+        }
+    }
     pub(crate) fn error(&self) -> Style {
         Style::new().fg(self.red).add_modifier(Modifier::BOLD)
     }
