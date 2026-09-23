@@ -1,4 +1,9 @@
 //! Isolated helpers for synthetic parser, storage, and Git tests.
+//!
+//! Tests run inside a Git pre-push hook, and Git exports `GIT_DIR` and `GIT_INDEX_FILE`
+//! to hooks. Every `git` invocation here therefore drops that inherited environment and
+//! its user configuration, so a test repository can never be created, staged, or
+//! committed in the repository under test.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -39,16 +44,29 @@ impl TempDir {
     pub fn git_repository(&self) -> std::io::Result<PathBuf> {
         let repo = self.path.join("repo");
         fs::create_dir_all(&repo)?;
-        let status = Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(&repo)
-            .status()?;
+        let status = git_command(&repo).args(["init", "--quiet"]).status()?;
         if !status.success() {
             return Err(std::io::Error::other("git init failed"));
         }
         Ok(repo)
     }
 }
+/// A `git` invocation confined to `dir`, with the ambient Git environment, system and
+/// global configuration, and committer identity all replaced by test-owned values.
+pub fn git_command(dir: &Path) -> Command {
+    let mut command = crate::git::git_command(dir);
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Agent History Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Agent History Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+        .env_remove("GIT_REFLOG_ACTION");
+    command
+}
+
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);

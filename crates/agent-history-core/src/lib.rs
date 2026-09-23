@@ -13,5 +13,5 @@ pub use contracts::{
     Store,
 };
 pub use domain::*;
-pub use git::GitContextResolver;
+pub use git::{git_command, GitContextResolver, INHERITED_GIT_ENVIRONMENT};
 pub use storage::{IndexStatus, IndexedFileState, SqliteStore};

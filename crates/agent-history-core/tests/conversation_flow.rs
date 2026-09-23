@@ -3,7 +3,7 @@ use agent_history_core::{
     index::index_all,
     preview::preview_source,
     test_support::TempDir,
-    AgentAdapter, EventKind, SqliteStore,
+    AgentAdapter, EventKind, GitOrigin, SqliteStore,
 };
 use std::{fs, io::Write};
 
@@ -115,7 +115,7 @@ fn schema_two_rebuild_preserves_captured_context_and_invalidates_mixed_text() {
         .connection()
         .execute("UPDATE indexed_files SET open_turn_state=?", [&legacy])
         .unwrap();
-    store.connection().execute_batch("UPDATE search_chunks SET text=text || ' toolsecret'; ALTER TABLE search_chunks DROP COLUMN kind; PRAGMA user_version=2;").unwrap();
+    store.connection().execute_batch("UPDATE search_chunks SET text=text || ' toolsecret'; ALTER TABLE search_chunks DROP COLUMN kind; ALTER TABLE sessions DROP COLUMN git_origin; ALTER TABLE sessions DROP COLUMN repository_url; PRAGMA user_version=2;").unwrap();
     drop(store);
 
     let mut store = SqliteStore::open(&db).unwrap();
@@ -136,11 +136,21 @@ fn schema_two_rebuild_preserves_captured_context_and_invalidates_mixed_text() {
         .unwrap()
         .remove(0);
     assert_ne!(user.source.generation, old_result.source.generation);
-    let session = agent_history_core::preview::session_for_source(&store, &user.source).unwrap();
+    let record =
+        agent_history_core::preview::session_record_for_source(&store, &user.source).unwrap();
+    let session = &record.session;
     assert_eq!(session.branch.as_deref(), Some("saved-branch"));
     assert_eq!(
         session.repository_root.as_deref(),
         Some(std::path::Path::new("/captured/repository"))
+    );
+    // Only a live `git` invocation could have filled those fields, so the upgrade must
+    // label them as observations rather than leaving their origin unknown.
+    assert_eq!(record.origin(), Some(GitOrigin::Observed));
+    assert!(!record.is_recorded_only());
+    assert_eq!(
+        store.session_record(&session.id).unwrap().unwrap().origin(),
+        Some(GitOrigin::Observed)
     );
     assert!(preview_source(&store, &old_result.source, 0).is_err());
     assert!(store.search("toolsecret", 10).unwrap().is_empty());

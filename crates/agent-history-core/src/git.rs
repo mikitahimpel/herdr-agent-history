@@ -1,6 +1,6 @@
 //! Read-only Git context discovery for session indexing.
 
-use crate::{GitContext, GitContextProvider, Result};
+use crate::{GitContext, GitContextProvider, GitOrigin, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
@@ -13,8 +13,10 @@ impl GitContextProvider for GitContextResolver {
     fn context(&self, cwd: &Path) -> Result<GitContext> {
         let observed_at = SystemTime::now();
         let empty = || GitContext {
+            origin: GitOrigin::Observed,
             repository: None,
             repository_root: None,
+            repository_url: None,
             worktree: None,
             branch: None,
             commit: None,
@@ -51,10 +53,13 @@ impl GitContextProvider for GitContextResolver {
             .map(|path| path.to_string_lossy().into_owned());
         let branch = git_value(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
         let commit = git_value(cwd, ["rev-parse", "--verify", "HEAD"]);
+        let repository_url = git_value(cwd, ["config", "--get", "remote.origin.url"]);
 
         Ok(GitContext {
+            origin: GitOrigin::Observed,
             repository,
             repository_root,
+            repository_url,
             worktree,
             branch,
             commit,
@@ -63,13 +68,41 @@ impl GitContextProvider for GitContextResolver {
     }
 }
 
+/// Variables git exports to its own subprocesses, notably to hooks. Inheriting them
+/// would resolve the surrounding repository instead of the session cwd, and would let
+/// a `git` run in one repository read or write another.
+///
+/// Every `git` invocation in this workspace must clear these, including the ones that
+/// mutate, such as `git worktree add` during confirmed recovery. Build commands with
+/// [`git_command`] rather than repeating the list.
+pub const INHERITED_GIT_ENVIRONMENT: [&str; 10] = [
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_QUARANTINE_PATH",
+];
+
+/// A `git` invocation scoped to `cwd` alone, with [`INHERITED_GIT_ENVIRONMENT`] cleared.
+///
+/// Use this for every `git` call, not only read-only ones: a command that inherits
+/// `GIT_DIR` stages and commits in the surrounding repository instead of `cwd`.
+pub fn git_command(cwd: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(cwd);
+    for name in INHERITED_GIT_ENVIRONMENT {
+        command.env_remove(name);
+    }
+    command
+}
+
 fn git_value<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .ok()?;
+    let output = git_command(cwd).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -80,9 +113,7 @@ fn git_value<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
 }
 
 fn git_worktree_root(cwd: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
+    let output = git_command(cwd)
         .args(["worktree", "list", "--porcelain", "-z"])
         .output()
         .ok()?;
@@ -112,18 +143,33 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
     use std::fs;
-    use std::process::Command;
 
     fn run(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        let status = crate::test_support::git_command(dir)
             .args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .status()
             .unwrap();
         assert!(status.success(), "git {:?} failed", args);
+    }
+
+    /// Git exports `GIT_DIR` and `GIT_INDEX_FILE` to hooks, and the pre-push hook runs
+    /// this test suite. An invocation that inherited them would resolve, stage, and
+    /// commit in the surrounding repository instead of the path it was given.
+    #[test]
+    fn git_invocations_do_not_inherit_a_surrounding_repository() {
+        for command in [
+            git_command(Path::new("/tmp")),
+            crate::test_support::git_command(Path::new("/tmp")),
+        ] {
+            let cleared: Vec<&str> = command
+                .get_envs()
+                .filter(|(_, value)| value.is_none())
+                .filter_map(|(name, _)| name.to_str())
+                .collect();
+            for name in INHERITED_GIT_ENVIRONMENT {
+                assert!(cleared.contains(&name), "{name} is still inherited");
+            }
+        }
     }
 
     fn repository(temp: &TempDir) -> PathBuf {
@@ -155,6 +201,27 @@ mod tests {
             context.repository,
             Some(repo.canonicalize().unwrap().to_string_lossy().into_owned())
         );
+        assert_eq!(context.origin, crate::GitOrigin::Observed);
+    }
+
+    #[test]
+    fn observed_context_reports_a_configured_remote() {
+        let temp = TempDir::new("git-remote").unwrap();
+        let repo = repository(&temp);
+        assert_eq!(
+            GitContextResolver.context(&repo).unwrap().repository_url,
+            None
+        );
+        run(
+            &repo,
+            &["remote", "add", "origin", "git@github.com:owner/name.git"],
+        );
+        let context = GitContextResolver.context(&repo).unwrap();
+        assert_eq!(
+            context.repository_url.as_deref(),
+            Some("git@github.com:owner/name.git")
+        );
+        assert_eq!(context.origin, crate::GitOrigin::Observed);
     }
 
     #[test]

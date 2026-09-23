@@ -51,6 +51,7 @@ impl AgentAdapter for CodexAdapter {
             },
             cwd: string(payload.get("cwd")).map(PathBuf::from),
             started_at: timestamp(v.get("timestamp")),
+            git: recorded_git(payload),
         };
         let channel = payload
             .get("channel")
@@ -122,6 +123,22 @@ impl AgentAdapter for CodexAdapter {
     }
 }
 
+/// Codex writes a `git` block into the rollout's `session_meta`. A block that is
+/// absent, not an object, or carries non-string fields yields no provenance.
+fn recorded_git(payload: &serde_json::Value) -> Option<RecordedGit> {
+    let block = payload.get("git")?.as_object()?;
+    let repository_url = non_empty(string(block.get("repository_url")));
+    let git = RecordedGit {
+        repository: repository_url.as_deref().and_then(repository_label),
+        repository_url,
+        branch: branch_name(string(block.get("branch"))),
+        commit: non_empty(string(
+            block.get("commit_hash").or_else(|| block.get("commit")),
+        )),
+    };
+    (!git.is_empty()).then_some(git)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +169,64 @@ mod tests {
             .unwrap();
         assert_eq!(parsed.events.len(), 1);
         assert_eq!(parsed.events[0].text, "Done ☃");
+    }
+    #[test]
+    fn session_meta_records_repository_commit_and_branch() {
+        let r = br#"{"type":"session_meta","payload":{"id":"native","cwd":"/gone/worktrees/6680/memoxia","git":{"commit_hash":"840c046cb65c43ad093bcac2e07736c86a3a8bf8","branch":"feature/prices","repository_url":"git@github.com:mikitahimpel/memoxia.git"}}}"#;
+        let parsed = CodexAdapter::with_root(".")
+            .parse_record(&session(), r, source("x".as_ref(), 1, 0, r.len()))
+            .unwrap();
+        let git = parsed.metadata.git.unwrap();
+        assert_eq!(
+            git.repository_url.as_deref(),
+            Some("git@github.com:mikitahimpel/memoxia.git")
+        );
+        assert_eq!(git.repository.as_deref(), Some("mikitahimpel/memoxia"));
+        assert_eq!(git.branch.as_deref(), Some("feature/prices"));
+        assert_eq!(
+            git.commit.as_deref(),
+            Some("840c046cb65c43ad093bcac2e07736c86a3a8bf8")
+        );
+        assert_eq!(
+            parsed.metadata.cwd,
+            Some(PathBuf::from("/gone/worktrees/6680/memoxia"))
+        );
+    }
+    #[test]
+    fn absent_malformed_and_partial_git_blocks_are_tolerated() {
+        let adapter = CodexAdapter::with_root(".");
+        let parse = |r: &[u8]| {
+            adapter
+                .parse_record(&session(), r, source("x".as_ref(), 1, 0, r.len()))
+                .unwrap()
+                .metadata
+                .git
+        };
+        assert_eq!(
+            parse(br#"{"type":"session_meta","payload":{"id":"native","cwd":"/work"}}"#),
+            None
+        );
+        assert_eq!(
+            parse(br#"{"type":"session_meta","payload":{"git":"not-an-object"}}"#),
+            None
+        );
+        assert_eq!(
+            parse(br#"{"type":"session_meta","payload":{"git":{"commit_hash":7,"branch":""}}}"#),
+            None
+        );
+        // A rollout without a commit still identifies the repository.
+        let partial =
+            parse(br#"{"type":"session_meta","payload":{"git":{"repository_url":"https://example.invalid/owner/name.git"}}}"#)
+                .unwrap();
+        assert_eq!(partial.commit, None);
+        assert_eq!(partial.branch, None);
+        assert_eq!(partial.repository.as_deref(), Some("owner/name"));
+        // A detached checkout records no branch.
+        let detached =
+            parse(br#"{"type":"session_meta","payload":{"git":{"branch":"HEAD","commit_hash":"a1b2c3"}}}"#)
+                .unwrap();
+        assert_eq!(detached.branch, None);
+        assert_eq!(detached.commit.as_deref(), Some("a1b2c3"));
     }
     #[test]
     fn event_mirror_is_skipped() {
