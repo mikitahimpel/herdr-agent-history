@@ -26,9 +26,23 @@ const STACKED_MIN_HEIGHT: u16 = 14;
 const ITEM_HEIGHT: usize = 5;
 const SNIPPET_LINES: usize = 2;
 
+/// Where the last frame drew each clickable region, so a click resolves
+/// against exactly what the user saw.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Hits {
+    pub(crate) search: Rect,
+    pub(crate) tabs: Vec<(Rect, RoleFilter)>,
+    /// The whole results pane, border included.
+    pub(crate) results: Option<Rect>,
+    /// Each visible result's rows, with its index.
+    pub(crate) rows: Vec<(Rect, usize)>,
+    pub(crate) preview: Option<Rect>,
+}
+
 pub fn draw(frame: &mut Frame, state: &mut BrowserState, integration: &impl Integration) {
     let p = integration.palette();
     let area = frame.area();
+    state.hits = Hits::default();
     frame.render_widget(Block::new().style(p.base()), area);
     if area.width < 24 || area.height < 10 {
         let lines = text::wrap("Agent History — enlarge this pane", area.width.into());
@@ -49,7 +63,11 @@ pub fn draw(frame: &mut Frame, state: &mut BrowserState, integration: &impl Inte
     ])
     .areas(area);
 
-    draw_header(frame, header, state, integration.title(), &p);
+    if integration.host_draws_title() {
+        draw_status_strip(frame, header, state, &p);
+    } else {
+        draw_header(frame, header, state, integration.title(), &p);
+    }
     draw_search(frame, search, state, &p);
     draw_filters(frame, filters, state, &p);
 
@@ -75,7 +93,14 @@ pub fn draw(frame: &mut Frame, state: &mut BrowserState, integration: &impl Inte
             message,
         );
     }
-    draw_keys(frame, keys, state.mode, integration, &p);
+    draw_keys(
+        frame,
+        keys,
+        state.mode,
+        state.mouse_capture,
+        integration,
+        &p,
+    );
 }
 
 /// Side by side when wide enough, stacked when tall enough, otherwise only
@@ -155,7 +180,26 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &BrowserState, title: &str,
     );
 }
 
-fn draw_search(frame: &mut Frame, area: Rect, state: &BrowserState, p: &Palette) {
+/// The header row when the host already titles the pane: the index status
+/// gets the whole width instead of repeating the host's title.
+fn draw_status_strip(frame: &mut Frame, area: Rect, state: &BrowserState, p: &Palette) {
+    let label = "Index ";
+    let status = safe(
+        &state.status,
+        usize::from(area.width).saturating_sub(width_of(label) + 2),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(label, p.key()),
+            Span::styled(status, p.muted()),
+        ])),
+        area,
+    );
+}
+
+fn draw_search(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Palette) {
+    state.hits.search = area;
     let focused = state.mode == Mode::Query;
     let block = pane("Search", focused, p);
     let inner = block.inner(area);
@@ -192,15 +236,21 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &BrowserState, p: &Palette)
     }
 }
 
-fn draw_filters(frame: &mut Frame, area: Rect, state: &BrowserState, p: &Palette) {
+fn draw_filters(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Palette) {
     let mut spans = vec![Span::raw(" ")];
+    let mut x = area.x + 1;
     for filter in RoleFilter::ALL {
         let style = if filter == state.role_filter {
             p.active_tab()
         } else {
             p.inactive_tab()
         };
-        spans.push(Span::styled(format!(" {} ", filter.label()), style));
+        let tab = format!(" {} ", filter.label());
+        let w = width_of(&tab) as u16;
+        let tab_area = Rect::new(x, area.y, w, 1).intersection(area);
+        state.hits.tabs.push((tab_area, filter));
+        x = x.saturating_add(w + 1);
+        spans.push(Span::styled(tab, style));
         spans.push(Span::raw(" "));
     }
     spans.push(Span::styled("F2", p.key()));
@@ -349,6 +399,7 @@ fn draw_results(
             .right_aligned(),
         );
     }
+    state.hits.results = Some(area);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -361,7 +412,12 @@ fn draw_results(
     let w = usize::from(inner.width);
     // Items are separated by a rule, so n items take n * ITEM_HEIGHT - 1 rows.
     let per_page = ((usize::from(inner.height) + 1) / ITEM_HEIGHT).max(1);
-    if state.selected < state.list_offset {
+    if state.list_scrolled {
+        // Wheel scrolling moves the view, not the selection.
+        state.list_offset = state
+            .list_offset
+            .min(state.results.len().saturating_sub(per_page));
+    } else if state.selected < state.list_offset {
         state.list_offset = state.selected;
     } else if state.selected >= state.list_offset + per_page {
         state.list_offset = state.selected + 1 - per_page;
@@ -426,6 +482,11 @@ fn draw_results(
         if selected {
             let style = p.selection(focused);
             item = item.into_iter().map(|l| l.patch_style(style)).collect();
+        }
+        let top = inner.y.saturating_add(lines.len() as u16);
+        let rows = Rect::new(inner.x, top, inner.width, item.len() as u16).intersection(inner);
+        if !rows.is_empty() {
+            state.hits.rows.push((rows, i));
         }
         lines.extend(item);
     }
@@ -575,6 +636,7 @@ fn preview_lines(
 }
 
 fn draw_preview(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Palette) {
+    state.hits.preview = Some(area);
     let focused = state.mode == Mode::Preview;
     let mut block = pane("Preview", focused, p);
     if let Some(r) = state.selected_result() {
@@ -688,8 +750,13 @@ fn draw_action(frame: &mut Frame, body: Rect, action_lines: &[String], p: &Palet
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// Key hints valid for the focused pane only.
-pub(crate) fn hints(mode: Mode, integration: &impl Integration) -> Vec<(&'static str, String)> {
+/// Key hints valid for the focused pane only, plus the mouse toggle, which
+/// works everywhere and says what pressing it will do.
+pub(crate) fn hints(
+    mode: Mode,
+    mouse_capture: bool,
+    integration: &impl Integration,
+) -> Vec<(&'static str, String)> {
     let enter = integration.enter_label().to_lowercase();
     let open = |v: &mut Vec<(&'static str, String)>| {
         if enter == "preview" {
@@ -699,18 +766,29 @@ pub(crate) fn hints(mode: Mode, integration: &impl Integration) -> Vec<(&'static
             v.push(("⏎", enter.clone()));
         }
     };
+    let mouse = (
+        "F3",
+        if mouse_capture {
+            "mouse off"
+        } else {
+            "mouse on"
+        }
+        .to_string(),
+    );
     let mut v = Vec::new();
     match mode {
         Mode::Query => {
             v.push(("↓/tab", "results".into()));
             open(&mut v);
             v.push(("F2", "role".into()));
+            v.push(mouse);
             v.push(("esc", "quit".into()));
         }
         Mode::Results => {
             v.push(("↑↓", "move".into()));
             open(&mut v);
             v.push(("F2", "role".into()));
+            v.push(mouse);
             v.push(("tab", "preview".into()));
             v.push(("esc", "search".into()));
         }
@@ -720,10 +798,14 @@ pub(crate) fn hints(mode: Mode, integration: &impl Integration) -> Vec<(&'static
                 v.push(("⏎", label.to_lowercase()));
             }
             v.push(("F2", "role".into()));
+            v.push(mouse);
             v.push(("tab", "search".into()));
             v.push(("esc", "results".into()));
         }
-        Mode::Action => v.push(("esc", "cancel".into())),
+        Mode::Action => {
+            v.push(("esc", "cancel".into()));
+            v.push(mouse);
+        }
     }
     if mode != Mode::Query {
         v.push(("^C", "quit".into()));
@@ -735,11 +817,12 @@ fn draw_keys(
     frame: &mut Frame,
     area: Rect,
     mode: Mode,
+    mouse_capture: bool,
     integration: &impl Integration,
     p: &Palette,
 ) {
     let mut spans = vec![Span::raw(" ")];
-    for (key, label) in hints(mode, integration) {
+    for (key, label) in hints(mode, mouse_capture, integration) {
         spans.push(Span::styled(key, p.key()));
         spans.push(Span::styled(
             format!(" {label}   "),
@@ -752,10 +835,11 @@ fn draw_keys(
     );
 }
 
+/// `title` is `None` when the host already titles the pane.
 pub(crate) fn draw_progress(
     frame: &mut Frame,
     p: &Palette,
-    title: &str,
+    title: Option<&str>,
     tick: usize,
     elapsed: Duration,
     progress: Option<&IndexProgress>,
@@ -773,13 +857,15 @@ pub(crate) fn draw_progress(
         width,
         height,
     };
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(p.border(true))
-        .title(Span::styled(
+        .border_style(p.border(true));
+    if let Some(title) = title {
+        block = block.title(Span::styled(
             format!(" {} ", safe(title, width.saturating_sub(4).into())),
             p.pane_title(true),
         ));
+    }
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
     let w = usize::from(inner.width);
@@ -1121,13 +1207,13 @@ mod tests {
         let keys = |mode, i: &dyn Fn(Mode) -> Vec<(&'static str, String)>| {
             i(mode).into_iter().map(|(k, _)| k).collect::<Vec<_>>()
         };
-        let standalone = |m| hints(m, &Standalone);
-        let resuming = |m| hints(m, &Themed(Palette::terminal()));
+        let standalone = |m| hints(m, true, &Standalone);
+        let resuming = |m| hints(m, true, &Themed(Palette::terminal()));
         assert!(keys(Mode::Query, &standalone).contains(&"␣/⏎"));
         assert!(!keys(Mode::Preview, &standalone).contains(&"⏎"));
         assert!(keys(Mode::Results, &resuming).contains(&"⏎"));
         assert!(keys(Mode::Preview, &resuming).contains(&"⏎"));
-        assert_eq!(keys(Mode::Action, &resuming), ["esc", "^C"]);
+        assert_eq!(keys(Mode::Action, &resuming), ["esc", "F3", "^C"]);
     }
 
     #[test]
@@ -1471,5 +1557,270 @@ mod tests {
     fn state_session(temp: &TempDir) -> agent_history_core::Session {
         let store = SqliteStore::open(temp.path().join("private/index.sqlite")).unwrap();
         store.sessions().unwrap().remove(0)
+    }
+
+    use crate::Mouse;
+
+    fn click(state: &mut BrowserState, store: &SqliteStore, (column, row): (u16, u16)) {
+        state.mouse(Mouse::Click { column, row }, store);
+    }
+
+    /// The status bar's text.
+    fn status_bar(buf: &Buffer) -> String {
+        row(buf, buf.area.height - 1)
+    }
+
+    /// Asserts `focused` has the heavy accent frame, the other panes do not,
+    /// and the status bar shows exactly the hints keyboard focus would.
+    fn assert_focus(buf: &Buffer, state: &BrowserState, focused: &str) {
+        let p = Palette::terminal();
+        for title in ["Search", "Results", "Preview"] {
+            let (x, y) = find(buf, &format!(" {title} ")).unwrap();
+            let corner = &buf[(x - 1, y)];
+            if title == focused {
+                assert_eq!(corner.symbol(), "┏", "{title} should be focused");
+                assert_eq!(corner.fg, p.accent);
+            } else {
+                assert_eq!(corner.symbol(), "╭", "{title} should not be focused");
+            }
+        }
+        let bar = status_bar(buf);
+        let expected: String = hints(state.mode, state.mouse_capture, &Standalone)
+            .iter()
+            .map(|(k, l)| format!("{k} {l}   "))
+            .collect();
+        assert!(
+            bar.trim_start().starts_with(expected.trim_end()),
+            "status bar {bar:?} should start with {expected:?}"
+        );
+    }
+
+    #[test]
+    fn clicking_anywhere_in_a_pane_focuses_it() {
+        let temp = TempDir::new("ui-click-focus").unwrap();
+        let (store, mut state) = searched(&temp);
+        state.mouse_capture = true;
+        let buf = render(&mut state, &Standalone, 120, 36);
+        let inner = results_inner(&buf);
+        let (sx, sy) = find(&buf, " Search ").unwrap();
+        let (px, py) = find(&buf, " Preview ").unwrap();
+        // Empty space, borders and titles, not only content.
+        let targets = [
+            ("Results", (inner.x + 3, inner.bottom() - 1), Mode::Results),
+            ("Preview", (px + 20, py + 25), Mode::Preview),
+            ("Search", (sx + 80, sy + 1), Mode::Query),
+            ("Preview", (buf.area.width - 1, py + 3), Mode::Preview),
+            ("Results", (inner.x - 1, inner.y + 10), Mode::Results),
+            ("Search", (sx - 1, sy), Mode::Query),
+            ("Results", (inner.right() - 1, inner.y + 20), Mode::Results),
+        ];
+        for (pane, at, mode) in targets {
+            let selected = state.selected;
+            click(&mut state, &store, at);
+            assert_eq!(state.mode, mode, "click at {at:?} should focus {pane}");
+            assert_eq!(state.selected, selected, "empty space does not select");
+            let buf = render(&mut state, &Standalone, 120, 36);
+            assert_focus(&buf, &state, pane);
+        }
+    }
+
+    #[test]
+    fn clicking_a_result_selects_that_row_and_focuses_results() {
+        let temp = TempDir::new("ui-click-row").unwrap();
+        let (store, mut state, _) = five_sessions(&temp);
+        state.mode = Mode::Query;
+        let buf = render(&mut state, &Standalone, 120, 40);
+        let inner = results_inner(&buf);
+        let (_, first) = find(&buf, "Claude  ").unwrap();
+        // Rows: 4 lines per result, then one separator line.
+        for (dy, expect) in [(0, 0), (3, 0), (5, 1), (8, 1), (10, 2), (15, 3)] {
+            state.mode = Mode::Preview;
+            click(&mut state, &store, (inner.x + 12, first + dy));
+            assert_eq!(state.selected, expect, "row offset {dy}");
+            assert_eq!(state.mode, Mode::Results);
+            let buf = render(&mut state, &Standalone, 120, 40);
+            assert_focus(&buf, &state, "Results");
+            assert_eq!(
+                buf[(inner.x + 1, first + dy)].bg,
+                Color::DarkGray,
+                "selected row is highlighted"
+            );
+        }
+        // The separator between results belongs to no result.
+        state.selected = 3;
+        click(&mut state, &store, (inner.x + 12, first + 4));
+        assert_eq!(state.selected, 3);
+        assert_eq!(state.mode, Mode::Results);
+    }
+
+    #[test]
+    fn clicking_a_role_tab_switches_the_filter() {
+        let temp = TempDir::new("ui-click-tab").unwrap();
+        let (store, mut state) = searched(&temp);
+        let buf = render(&mut state, &Standalone, 100, 30);
+        let (ux, uy) = find(&buf, " User ").unwrap();
+        click(&mut state, &store, (ux + 2, uy));
+        assert_eq!(state.role_filter, RoleFilter::User);
+        assert!(state.results.iter().all(|r| r.kind == EventKind::User));
+        assert_eq!(
+            state.mode,
+            Mode::Query,
+            "a tab does not steal the query's focus"
+        );
+        let buf = render(&mut state, &Standalone, 100, 30);
+        assert_eq!(
+            buf[(ux + 1, uy)].bg,
+            Color::Blue,
+            "clicked tab is highlighted"
+        );
+        state.mode = Mode::Preview;
+        let (ax, ay) = find(&buf, " All ").unwrap();
+        click(&mut state, &store, (ax + 1, ay));
+        assert_eq!(state.role_filter, RoleFilter::All);
+        assert_eq!(state.mode, Mode::Results, "like F2, leaves the preview");
+    }
+
+    #[test]
+    fn wheel_scrolls_the_pane_under_the_pointer() {
+        let temp = TempDir::new("ui-wheel").unwrap();
+        let (store, mut state, _) = five_sessions(&temp);
+        state.preview = (0..200).map(|i| format!("line {i}\n\n")).collect();
+        state.preview_anchor = false;
+        state.mode = Mode::Query;
+        let buf = render(&mut state, &Standalone, 120, 20);
+        let inner = results_inner(&buf);
+        let (px, py) = find(&buf, " Preview ").unwrap();
+        let wheel_results = Mouse::ScrollDown {
+            column: inner.x + 5,
+            row: inner.y + 2,
+        };
+        state.mouse(wheel_results, &store);
+        state.mouse(wheel_results, &store);
+        render(&mut state, &Standalone, 120, 20);
+        assert_eq!(state.list_offset, 2, "list scrolled");
+        assert_eq!(state.selected, 0, "selection and preview stay put");
+        assert_eq!(state.mode, Mode::Query, "scrolling does not move focus");
+        let wheel_preview = Mouse::ScrollDown {
+            column: px + 10,
+            row: py + 4,
+        };
+        state.mouse(wheel_preview, &store);
+        assert_eq!(state.preview_scroll, 3);
+        state.mouse(
+            Mouse::ScrollUp {
+                column: px + 10,
+                row: py + 4,
+            },
+            &store,
+        );
+        assert_eq!(state.preview_scroll, 0);
+        // Moving the selection makes the list follow it again.
+        state.handle(Key::Down, &store).unwrap();
+        state.handle(Key::Down, &store).unwrap();
+        render(&mut state, &Standalone, 120, 20);
+        assert!(!state.list_scrolled);
+        assert!(state.list_offset <= state.selected);
+    }
+
+    #[test]
+    fn mouse_never_touches_the_recovery_screen() {
+        let temp = TempDir::new("ui-click-action").unwrap();
+        let (store, mut state) = searched(&temp);
+        state.mode = Mode::Action;
+        render(&mut state, &Themed(Palette::terminal()), 100, 30);
+        for at in [(5, 3), (10, 12), (70, 12), (50, 15)] {
+            click(&mut state, &store, at);
+            state.mouse(
+                Mouse::ScrollDown {
+                    column: at.0,
+                    row: at.1,
+                },
+                &store,
+            );
+        }
+        assert_eq!(state.mode, Mode::Action);
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn status_bar_offers_the_mouse_toggle_in_every_pane() {
+        let temp = TempDir::new("ui-toggle-hint").unwrap();
+        let (_store, mut state) = searched(&temp);
+        for mode in [Mode::Query, Mode::Results, Mode::Preview] {
+            state.mode = mode;
+            state.mouse_capture = true;
+            assert!(status_bar(&render(&mut state, &Standalone, 120, 30)).contains("F3 mouse off"));
+            state.mouse_capture = false;
+            assert!(status_bar(&render(&mut state, &Standalone, 120, 30)).contains("F3 mouse on"));
+        }
+    }
+
+    struct HostTitled;
+    impl Integration for HostTitled {
+        fn title(&self) -> &str {
+            "Agent History — Host"
+        }
+        fn enter_label(&self) -> &str {
+            "Resume"
+        }
+        fn host_draws_title(&self) -> bool {
+            true
+        }
+        fn handle(
+            &mut self,
+            _: Key,
+            _: &mut BrowserState,
+            _: &SqliteStore,
+        ) -> agent_history_core::Result<bool> {
+            Ok(false)
+        }
+        fn action_lines(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_host_titled_pane_shows_status_instead_of_a_second_title() {
+        let temp = TempDir::new("ui-host-title").unwrap();
+        let (_store, mut state) = searched(&temp);
+        state.status = "412 files · 9120 chunks · 0 failed · 0 malformed · 0.4s".into();
+        let buf = render(&mut state, &HostTitled, 100, 30);
+        let all: String = (0..30).map(|y| row(&buf, y)).collect();
+        assert!(
+            !all.contains("Agent History"),
+            "the host already shows the title"
+        );
+        let top = row(&buf, 0);
+        assert!(top.starts_with(" Index 412 files · 9120 chunks"), "{top:?}");
+        // Standalone keeps its title with the status on the right.
+        let buf = render(&mut state, &Standalone, 100, 30);
+        let top = row(&buf, 0);
+        assert!(top.starts_with(" Agent History (Standalone)"), "{top:?}");
+        assert!(top.trim_end().ends_with("0.4s"), "{top:?}");
+    }
+
+    #[test]
+    fn indexing_progress_omits_the_title_when_the_host_has_one() {
+        let draw_with = |title: Option<&str>| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+            terminal
+                .draw(|f| {
+                    draw_progress(
+                        f,
+                        &Palette::terminal(),
+                        title,
+                        0,
+                        std::time::Duration::from_secs(1),
+                        None,
+                    )
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..20).map(|y| row(&buf, y)).collect::<String>()
+        };
+        assert!(draw_with(Some("Agent History (Standalone)")).contains("Agent History"));
+        let hosted = draw_with(None);
+        assert!(!hosted.contains("Agent History"));
+        assert!(hosted.contains("Indexing conversations"));
     }
 }

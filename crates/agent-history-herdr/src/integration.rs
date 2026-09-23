@@ -13,6 +13,7 @@ pub struct HerdrIntegration<H> {
     recovery: Vec<restore::RecoveryChoice>,
     confirmation_text: Option<String>,
     palette: Palette,
+    host_titled: bool,
 }
 
 impl<H> HerdrIntegration<H> {
@@ -22,7 +23,15 @@ impl<H> HerdrIntegration<H> {
             recovery: Vec::new(),
             confirmation_text: None,
             palette: Palette::terminal(),
+            host_titled: false,
         }
+    }
+
+    /// Declares that Herdr frames this pane with a title, as it does for
+    /// plugin panes, so the browser does not repeat it.
+    pub fn with_host_title(mut self, host_titled: bool) -> Self {
+        self.host_titled = host_titled;
+        self
     }
 
     /// Colors the browser with `palette`, normally Herdr's configured theme
@@ -86,6 +95,10 @@ impl<H: HostRuntime> Integration for HerdrIntegration<H> {
 
     fn enter_label(&self) -> &str {
         "Resume"
+    }
+
+    fn host_draws_title(&self) -> bool {
+        self.host_titled
     }
 
     fn preview_enter_label(&self) -> Option<&str> {
@@ -297,6 +310,21 @@ mod tests {
     }
     fn enter(state: &mut BrowserState, db: &SqliteStore, integration: &mut HerdrIntegration<Host>) {
         integration.handle(Key::Enter, state, db).unwrap();
+    }
+
+    #[test]
+    fn only_a_plugin_pane_leaves_the_title_to_herdr() {
+        let manual = HerdrIntegration::new(Host::default());
+        assert!(
+            !manual.host_draws_title(),
+            "an ordinary pane has no Herdr title"
+        );
+        let plugin = HerdrIntegration::new(Host::default()).with_host_title(true);
+        assert!(plugin.host_draws_title());
+        assert!(
+            manual.host().effects.is_empty(),
+            "asking needs no host call"
+        );
     }
 
     #[test]
