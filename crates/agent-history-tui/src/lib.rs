@@ -358,11 +358,7 @@ fn parse_args(args: Vec<String>) -> io::Result<(PathBuf, Option<PathBuf>, Option
         }
     }
     let db = db
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| {
-                PathBuf::from(h).join("Library/Application Support/Agent History/index.sqlite")
-            })
-        })
+        .or_else(agent_history_core::default_index_path)
         .ok_or_else(|| io::Error::other("HOME is unavailable; specify --db"))?;
     Ok((db, claude, codex))
 }

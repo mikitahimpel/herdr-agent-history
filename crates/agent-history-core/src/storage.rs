@@ -12,8 +12,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const VERSION: i32 = 4;
 const MAX_LIMIT: usize = 1000;
+/// Location of the shared index below `$HOME`. The directory name predates the
+/// standalone/Herdr split and is kept so existing installations keep their data;
+/// it does not imply a Herdr dependency.
+pub const DEFAULT_INDEX_RELATIVE_PATH: &str =
+    "Library/Application Support/Herdr Agent History/index.sqlite";
 /// Below this many free pages a rebuild is not worth the cost of rewriting the file.
 const RECLAIM_MIN_FREE_PAGES: i64 = 64;
+
+/// The index every entry point opens when no `--db` is given.
+///
+/// Resolved here rather than per binary so the CLI and the terminal UI cannot
+/// drift onto separate databases: indexing from one and searching from the
+/// other would silently read a different corpus.
+pub fn default_index_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(DEFAULT_INDEX_RELATIVE_PATH))
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexStatus {

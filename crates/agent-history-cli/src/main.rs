@@ -211,11 +211,7 @@ fn preview(db: PathBuf, o: Options) -> Result<(), String> {
     Ok(())
 }
 fn default_db() -> Result<PathBuf, String> {
-    env::var_os("HOME")
-        .map(|h| {
-            PathBuf::from(h).join("Library/Application Support/Herdr Agent History/index.sqlite")
-        })
-        .ok_or_else(|| "HOME is unset; pass --db <path>".into())
+    agent_history_core::default_index_path().ok_or_else(|| "HOME is unset; pass --db <path>".into())
 }
 fn sanitize(s: &str) -> String {
     s.chars()
