@@ -1,6 +1,7 @@
 //! Layout and drawing. Everything here is a pure function of the state and
 //! palette, so it renders identically to a `TestBackend` and a terminal.
 use crate::{
+    markdown,
     text::{self, matches, query_terms, safe, width},
     theme::Palette,
     BrowserState, Integration, Mode, RoleFilter, RESULT_LIMIT,
@@ -157,8 +158,8 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &BrowserState, p: &Palette)
     let block = pane("Search", focused, p);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let prompt = Span::styled("› ", p.key());
-    let room = usize::from(inner.width).saturating_sub(3);
+    let prompt = Span::styled(" › ", p.key());
+    let room = usize::from(inner.width).saturating_sub(4);
     let line = if state.query.is_empty() {
         let hint = safe("Type words you remember · \"exact phrase\" · prefix*", room);
         Line::from(vec![prompt, Span::styled(hint, p.muted())])
@@ -181,7 +182,7 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &BrowserState, p: &Palette)
     };
     frame.render_widget(Paragraph::new(line), inner);
     if focused {
-        let x = inner.x.saturating_add(2 + typed as u16);
+        let x = inner.x.saturating_add(3 + typed as u16);
         frame.set_cursor_position(Position::new(
             x.min(inner.right().saturating_sub(1)),
             inner.y,
@@ -278,6 +279,43 @@ fn highlighted(line: &str, terms: &[String], base: Style, p: &Palette) -> Vec<Sp
     out
 }
 
+/// `area` less one column of padding on each side.
+fn padded(area: Rect) -> Rect {
+    if area.width <= 2 {
+        return area;
+    }
+    Rect {
+        x: area.x + 1,
+        width: area.width - 2,
+        ..area
+    }
+}
+
+/// A dim horizontal rule across `width` columns, optionally led by a label.
+fn rule(width: usize, label: Option<Span<'static>>, p: &Palette) -> Line<'static> {
+    let mut spans = Vec::new();
+    if let Some(label) = label {
+        spans.push(label);
+        spans.push(Span::raw(" "));
+    }
+    let used: usize = spans.iter().map(|s| width_of(&s.content)).sum();
+    spans.push(Span::styled(
+        "─".repeat(width.saturating_sub(used)),
+        Style::new().fg(p.surface1),
+    ));
+    fit(spans, width)
+}
+
+/// One row of a result: selection bar, gutter, content, right padding.
+/// Every row of a result spans the full pane width, so a selection style
+/// patched onto it covers the padding too.
+fn result_row(bar: &Span<'static>, content: Vec<Span<'static>>, w: usize) -> Line<'static> {
+    let mut spans = vec![bar.clone(), Span::raw(" ")];
+    spans.extend(fit(content, w.saturating_sub(3)).spans);
+    spans.push(Span::raw(" "));
+    fit(spans, w)
+}
+
 fn draw_results(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Palette) {
     let focused = state.mode == Mode::Results;
     let mut block = pane("Results", focused, p);
@@ -296,12 +334,12 @@ fn draw_results(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Pal
         return;
     }
     if state.results.is_empty() {
-        draw_empty(frame, inner, state, p);
+        draw_empty(frame, padded(inner), state, p);
         return;
     }
     let w = usize::from(inner.width);
-    let per_page = (usize::from(inner.height) + 1) / ITEM_HEIGHT;
-    let per_page = per_page.max(1);
+    // Items are separated by a rule, so n items take n * ITEM_HEIGHT - 1 rows.
+    let per_page = ((usize::from(inner.height) + 1) / ITEM_HEIGHT).max(1);
     if state.selected < state.list_offset {
         state.list_offset = state.selected;
     } else if state.selected >= state.list_offset + per_page {
@@ -309,6 +347,7 @@ fn draw_results(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Pal
     }
     state.list_offset = state.list_offset.min(state.results.len() - 1);
     let terms = query_terms(&state.query);
+    let content_w = w.saturating_sub(3);
     let mut lines = Vec::new();
     for (i, r) in state
         .results
@@ -317,43 +356,44 @@ fn draw_results(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Pal
         .skip(state.list_offset)
         .take(per_page)
     {
+        if i > state.list_offset {
+            let mut separator = vec![Span::raw(" ")];
+            separator.extend(rule(w.saturating_sub(2), None, p).spans);
+            separator.push(Span::raw(" "));
+            lines.push(Line::from(separator));
+        }
         let selected = i == state.selected;
-        let marker = if selected {
+        let bar = if selected {
             Span::styled("▌", Style::new().fg(p.accent))
         } else {
             Span::raw(" ")
         };
         let d = date(r);
         let mut head = vec![
-            marker.clone(),
-            Span::raw(" "),
             agent_span(r.agent, p),
             Span::raw("  "),
             role_span(r.kind, p),
         ];
         let used: usize = head.iter().map(|s| width_of(&s.content)).sum();
-        let gap = w.saturating_sub(used + width_of(&d) + 1).max(1);
+        let gap = content_w.saturating_sub(used + width_of(&d)).max(1);
         head.push(Span::raw(" ".repeat(gap)));
         head.push(Span::styled(d, p.muted()));
-        let mut item = vec![fit(head, w)];
-        let mut context = vec![marker.clone(), Span::raw("  ")];
-        context.extend(context_spans(r, p));
-        item.push(fit(context, w));
-        let snippet = text::wrap(&r.snippet, w.saturating_sub(4).max(1));
+        let mut item = vec![
+            result_row(&bar, head, w),
+            result_row(&bar, context_spans(r, p), w),
+        ];
+        let snippet = text::wrap(&markdown::plain(&r.snippet), content_w.max(1));
         for k in 0..SNIPPET_LINES {
-            let mut spans = vec![marker.clone(), Span::raw("  ")];
-            // Snippet text is indented under the header's agent name.
-            if let Some(line) = snippet.get(k) {
-                spans.extend(highlighted(line, &terms, Style::new().fg(p.subtext0), p));
-            }
-            item.push(fit(spans, w));
+            let content = snippet.get(k).map_or_else(Vec::new, |line| {
+                highlighted(line, &terms, Style::new().fg(p.subtext0), p)
+            });
+            item.push(result_row(&bar, content, w));
         }
         if selected {
             let style = p.selection(focused);
             item = item.into_iter().map(|l| l.patch_style(style)).collect();
         }
         lines.extend(item);
-        lines.push(Line::raw(""));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -362,8 +402,8 @@ fn draw_empty(frame: &mut Frame, area: Rect, state: &BrowserState, p: &Palette) 
     let w = usize::from(area.width);
     let mut lines = vec![Line::raw("")];
     let push = |lines: &mut Vec<Line<'static>>, s: &str, style: Style| {
-        for l in text::wrap(s, w.saturating_sub(2)) {
-            lines.push(Line::from(vec![Span::raw(" "), Span::styled(l, style)]));
+        for l in text::wrap(s, w) {
+            lines.push(Line::styled(l, style));
         }
     };
     if state.query.trim().is_empty() {
@@ -394,49 +434,107 @@ fn draw_empty(frame: &mut Frame, area: Rect, state: &BrowserState, p: &Palette) 
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// A preview paragraph: either a role heading or a line of message text in
-/// the current role.
-fn preview_lines(preview: &str, width: usize, terms: &[String], p: &Palette) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    let mut role_color = p.overlay0;
+/// The preview split into messages. Core separates events with a blank line
+/// and starts each with its role, so a role prefix counts only at the start
+/// of the text or after a blank line.
+fn messages(preview: &str) -> Vec<(Option<EventKind>, String)> {
+    let mut out: Vec<(Option<EventKind>, String)> = Vec::new();
     let mut boundary = true;
     for raw in preview.split('\n') {
-        let heading = boundary
-            .then(|| {
-                [
-                    ("User: ", EventKind::User),
-                    ("Assistant: ", EventKind::Assistant),
-                    ("Tool: ", EventKind::ToolResult),
-                ]
-                .into_iter()
-                .find_map(|(prefix, kind)| raw.strip_prefix(prefix).map(|rest| (kind, rest)))
-            })
-            .flatten();
-        let body = match heading {
-            Some((kind, rest)) => {
-                let (name, color) = role(kind, p);
-                role_color = color;
-                out.push(Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(name, Style::new().fg(color).add_modifier(Modifier::BOLD)),
-                ]));
-                rest
-            }
-            None => raw,
+        let heading = if boundary {
+            [
+                ("User: ", EventKind::User),
+                ("Assistant: ", EventKind::Assistant),
+                ("Tool: ", EventKind::ToolResult),
+            ]
+            .into_iter()
+            .find_map(|(prefix, kind)| raw.strip_prefix(prefix).map(|rest| (kind, rest)))
+        } else {
+            None
         };
         boundary = raw.is_empty();
-        if raw.starts_with("[Surrounding context is limited]") {
-            out.push(Line::styled(format!(" {raw}"), p.muted()));
-            continue;
+        match heading {
+            Some((kind, rest)) => out.push((Some(kind), rest.to_string())),
+            None if raw.starts_with("[Surrounding context is limited]") => {
+                out.push((None, raw.to_string()))
+            }
+            None => match out.last_mut() {
+                Some((Some(_), body)) => {
+                    body.push('\n');
+                    body.push_str(raw);
+                }
+                _ => out.push((None, raw.to_string())),
+            },
         }
-        if body.is_empty() && heading.is_none() {
-            out.push(Line::raw(""));
-            continue;
+    }
+    for (_, body) in &mut out {
+        let trimmed = body.trim_end_matches('\n').len();
+        body.truncate(trimmed);
+    }
+    out
+}
+
+/// Patches the matched-term style onto cells whose text matches the query.
+fn highlight_cells(cells: &mut [markdown::Cell], terms: &[String], p: &Palette) -> bool {
+    let text: String = cells.iter().map(|c| c.0).collect();
+    let ranges = matches(&text, terms);
+    if ranges.is_empty() {
+        return false;
+    }
+    let starts: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+    for (i, cell) in cells.iter_mut().enumerate() {
+        if ranges.iter().any(|&(a, b)| (a..b).contains(&starts[i])) {
+            cell.1 = cell.1.patch(p.matched());
         }
-        for line in text::wrap(body, width.saturating_sub(4).max(1)) {
-            let mut spans = vec![Span::styled(" ▎ ", Style::new().fg(role_color))];
-            spans.extend(highlighted(&line, terms, Style::new().fg(p.text), p));
-            out.push(Line::from(spans));
+    }
+    true
+}
+
+/// Preview lines, each flagged when it contains a matched term. Every
+/// message starts with a rule labelled with its role; its text is rendered
+/// as markdown behind a gutter in the role's color.
+fn preview_lines(
+    preview: &str,
+    width: usize,
+    terms: &[String],
+    p: &Palette,
+) -> Vec<(Line<'static>, bool)> {
+    let mut out = Vec::new();
+    for (kind, body) in messages(preview) {
+        let Some(kind) = kind else {
+            if !body.trim().is_empty() {
+                for l in text::wrap(&body, width) {
+                    out.push((
+                        Line::styled(l, p.muted().add_modifier(Modifier::ITALIC)),
+                        false,
+                    ));
+                }
+            }
+            continue;
+        };
+        let (name, color) = role(kind, p);
+        if !out.is_empty() {
+            out.push((Line::raw(""), false));
+        }
+        out.push((
+            rule(
+                width,
+                Some(Span::styled(
+                    name,
+                    Style::new().fg(color).add_modifier(Modifier::BOLD),
+                )),
+                p,
+            ),
+            false,
+        ));
+        let gutter = Span::styled("▎ ", Style::new().fg(color));
+        for mut cells in
+            markdown::render(&body, width.saturating_sub(2), Style::new().fg(p.text), p)
+        {
+            let hit = highlight_cells(&mut cells, terms, p);
+            let mut spans = vec![gutter.clone()];
+            spans.extend(markdown::to_line(&cells).spans);
+            out.push((Line::from(spans), hit));
         }
     }
     out
@@ -462,43 +560,42 @@ fn draw_preview(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Pal
         frame.render_widget(block, area);
         return;
     }
-    let w = usize::from(inner.width);
-    let lines: Vec<Line<'static>> = if state.selected_result().is_none() {
+    let content = padded(inner);
+    let w = usize::from(content.width);
+    let lines: Vec<(Line<'static>, bool)> = if state.selected_result().is_none() {
         vec![
             Line::raw(""),
             Line::styled(
-                " The conversation around the selected result appears here.",
+                "The conversation around the selected result appears here.",
                 p.muted(),
             ),
         ]
+        .into_iter()
+        .map(|l| (l, false))
+        .collect()
     } else if let Some(error) = &state.preview_error {
         let mut lines = vec![
             Line::raw(""),
-            Line::styled(" Preview unavailable", p.error()),
+            Line::styled("Preview unavailable", p.error()),
         ];
         lines.extend(
-            text::wrap(error, w.saturating_sub(2))
+            text::wrap(error, w)
                 .into_iter()
-                .map(|l| Line::styled(format!(" {l}"), Style::new().fg(p.text))),
+                .map(|l| Line::styled(l, Style::new().fg(p.text))),
         );
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            " Reopen Agent History to re-index changed files.",
+            "Reopen Agent History to re-index changed files.",
             p.muted(),
         ));
-        lines
+        lines.into_iter().map(|l| (l, false)).collect()
     } else {
         preview_lines(&state.preview, w, &query_terms(&state.query), p)
     };
-    let visible = usize::from(inner.height);
+    let visible = usize::from(content.height);
     if state.preview_anchor {
         state.preview_anchor = false;
-        let terms = query_terms(&state.query);
-        if let Some(i) = lines.iter().position(|l| {
-            l.spans
-                .iter()
-                .any(|s| !matches(&s.content, &terms).is_empty())
-        }) {
+        if let Some(i) = lines.iter().position(|(_, hit)| *hit) {
             state.preview_scroll = i.saturating_sub(2);
         }
     }
@@ -519,8 +616,9 @@ fn draw_preview(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Pal
         .into_iter()
         .skip(state.preview_scroll)
         .take(visible)
+        .map(|(l, _)| l)
         .collect();
-    frame.render_widget(Paragraph::new(shown), inner);
+    frame.render_widget(Paragraph::new(shown), content);
 }
 
 fn draw_action(frame: &mut Frame, body: Rect, action_lines: &[String], p: &Palette) {
@@ -615,7 +713,7 @@ fn draw_keys(
         ));
     }
     frame.render_widget(
-        Paragraph::new(fit(spans, area.width.into())).style(Style::new().bg(p.surface_dim)),
+        Paragraph::new(fit(spans, area.width.into())).style(p.bar()),
         area,
     );
 }
@@ -764,8 +862,13 @@ mod tests {
 
     /// First cell whose row text contains `needle`, as (x, y) of the match.
     fn find(buf: &Buffer, needle: &str) -> Option<(u16, u16)> {
+        find_from(buf, needle, 0)
+    }
+
+    /// `find`, considering only matches starting at column `min_x` or later.
+    fn find_from(buf: &Buffer, needle: &str, min_x: u16) -> Option<(u16, u16)> {
         (0..buf.area.height).find_map(|y| {
-            let mut x = 0;
+            let mut x = min_x;
             let cells: Vec<&str> = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
             while (x as usize) < cells.len() {
                 let rest: String = cells[x as usize..].concat();
@@ -978,12 +1081,12 @@ mod tests {
             i(mode).into_iter().map(|(k, _)| k).collect::<Vec<_>>()
         };
         let standalone = |m| hints(m, &Standalone);
-        let herdr = |m| hints(m, &Themed(Palette::terminal()));
+        let resuming = |m| hints(m, &Themed(Palette::terminal()));
         assert!(keys(Mode::Query, &standalone).contains(&"␣/⏎"));
         assert!(!keys(Mode::Preview, &standalone).contains(&"⏎"));
-        assert!(keys(Mode::Results, &herdr).contains(&"⏎"));
-        assert!(keys(Mode::Preview, &herdr).contains(&"⏎"));
-        assert_eq!(keys(Mode::Action, &herdr), ["esc", "^C"]);
+        assert!(keys(Mode::Results, &resuming).contains(&"⏎"));
+        assert!(keys(Mode::Preview, &resuming).contains(&"⏎"));
+        assert_eq!(keys(Mode::Action, &resuming), ["esc", "^C"]);
     }
 
     #[test]
@@ -994,5 +1097,196 @@ mod tests {
         let buf = render(&mut state, &Themed(Palette::terminal()), 100, 30);
         assert!(find(&buf, " Recovery ").is_some());
         assert!(find(&buf, "The recorded workspace is unavailable.").is_some());
+    }
+
+    fn markdown_store(temp: &TempDir) -> SqliteStore {
+        let cwd = temp.path().to_string_lossy();
+        let user = format!(
+            r#"{{"type":"user","sessionId":"00000000-0000-4000-8000-000000000002","cwd":"{cwd}","message":{{"content":"why is **portfolio** `hidden`?"}}}}"#
+        );
+        let answer = serde_escape(
+            "## Portfolio rules\n\nThe **portfolio** filter uses `DUST`.\n\n- first point\n- second point\n\n> quoted caveat\n\n```rust\nlet portfolio = 1;\n```",
+        );
+        let assistant = format!(r#"{{"type":"assistant","message":{{"content":"{answer}"}}}}"#);
+        crate::tests::fixture_store(temp.path(), &[&user, &assistant])
+    }
+
+    fn serde_escape(s: &str) -> String {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    }
+
+    fn markdown_state(store: &SqliteStore) -> BrowserState {
+        let mut state = BrowserState {
+            query: "portfolio".into(),
+            ..Default::default()
+        };
+        state.refresh(store);
+        assert_eq!(state.results.len(), 2);
+        state
+    }
+
+    /// The results pane's inner rectangle: inside its border.
+    fn results_inner(buf: &Buffer) -> Rect {
+        let (x, y) = find(buf, " Results ").unwrap();
+        let left = x - 1;
+        let right = (left + 1..buf.area.width)
+            .find(|&x| matches!(buf[(x, y)].symbol(), "┓" | "╮"))
+            .unwrap();
+        let bottom = (y + 1..buf.area.height)
+            .find(|&yy| matches!(buf[(left, yy)].symbol(), "┗" | "╰"))
+            .unwrap();
+        Rect::new(left + 1, y + 1, right - left - 1, bottom - y - 1)
+    }
+
+    #[test]
+    fn result_rows_are_padded_separated_and_fully_selected() {
+        let temp = TempDir::new("ui-rows").unwrap();
+        let (_store, mut state) = searched(&temp);
+        state.mode = Mode::Results;
+        let buf = render(&mut state, &Standalone, 100, 30);
+        let inner = results_inner(&buf);
+        let (hx, hy) = find(&buf, "Claude  USER").unwrap();
+        let (_, ay) = find(&buf, "Claude  ASSISTANT").unwrap();
+        // Header, context and snippet share one gutter: two columns in.
+        assert_eq!(hx, inner.x + 2);
+        let snippet_row: String = (inner.x + 2..inner.right())
+            .map(|x| buf[(x, hy + 2)].symbol())
+            .collect();
+        assert!(
+            snippet_row.starts_with("rememberable topic"),
+            "snippet aligns with the header"
+        );
+        assert_eq!(
+            buf[(inner.x + 2, hy + 1)].symbol(),
+            "n",
+            "context aligns with the header"
+        );
+        // The selection covers all four rows edge to edge, padding included.
+        for y in hy..hy + 4 {
+            for x in [inner.x, inner.x + 1, inner.right() - 1] {
+                assert_eq!(buf[(x, y)].bg, Color::DarkGray, "cell {x},{y}");
+            }
+        }
+        // A dim rule separates the items, padded on both sides.
+        let sep = hy + 4;
+        assert_eq!(ay, sep + 1);
+        assert_eq!(buf[(inner.x, sep)].symbol(), " ");
+        assert_eq!(buf[(inner.right() - 1, sep)].symbol(), " ");
+        for x in inner.x + 1..inner.right() - 1 {
+            assert_eq!(buf[(x, sep)].symbol(), "─");
+            assert_eq!(buf[(x, sep)].fg, Palette::terminal().surface1);
+            assert_eq!(buf[(x, sep)].bg, Color::Reset, "separator is not selected");
+        }
+        assert_eq!(buf[(inner.x + 1, ay)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn preview_renders_markdown_with_padding_and_role_rules() {
+        let temp = TempDir::new("ui-markdown").unwrap();
+        let store = markdown_store(&temp);
+        let mut state = markdown_state(&store);
+        state.preview_anchor = false;
+        let p = Palette::terminal();
+        let buf = render(&mut state, &Standalone, 120, 40);
+        let (px, _) = find(&buf, " Preview ").unwrap();
+        let text: Vec<String> = (0..40).map(|y| row(&buf, y)).collect();
+        let all = text.join("\n");
+        // Messages open with a rule labelled by role, one column in.
+        let (ux, uy) = find_from(&buf, "USER ─", px).unwrap();
+        assert_eq!(ux, px + 1, "preview content is padded from the border");
+        assert_eq!(buf[(ux, uy)].fg, p.blue);
+        assert_eq!(buf[(ux + 6, uy)].fg, p.surface1);
+        assert!(find_from(&buf, "ASSISTANT ─", px).is_some());
+        // Markdown is rendered, not shown raw.
+        assert!(!all.contains("**") && !all.contains("```") && !all.contains("## "));
+        let (hx, hy) = find_from(&buf, "Portfolio rules", px).unwrap();
+        assert_eq!(buf[(hx, hy)].bg, p.yellow, "query term inside the heading");
+        let rules = (hx + 10, hy);
+        assert!(buf[rules].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[rules].fg, p.accent);
+        let (cx, cy) = find_from(&buf, "DUST", px).unwrap();
+        assert_eq!(buf[(cx, cy)].bg, p.surface0, "inline code");
+        assert!(find_from(&buf, "• first point", px).is_some());
+        assert!(find_from(&buf, "▎ quoted caveat", px).is_some());
+        let (kx, ky) = find_from(&buf, "let portfolio = 1;", px).unwrap();
+        assert_eq!(buf[(kx, ky)].bg, p.surface0, "code block");
+        let right = (px..120)
+            .rev()
+            .find(|&x| matches!(buf[(x, ky)].symbol(), "│" | "┃"))
+            .unwrap();
+        assert_eq!(
+            buf[(right - 2, ky)].bg,
+            p.surface0,
+            "code block is a solid block"
+        );
+        assert_eq!(
+            buf[(right - 1, ky)].bg,
+            Color::Reset,
+            "right padding stays clear"
+        );
+        // Query terms are still highlighted inside rendered markdown.
+        let (bx, by) = find_from(&buf, "portfolio filter", px).unwrap();
+        assert_eq!(buf[(bx, by)].bg, p.yellow);
+        assert!(buf[(bx, by)].modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn snippets_strip_markdown_syntax() {
+        let temp = TempDir::new("ui-snippet").unwrap();
+        let store = markdown_store(&temp);
+        let mut state = markdown_state(&store);
+        state.mode = Mode::Results;
+        let buf = render(&mut state, &Standalone, 120, 40);
+        let inner = results_inner(&buf);
+        let results: String = (inner.y..inner.bottom())
+            .map(|y| {
+                (inner.x..inner.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(results.contains("why is portfolio hidden?"), "{results}");
+        assert!(!results.contains("**") && !results.contains('`') && !results.contains("##"));
+    }
+
+    #[test]
+    fn hostile_markdown_cannot_corrupt_the_preview() {
+        let temp = TempDir::new("ui-hostile-md").unwrap();
+        let (_store, mut state) = searched(&temp);
+        let payload = "# \u{1b}[2J\u{1b}]52;c;aGk=\u{7} title\n\n```\n\u{1b}[31m雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪雪 e\u{301}\u{301}\u{301}\u{9b}2J\n```\n\n> \u{202e}evil **\u{1b}[5mblink** `\u{0}`\n\n"
+            .repeat(10)
+            + &">".repeat(400)
+            + " deep\n\n"
+            + &"- ".repeat(200)
+            + "<script>x</script> [l](javascript:x)";
+        state.preview = format!("User: {payload}\n\nAssistant: {payload}");
+        state.results[0].snippet = payload.clone();
+        for (w, h) in [(120, 40), (61, 40), (30, 12)] {
+            for mode in [Mode::Results, Mode::Preview] {
+                state.mode = mode;
+                state.preview_anchor = true;
+                let buf = render(&mut state, &Standalone, w, h);
+                for y in 0..h {
+                    for x in 0..w {
+                        let symbol = buf[(x, y)].symbol();
+                        assert!(
+                            !symbol.chars().any(|c| c.is_control() || c == '\u{202e}'),
+                            "control character at {x},{y}: {symbol:?}"
+                        );
+                    }
+                    if w >= SIDE_BY_SIDE_MIN_WIDTH && y > 5 && y < h - 2 {
+                        assert!(
+                            matches!(buf[(w - 1, y)].symbol(), "│" | "┃"),
+                            "row {y}: {:?}",
+                            row(&buf, y)
+                        );
+                    }
+                }
+                assert!(!(0..h).any(|y| row(&buf, y).contains("javascript")));
+            }
+        }
     }
 }

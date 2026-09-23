@@ -18,6 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod markdown;
 mod terminal;
 mod text;
 mod theme;
