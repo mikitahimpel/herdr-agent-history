@@ -298,10 +298,9 @@ fn date(r: &SearchResult) -> String {
 }
 
 fn context_spans(r: &SearchResult, p: &Palette) -> Vec<Span<'static>> {
-    let repo = r
-        .repository
-        .as_deref()
-        .map(|a| a.rsplit('/').next().unwrap_or(a).to_string());
+    // Already a short `owner/name` label rather than a path, and the owner
+    // distinguishes same-named repositories, so it is shown whole.
+    let repo = r.repository.clone();
     match (repo, r.branch.clone()) {
         (Some(repo), Some(branch)) => vec![
             Span::styled(repo, Style::new().fg(p.text)),

@@ -48,12 +48,21 @@ impl GitContextProvider for GitContextResolver {
                     .and_then(|path| canonical_output_path(cwd, path))
             })
             .or_else(|| common_dir.map(PathBuf::from));
-        let repository = repository_root
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned());
         let branch = git_value(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
         let commit = git_value(cwd, ["rev-parse", "--verify", "HEAD"]);
         let repository_url = git_value(cwd, ["config", "--get", "remote.origin.url"]);
+        // A label, not a location: `repository_root` still carries the path that
+        // restoration needs. Recorded provenance already labels sessions `owner/name`,
+        // so observed sessions derive the same shape instead of a full path.
+        let repository = repository_url
+            .as_deref()
+            .and_then(crate::adapters::repository_label)
+            .or_else(|| {
+                repository_root
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+            });
 
         Ok(GitContext {
             origin: GitOrigin::Observed,
@@ -197,11 +206,36 @@ mod tests {
             .commit
             .as_ref()
             .is_some_and(|commit| commit.len() == 40));
+        // No remote configured, so the label falls back to the directory name.
         assert_eq!(
-            context.repository,
-            Some(repo.canonicalize().unwrap().to_string_lossy().into_owned())
+            context.repository.as_deref(),
+            repo.canonicalize()
+                .unwrap()
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .as_deref()
         );
         assert_eq!(context.origin, crate::GitOrigin::Observed);
+    }
+
+    #[test]
+    fn observed_repository_is_labelled_like_recorded_provenance() {
+        let temp = TempDir::new("git-observed-label").unwrap();
+        let repo = repository(&temp);
+        run(
+            &repo,
+            &["remote", "add", "origin", "git@github.com:owner/name.git"],
+        );
+        let context = GitContextResolver.context(&repo).unwrap();
+        // Rows would otherwise mix `owner/name` with a full filesystem path
+        // depending on which provenance won.
+        assert_eq!(context.repository.as_deref(), Some("owner/name"));
+        assert_eq!(
+            context.repository_url.as_deref(),
+            Some("git@github.com:owner/name.git"),
+            "the location restoration needs is kept verbatim"
+        );
+        assert_eq!(context.repository_root, Some(repo.canonicalize().unwrap()));
     }
 
     #[test]

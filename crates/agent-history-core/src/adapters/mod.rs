@@ -5,3 +5,4 @@ mod common;
 
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
+pub(crate) use common::repository_label;
