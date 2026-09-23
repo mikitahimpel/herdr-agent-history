@@ -7,7 +7,11 @@ use agent_history_core::{
     preview::preview_source,
     CoreError, EventKind, Result, SearchResult, Session, SessionId, SourceRef, SqliteStore,
 };
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use ratatui::layout::Position;
 use std::{
     io,
     path::PathBuf,
@@ -48,6 +52,25 @@ pub enum Key {
     Esc,
     Tab,
     F2,
+    F3,
+}
+
+/// A mouse action at a screen cell. Mouse input is additive: every action
+/// here also has a key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mouse {
+    Click { column: u16, row: u16 },
+    ScrollUp { column: u16, row: u16 },
+    ScrollDown { column: u16, row: u16 },
+}
+impl Mouse {
+    fn position(self) -> Position {
+        match self {
+            Self::Click { column, row }
+            | Self::ScrollUp { column, row }
+            | Self::ScrollDown { column, row } => Position::new(column, row),
+        }
+    }
 }
 
 /// Which pane has keyboard focus, or the integration's action screen.
@@ -116,6 +139,14 @@ pub struct BrowserState {
     /// Whether each result's session still exists on disk, filled in by a
     /// background check.
     pub availability: Availabilities,
+    /// Whether the browser receives mouse events. Off hands selection back
+    /// to the terminal; F3 toggles it.
+    pub mouse_capture: bool,
+    /// The results list was scrolled by the wheel, so it no longer follows
+    /// the selection until the selection moves.
+    pub list_scrolled: bool,
+    /// Where the last frame drew each clickable region.
+    pub(crate) hits: ui::Hits,
 }
 impl BrowserState {
     pub fn refresh(&mut self, store: &SqliteStore) {
@@ -195,12 +226,69 @@ impl BrowserState {
     fn requery(&mut self, store: &SqliteStore) {
         self.selected = 0;
         self.list_offset = 0;
+        self.list_scrolled = false;
         self.refresh(store);
     }
 
     fn select(&mut self, index: usize, store: &SqliteStore) {
+        self.list_scrolled = false;
         self.selected = index.min(self.results.len().saturating_sub(1));
         self.sync_preview(store);
+    }
+
+    /// Applies a mouse action against the regions of the last drawn frame.
+    /// A click anywhere in a pane focuses it; a click on a result also
+    /// selects it. The recovery screen ignores the mouse so that a stray
+    /// click can never answer it.
+    pub fn mouse(&mut self, event: Mouse, store: &SqliteStore) {
+        if self.mode == Mode::Action {
+            return;
+        }
+        self.error = None;
+        let at = event.position();
+        let hits = std::mem::take(&mut self.hits);
+        let in_results = hits.results.is_some_and(|r| r.contains(at));
+        let in_preview = hits.preview.is_some_and(|r| r.contains(at));
+        match event {
+            Mouse::Click { .. } => {
+                if hits.search.contains(at) {
+                    self.mode = Mode::Query;
+                } else if let Some(&(_, filter)) = hits.tabs.iter().find(|(r, _)| r.contains(at)) {
+                    if filter != self.role_filter {
+                        self.role_filter = filter;
+                        self.requery(store);
+                    }
+                    if self.mode == Mode::Preview {
+                        self.mode = Mode::Results;
+                    }
+                } else if in_results {
+                    self.mode = Mode::Results;
+                    if let Some(&(_, index)) = hits.rows.iter().find(|(r, _)| r.contains(at)) {
+                        self.select(index, store);
+                    }
+                } else if in_preview {
+                    self.mode = Mode::Preview;
+                }
+            }
+            Mouse::ScrollUp { .. } if in_results => {
+                self.list_scrolled = true;
+                self.list_offset = self.list_offset.saturating_sub(1);
+            }
+            Mouse::ScrollDown { .. } if in_results => {
+                self.list_scrolled = true;
+                self.list_offset = self.list_offset.saturating_add(1);
+            }
+            Mouse::ScrollUp { .. } if in_preview => {
+                self.preview_anchor = false;
+                self.preview_scroll = self.preview_scroll.saturating_sub(3);
+            }
+            Mouse::ScrollDown { .. } if in_preview => {
+                self.preview_anchor = false;
+                self.preview_scroll = self.preview_scroll.saturating_add(3);
+            }
+            _ => {}
+        }
+        self.hits = hits;
     }
 
     pub fn handle(&mut self, key: Key, store: &SqliteStore) -> Result<()> {
@@ -268,6 +356,8 @@ impl BrowserState {
                     self.requery(store);
                 }
                 Key::Enter => self.show_preview(store)?,
+                // Mouse capture is terminal state; the run loop toggles it.
+                Key::F3 => {}
             },
         }
         Ok(())
@@ -277,6 +367,11 @@ impl BrowserState {
 pub trait Integration {
     fn title(&self) -> &str;
     fn enter_label(&self) -> &str;
+    /// Whether the host draws a titled frame around the browser. Whoever owns
+    /// the chrome owns the title, so the browser then leaves its own out.
+    fn host_draws_title(&self) -> bool {
+        false
+    }
     /// What Enter does while the preview pane is focused, if anything.
     fn preview_enter_label(&self) -> Option<&str> {
         None
@@ -341,7 +436,7 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
         ]
     };
     let palette = integration.palette();
-    let title = integration.title().to_string();
+    let title = (!integration.host_draws_title()).then(|| integration.title().to_string());
     terminal::install_signal_handlers();
     let mut screen = terminal::Screen::enter()?;
 
@@ -361,7 +456,7 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
                     ui::draw_progress(
                         f,
                         &palette,
-                        &title,
+                        title.as_deref(),
                         frame,
                         started.elapsed(),
                         snapshot.as_ref(),
@@ -416,6 +511,7 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
             report.malformed_records,
             started.elapsed().as_secs_f32()
         ),
+        mouse_capture: true,
         ..Default::default()
     };
     if !report.errors.is_empty() {
@@ -452,14 +548,27 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
         if !event::poll(Duration::from_millis(wait))? {
             continue;
         }
-        let Event::Key(k) = event::read()? else {
-            continue;
+        let k = match event::read()? {
+            Event::Key(k) => k,
+            Event::Mouse(m) => {
+                if let Some(action) = map_mouse(m) {
+                    state.mouse(action, &store);
+                }
+                continue;
+            }
+            _ => continue,
         };
         if k.kind == KeyEventKind::Release {
             continue;
         }
         if is_interrupt(&k) {
             break;
+        }
+        if map_key(k.code) == Some(Key::F3) {
+            // Handled before the integration so it works on every screen.
+            state.mouse_capture = !state.mouse_capture;
+            terminal::set_mouse_capture(&mut io::stdout(), state.mouse_capture)?;
+            continue;
         }
         if let Some(key) = map_key(k.code) {
             let handled = match integration.handle(key, &mut state, &store) {
@@ -478,6 +587,16 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
         }
     }
     Ok(())
+}
+
+fn map_mouse(m: MouseEvent) -> Option<Mouse> {
+    let (column, row) = (m.column, m.row);
+    Some(match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => Mouse::Click { column, row },
+        MouseEventKind::ScrollUp => Mouse::ScrollUp { column, row },
+        MouseEventKind::ScrollDown => Mouse::ScrollDown { column, row },
+        _ => return None,
+    })
 }
 
 fn is_interrupt(k: &KeyEvent) -> bool {
@@ -531,6 +650,7 @@ fn map_key(k: KeyCode) -> Option<Key> {
         KeyCode::Esc => Key::Esc,
         KeyCode::Tab => Key::Tab,
         KeyCode::F(2) => Key::F2,
+        KeyCode::F(3) => Key::F3,
         _ => return None,
     })
 }

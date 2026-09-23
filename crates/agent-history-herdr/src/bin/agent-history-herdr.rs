@@ -22,6 +22,9 @@ fn main() -> io::Result<()> {
     run(
         args,
         &mut HerdrIntegration::new(HerdrCli::new(ProcessRunner))
-            .with_palette(theme::palette_from_env()),
+            .with_palette(theme::palette_from_env())
+            // Herdr sets this only for plugin panes, which it frames with the
+            // manifest's title; a manual run in an ordinary pane has no title.
+            .with_host_title(std::env::var_os("HERDR_PLUGIN_ID").is_some()),
     )
 }

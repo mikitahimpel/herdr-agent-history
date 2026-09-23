@@ -1,12 +1,15 @@
-//! Raw-mode/alternate-screen lifetime. The terminal is restored when the
-//! guard drops, when any thread panics, and when SIGINT or SIGTERM arrives.
+//! Raw mode, alternate screen and mouse capture lifetime. The terminal is
+//! restored when the guard drops, when any thread panics, and when SIGINT or
+//! SIGTERM arrives.
 use crossterm::{
-    cursor, execute,
+    cursor,
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
-    io::{self, Stdout},
+    io::{self, Stdout, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
         Once,
@@ -36,9 +39,26 @@ pub(crate) fn interrupted() -> bool {
     INTERRUPTED.load(Ordering::SeqCst)
 }
 
+/// Releases the mouse, leaves the alternate screen and shows the cursor.
+/// Releasing capture that is already off is harmless, so this runs
+/// unconditionally on every exit path.
+pub(crate) fn write_restore(out: &mut impl Write) -> io::Result<()> {
+    execute!(out, DisableMouseCapture, LeaveAlternateScreen, cursor::Show)
+}
+
+/// Turns mouse reporting on or off. Off returns drag-to-select to the
+/// terminal.
+pub(crate) fn set_mouse_capture(out: &mut impl Write, on: bool) -> io::Result<()> {
+    if on {
+        execute!(out, EnableMouseCapture)
+    } else {
+        execute!(out, DisableMouseCapture)
+    }
+}
+
 fn restore() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
+    let _ = write_restore(&mut io::stdout());
 }
 
 fn install_panic_hook() {
@@ -71,6 +91,7 @@ impl Screen {
         enable_raw_mode()?;
         let mut screen = Self { term: None };
         execute!(io::stdout(), EnterAlternateScreen)?;
+        set_mouse_capture(&mut io::stdout(), true)?;
         screen.term = Some(Terminal::new(CrosstermBackend::new(io::stdout()))?);
         Ok(screen)
     }
@@ -93,5 +114,44 @@ impl Drop for Screen {
     fn drop(&mut self) {
         drop(self.term.take());
         restore();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MOUSE_OFF: &[&str] = &["\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l", "\x1b[?1006l"];
+
+    fn written(f: impl FnOnce(&mut Vec<u8>) -> io::Result<()>) -> String {
+        let mut out = Vec::new();
+        f(&mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn restore_releases_the_mouse_before_leaving_the_screen() {
+        let bytes = written(write_restore);
+        for off in MOUSE_OFF {
+            assert!(bytes.contains(off), "{off:?} missing from {bytes:?}");
+        }
+        let leave = bytes
+            .find("\x1b[?1049l")
+            .expect("leaves the alternate screen");
+        assert!(bytes.find("\x1b[?1000l").unwrap() < leave);
+        assert!(bytes.contains("\x1b[?25h"), "shows the cursor");
+    }
+
+    #[test]
+    fn toggle_turns_reporting_off_and_back_on() {
+        let off = written(|o| set_mouse_capture(o, false));
+        for seq in MOUSE_OFF {
+            assert!(off.contains(seq), "{seq:?} missing from {off:?}");
+        }
+        let on = written(|o| set_mouse_capture(o, true));
+        for seq in ["\x1b[?1000h", "\x1b[?1006h"] {
+            assert!(on.contains(seq), "{seq:?} missing from {on:?}");
+        }
+        assert!(!on.contains("?1000l"), "turning on never also turns off");
     }
 }
