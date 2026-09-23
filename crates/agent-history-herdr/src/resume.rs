@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeResumePlan {
     pub agent: Agent,
+    /// Host agent name this integration assigns to the resumed pane. It carries
+    /// the validated native session ID, so a later overlay run can recognize
+    /// its own resume even when the host reports no session ID for that pane.
+    pub agent_name: String,
     pub argv: Vec<String>,
 }
 
@@ -21,6 +25,7 @@ impl NativeResumePlan {
         };
         Ok(Self {
             agent: session.id.agent,
+            agent_name: format!("agent-history-{id}"),
             argv,
         })
     }
@@ -52,6 +57,9 @@ pub struct LiveAgent {
     pub workspace_id: String,
     pub agent: Agent,
     pub session_id: Option<SessionId>,
+    /// Host-reported agent name, used only as provenance for a pane this
+    /// integration started itself.
+    pub name: Option<String>,
 }
 
 #[cfg(test)]

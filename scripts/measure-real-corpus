@@ -1,0 +1,338 @@
+#!/bin/sh
+set -eu
+cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/measure-real-corpus [--claude-config-dir DIR] [--codex-home DIR] [--out DIR] [--queries FILE]
+
+Measures, in one run: real-corpus initial indexing time and peak RSS, a
+second-pass rescan characterizing discovery cost at full file count, an
+isolated single-file incremental append, cold CLI search p50/p95 over a
+fixed query set, and SQLite storage decomposed into live pages vs.
+freelist against raw JSONL bytes.
+
+It always indexes into a private database under mktemp and deletes it (and
+every scratch copy it made) on exit. It never opens the shared installed
+index and never writes into the given Claude/Codex directories: those are
+only read (session discovery, file sizes, and copying at most two small
+existing files elsewhere before appending to the copies).
+
+With no arguments it measures a tiny generated synthetic corpus instead of
+real history, which is what makes it safe to run unattended (CI). Pass
+--claude-config-dir/--codex-home to measure a real corpus; each is the
+directory that would normally be $HOME/.claude or $HOME/.codex (i.e. the
+parent of "projects", or of "sessions"/"archived_sessions") -- matching the
+CLAUDE_CONFIG_DIR/CODEX_HOME environment variables the product itself
+honors. Either may be omitted, in which case that agent falls back to the
+small synthetic fixture and the report says so.
+
+Options:
+  --claude-config-dir DIR  Real Claude config directory (contains projects/)
+  --codex-home DIR         Real Codex home directory (contains sessions/,
+                            archived_sessions/)
+  --queries FILE           One query term per line (default: a small
+                            built-in generic word list)
+  --out DIR                Also write the report to DIR/real-corpus-report.txt
+  -h, --help               Show this help
+EOF
+}
+
+claude_config_dir=
+codex_home=
+queries_file=
+out_dir=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --claude-config-dir) shift; claude_config_dir=${1:?--claude-config-dir requires a value} ;;
+    --codex-home) shift; codex_home=${1:?--codex-home requires a value} ;;
+    --queries) shift; queries_file=${1:?--queries requires a value} ;;
+    --out) shift; out_dir=${1:?--out requires a value} ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "measure-real-corpus: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+die() { echo "measure-real-corpus: $1" >&2; exit 1; }
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/agent-history-measure.XXXXXX")
+trap 'rm -rf "$work"' EXIT INT TERM
+report="$work/report.txt"
+: >"$report"
+emit() { printf '%s\n' "$1" | tee -a "$report"; }
+
+cargo build --release --locked -p agent-history-cli
+bin="$(pwd)/target/release/agent-history"
+[ -x "$bin" ] || die "release binary not found at $bin"
+
+db_dir="$work/db"
+db="$db_dir/index.sqlite"
+case "$db" in
+  "$HOME/Library/Application Support/Herdr Agent History"*) die "refusing to use the shared install directory" ;;
+esac
+
+default_queries="error function test index search review config install"
+if [ -n "$queries_file" ]; then
+  queries=$(tr '\n' ' ' <"$queries_file")
+else
+  queries=$default_queries
+fi
+
+# --- corpus roots -----------------------------------------------------
+mode_claude=synthetic
+mode_codex=synthetic
+synthetic_root="$work/synthetic"
+mkdir -p "$synthetic_root/claude/projects/measure-fixture" "$synthetic_root/codex/sessions"
+cat >"$synthetic_root/claude/projects/measure-fixture/00000000-0000-4000-8000-000000000001.jsonl" <<'EOF'
+{"type":"user","sessionId":"00000000-0000-4000-8000-000000000001","cwd":"/synthetic/measure","timestamp":"2026-09-14T12:00:00Z","message":{"role":"user","content":"Synthetic fixture question about search relevance and indexing."}}
+{"type":"assistant","sessionId":"00000000-0000-4000-8000-000000000001","cwd":"/synthetic/measure","timestamp":"2026-09-14T12:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"Synthetic fixture answer covering config, review, and test terms."}]}}
+EOF
+cat >"$synthetic_root/codex/sessions/00000000-0000-4000-8000-000000000002.jsonl" <<'EOF'
+{"type":"session_meta","timestamp":"2026-09-14T12:00:00Z","payload":{"id":"00000000-0000-4000-8000-000000000002","cwd":"/synthetic/measure"}}
+{"type":"response_item","timestamp":"2026-09-14T12:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Synthetic fixture install question with an error to search for."}]}}
+{"type":"response_item","timestamp":"2026-09-14T12:00:02Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Synthetic fixture function-level index of the search function."}]}}
+EOF
+
+claude_config_dir_used="$synthetic_root/claude"
+codex_home_used="$synthetic_root/codex"
+if [ -n "$claude_config_dir" ]; then
+  [ -d "$claude_config_dir" ] || die "--claude-config-dir does not exist: $claude_config_dir"
+  claude_config_dir_used=$claude_config_dir
+  mode_claude=real
+fi
+if [ -n "$codex_home" ]; then
+  [ -d "$codex_home" ] || die "--codex-home does not exist: $codex_home"
+  codex_home_used=$codex_home
+  mode_codex=real
+fi
+
+raw_bytes=$(find -L "$claude_config_dir_used/projects" "$codex_home_used/sessions" "$codex_home_used/archived_sessions" \
+  -type f -name '*.jsonl' -exec stat -f%z {} + 2>/dev/null | awk '{s+=$1} END{print s+0}')
+raw_files=$(find -L "$claude_config_dir_used/projects" "$codex_home_used/sessions" "$codex_home_used/archived_sessions" \
+  -type f -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')
+
+# --- timing helpers -----------------------------------------------------
+run_timed() {
+  # $1 = output file prefix, remaining args = command to time
+  prefix=$1; shift
+  set +e
+  /usr/bin/time -l "$@" >"$prefix.out" 2>"$prefix.time"
+  status=$?
+  set -e
+  return $status
+}
+real_ms() { awk '/ real /{print $1*1000; exit} / real$/{print $1*1000; exit}' "$1.time" 2>/dev/null; }
+max_rss() { awk '/maximum resident set size/{print $1; exit}' "$1.time" 2>/dev/null; }
+index_summary() { grep -Eo 'indexed [0-9]+ files \([0-9]+ failed\), [0-9]+ records \([0-9]+ bytes, [0-9]+ chunks; [0-9]+ malformed\)' "$1.out" 2>/dev/null || true; }
+still_running() { pgrep -f "$bin" >/dev/null 2>&1 && echo yes || echo no; }
+
+emit "== host =="
+emit "date_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+emit "os=$(sw_vers -productVersion 2>/dev/null || echo unknown) build=$(sw_vers -buildVersion 2>/dev/null || echo unknown)"
+emit "arch=$(uname -m)"
+emit "cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
+emit "memsize_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo unknown)"
+emit "rustc=$(rustc --version)"
+emit "cargo=$(cargo --version)"
+emit "git_commit=$(git rev-parse HEAD)"
+emit "release_profile=cargo default (no [profile.release] override in Cargo.toml)"
+emit "claude_mode=$mode_claude codex_mode=$mode_codex"
+emit "raw_jsonl_files=$raw_files raw_jsonl_bytes=$raw_bytes"
+
+# --- phase A: initial index (real roots, read-only) ---------------------
+emit ""
+emit "== phase A: initial index =="
+if ! run_timed "$work/a" env CLAUDE_CONFIG_DIR="$claude_config_dir_used" CODEX_HOME="$codex_home_used" "$bin" index --db "$db"; then
+  die "initial index failed, see $work/a.out and $work/a.time"
+fi
+emit "wall_ms=$(real_ms "$work/a")"
+emit "max_rss_bytes=$(max_rss "$work/a")"
+emit "$(index_summary "$work/a")"
+emit "process_still_running=$(still_running)"
+
+# --- phase B: second-pass rescan over the same real roots. This mostly
+# characterizes discovery cost at full file count (stat/hash comparison of
+# every already-indexed file); it is only exactly zero-byte if nothing in
+# the corpus changed between phase A and phase B, which is not guaranteed
+# when the roots include a history that a live session is still writing to.
+emit ""
+emit "== phase B: second-pass rescan (discovery cost at full file count) =="
+if ! run_timed "$work/b" env CLAUDE_CONFIG_DIR="$claude_config_dir_used" CODEX_HOME="$codex_home_used" "$bin" index --db "$db"; then
+  die "rescan failed, see $work/b.out and $work/b.time"
+fi
+emit "wall_ms=$(real_ms "$work/b")"
+emit "max_rss_bytes=$(max_rss "$work/b")"
+emit "$(index_summary "$work/b")"
+emit "process_still_running=$(still_running)"
+
+# --- phase C: isolated single-file incremental append -------------------
+emit ""
+emit "== phase C: isolated incremental append =="
+incroot="$work/increment"
+mkdir -p "$incroot/claude/projects" "$incroot/codex/sessions"
+claude_seed=$(find -L "$claude_config_dir_used/projects" -type f -name '*.jsonl' -exec stat -f '%z %N' {} + 2>/dev/null | sort -n | head -1 | cut -d' ' -f2-)
+codex_seed=$(find -L "$codex_home_used/sessions" -type f -name '*.jsonl' -exec stat -f '%z %N' {} + 2>/dev/null | sort -n | head -1 | cut -d' ' -f2-)
+[ -n "$claude_seed" ] || claude_seed="$synthetic_root/claude/projects/measure-fixture/00000000-0000-4000-8000-000000000001.jsonl"
+[ -n "$codex_seed" ] || codex_seed="$synthetic_root/codex/sessions/00000000-0000-4000-8000-000000000002.jsonl"
+cp "$claude_seed" "$incroot/claude/projects/seed.jsonl"
+cp "$codex_seed" "$incroot/codex/sessions/seed.jsonl"
+emit "claude_seed_bytes=$(stat -f%z "$claude_seed")"
+emit "codex_seed_bytes=$(stat -f%z "$codex_seed")"
+
+if ! run_timed "$work/c1" "$bin" index --db "$db" --claude-root "$incroot/claude/projects" --codex-root "$incroot/codex/sessions"; then
+  die "initial isolated index failed, see $work/c1.out and $work/c1.time"
+fi
+emit "isolated_initial_wall_ms=$(real_ms "$work/c1")"
+emit "$(index_summary "$work/c1")"
+
+sentinel="agenthistorybenchmarkappend$(date +%s)"
+now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+append_claude='{"type":"user","timestamp":"'"$now"'","message":{"role":"user","content":"Incremental append marker '"$sentinel"'-claude"}}'
+append_codex='{"type":"response_item","timestamp":"'"$now"'","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Incremental append marker '"$sentinel"'-codex"}]}}'
+printf '%s\n' "$append_claude" >>"$incroot/claude/projects/seed.jsonl"
+printf '%s\n' "$append_codex" >>"$incroot/codex/sessions/seed.jsonl"
+append_bytes=$(( $(printf '%s\n' "$append_claude" | wc -c) + $(printf '%s\n' "$append_codex" | wc -c) ))
+emit "append_bytes=$append_bytes"
+
+if ! run_timed "$work/c2" "$bin" index --db "$db" --claude-root "$incroot/claude/projects" --codex-root "$incroot/codex/sessions"; then
+  die "incremental append index failed, see $work/c2.out and $work/c2.time"
+fi
+emit "incremental_wall_ms=$(real_ms "$work/c2")"
+emit "$(index_summary "$work/c2")"
+
+set +e
+found=$("$bin" search --db "$db" --role all "$sentinel" 2>/dev/null | wc -l | tr -d ' ')
+set -e
+emit "sentinel_search_hits=$found"
+emit "process_still_running=$(still_running)"
+
+# --- phase D: storage decomposition --------------------------------------
+emit ""
+emit "== phase D: storage decomposition (private db, after phases A-C) =="
+page_count=$(sqlite3 "$db" 'PRAGMA page_count;')
+freelist_count=$(sqlite3 "$db" 'PRAGMA freelist_count;')
+page_size=$(sqlite3 "$db" 'PRAGMA page_size;')
+chunk_text_bytes=$(sqlite3 "$db" 'SELECT COALESCE(SUM(length(text)),0) FROM search_chunks;')
+sessions_count=$(sqlite3 "$db" 'SELECT COUNT(*) FROM sessions;')
+chunks_count=$(sqlite3 "$db" 'SELECT COUNT(*) FROM search_chunks;')
+db_file_bytes=0
+for suffix in "" "-wal" "-shm"; do
+  [ -f "$db$suffix" ] && db_file_bytes=$((db_file_bytes + $(stat -f%z "$db$suffix")))
+done
+live_bytes=$(( (page_count - freelist_count) * page_size ))
+total_page_bytes=$(( page_count * page_size ))
+emit "sessions=$sessions_count chunks=$chunks_count"
+emit "page_count=$page_count freelist_count=$freelist_count page_size=$page_size"
+emit "total_page_bytes=$total_page_bytes live_bytes=$live_bytes free_pct=$(awk -v f="$freelist_count" -v p="$page_count" 'BEGIN{printf "%.1f", (p>0?100*f/p:0)}')"
+emit "chunk_text_bytes=$chunk_text_bytes"
+emit "db_file_bytes_incl_wal_shm=$db_file_bytes"
+if [ "$raw_bytes" -gt 0 ]; then
+  emit "sqlite_file_to_raw_ratio=$(awk -v a="$db_file_bytes" -v b="$raw_bytes" 'BEGIN{printf "%.4f", a/b}')"
+  emit "sqlite_live_to_raw_ratio=$(awk -v a="$live_bytes" -v b="$raw_bytes" 'BEGIN{printf "%.4f", a/b}')"
+  emit "chunk_text_to_raw_ratio=$(awk -v a="$chunk_text_bytes" -v b="$raw_bytes" 'BEGIN{printf "%.6f", a/b}')"
+fi
+
+# --- phase E: search p50/p95 ---------------------------------------------
+emit ""
+emit "== phase E: search latency (cold CLI invocation: process spawn + db open + FTS query) =="
+emit "query_set=$queries"
+search_pl="$work/search_timing.pl"
+cat >"$search_pl" <<'PERL'
+use strict;
+use warnings;
+use Time::HiRes qw(time);
+
+my $bin = shift @ARGV;
+my $db = shift @ARGV;
+my $reps = shift @ARGV;
+my @queries = @ARGV;
+die "no queries given\n" unless @queries;
+
+open(my $saved_out, ">&STDOUT") or die $!;
+open(my $saved_err, ">&STDERR") or die $!;
+open(STDOUT, ">", "/dev/null") or die $!;
+open(STDERR, ">", "/dev/null") or die $!;
+
+my @ms;
+for (my $r = 0; $r < $reps; $r++) {
+    for my $q (@queries) {
+        my $t0 = time();
+        my $rc = system($bin, "search", "--db", $db, "--role", "all", $q);
+        my $t1 = time();
+        open(STDOUT, ">&", $saved_out) or die $!;
+        open(STDERR, ">&", $saved_err) or die $!;
+        die "search failed for a query, exit status $rc\n" if $rc != 0;
+        open(STDOUT, ">", "/dev/null") or die $!;
+        open(STDERR, ">", "/dev/null") or die $!;
+        push @ms, ($t1 - $t0) * 1000.0;
+    }
+}
+open(STDOUT, ">&", $saved_out) or die $!;
+open(STDERR, ">&", $saved_err) or die $!;
+
+@ms = sort { $a <=> $b } @ms;
+my $n = scalar @ms;
+sub pct {
+    my ($p) = @_;
+    my $idx = int($n * $p / 100);
+    $idx = $n - 1 if $idx >= $n;
+    return $ms[$idx];
+}
+printf "search_samples=%d\n", $n;
+printf "search_p50_ms=%.3f\n", pct(50);
+printf "search_p95_ms=%.3f\n", pct(95);
+printf "search_min_ms=%.3f\n", $ms[0];
+printf "search_max_ms=%.3f\n", $ms[$n-1];
+PERL
+perl "$search_pl" "$bin" "$db" 5 $queries | tee -a "$report"
+emit "process_still_running=$(still_running)"
+
+# --- phase F: CLI/process-spawn overhead baseline (no query work) -------
+emit ""
+emit "== phase F: CLI overhead baseline (process spawn + db open, no query) =="
+overhead_pl="$work/overhead_timing.pl"
+cat >"$overhead_pl" <<'PERL'
+use strict;
+use warnings;
+use Time::HiRes qw(time);
+
+my $bin = shift @ARGV;
+my $db = shift @ARGV;
+my $reps = shift @ARGV;
+
+open(my $saved_out, ">&STDOUT") or die $!;
+open(my $saved_err, ">&STDERR") or die $!;
+open(STDOUT, ">", "/dev/null") or die $!;
+open(STDERR, ">", "/dev/null") or die $!;
+
+my @ms;
+for (my $r = 0; $r < $reps; $r++) {
+    my $t0 = time();
+    my $rc = system($bin, "status", "--db", $db);
+    my $t1 = time();
+    open(STDOUT, ">&", $saved_out) or die $!;
+    open(STDERR, ">&", $saved_err) or die $!;
+    die "status failed, exit status $rc\n" if $rc != 0;
+    open(STDOUT, ">", "/dev/null") or die $!;
+    open(STDERR, ">", "/dev/null") or die $!;
+    push @ms, ($t1 - $t0) * 1000.0;
+}
+open(STDOUT, ">&", $saved_out) or die $!;
+open(STDERR, ">&", $saved_err) or die $!;
+
+@ms = sort { $a <=> $b } @ms;
+my $n = scalar @ms;
+printf "overhead_samples=%d\n", $n;
+printf "overhead_median_ms=%.3f\n", $ms[int($n/2)];
+printf "overhead_min_ms=%.3f\n", $ms[0];
+printf "overhead_max_ms=%.3f\n", $ms[$n-1];
+PERL
+perl "$overhead_pl" "$bin" "$db" 20 | tee -a "$report"
+emit "process_still_running=$(still_running)"
+
+if [ -n "$out_dir" ]; then
+  mkdir -p "$out_dir"
+  cp "$report" "$out_dir/real-corpus-report.txt"
+  echo "measure-real-corpus: report copied to $out_dir/real-corpus-report.txt" >&2
+fi

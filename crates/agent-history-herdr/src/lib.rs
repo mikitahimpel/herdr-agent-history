@@ -53,7 +53,14 @@ where
     let matches = agents.iter().filter(|agent| {
         agent.workspace_id == workspace.id
             && agent.agent == session.id.agent
-            && agent.session_id.as_ref() == Some(&session.id)
+            && match &agent.session_id {
+                Some(reported) => reported == &session.id,
+                // Herdr's Codex integration reports a native session ID only
+                // when Codex creates a session, not when it resumes one. A pane
+                // this integration started carries the session ID in its agent
+                // name, so that name identifies the exact session instead.
+                None => agent.name.as_deref() == Some(plan.agent_name.as_str()),
+            }
     });
     let mut matching = matches.collect::<Vec<_>>();
     if matching.len() > 1 {
