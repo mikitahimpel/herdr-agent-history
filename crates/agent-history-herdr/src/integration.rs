@@ -83,8 +83,23 @@ impl<H> HerdrIntegration<H> {
             return Ok(());
         }
         resume_in_host(&mut self.host, &session)?;
-        state.closed = true;
+        // The browser stays open so one search can resume several sessions.
+        // Herdr focuses the resumed pane, so this is what the user sees on return.
+        state.notice = Some(resumed_notice(&session));
         Ok(())
+    }
+}
+
+/// Names the session that was resumed, so returning to the browser explains
+/// what happened rather than looking as though nothing did.
+fn resumed_notice(session: &agent_history_core::Session) -> String {
+    let agent = match session.id.agent {
+        agent_history_core::Agent::Claude => "Claude",
+        agent_history_core::Agent::Codex => "Codex",
+    };
+    match session.repository.as_deref() {
+        Some(repository) => format!("Resumed {agent} session in {repository}"),
+        None => format!("Resumed {agent} session"),
     }
 }
 
@@ -191,7 +206,8 @@ impl<H: HostRuntime> Integration for HerdrIntegration<H> {
                     let mut session = self.session(state, store)?;
                     session.cwd = session.repository_root.clone();
                     resume_in_host(&mut self.host, &session)?;
-                    state.closed = true;
+                    state.mode = Mode::Results;
+                    state.notice = Some(resumed_notice(&session));
                     Ok(true)
                 }
                 Key::Char('v') => {
@@ -340,7 +356,10 @@ mod tests {
         assert!(s.preview.contains("User: portfolio"));
         s.handle(Key::Esc, &db).unwrap();
         enter(&mut s, &db, &mut i);
-        assert!(s.closed);
+        // Resuming leaves the browser open so one search can resume more than
+        // one session; the notice is what the user sees on returning to it.
+        assert!(!s.closed);
+        assert!(s.notice.as_deref().is_some_and(|n| n.contains("Resumed")));
         assert_eq!(s.query, "portfolio visibility");
     }
     #[test]
@@ -445,7 +464,13 @@ mod tests {
         search(&mut s, &db);
         enter(&mut s, &db, &mut i);
         i.handle(Key::Char('r'), &mut s, &db).unwrap();
-        assert!(s.closed);
+        assert!(!s.closed);
+        assert_eq!(
+            s.mode,
+            Mode::Results,
+            "recovery returns to the results list"
+        );
+        assert!(s.notice.as_deref().is_some_and(|n| n.contains("Resumed")));
         assert_eq!(i.host().effects, ["list", "open", "resume"]);
         assert_eq!(i.host().session.clone().unwrap().cwd, Some(root));
     }
@@ -483,7 +508,8 @@ mod tests {
         assert!(i.host().effects.is_empty());
         i.handle(Key::Char('w'), &mut s, &db).unwrap();
         i.handle(Key::Char('y'), &mut s, &db).unwrap();
-        assert!(s.closed);
+        assert!(!s.closed);
+        assert!(s.notice.as_deref().is_some_and(|n| n.contains("Resumed")));
         assert_eq!(i.host().effects, ["list", "open", "resume"]);
         assert_eq!(
             fs::read_to_string(target.join("tracked")).unwrap(),
