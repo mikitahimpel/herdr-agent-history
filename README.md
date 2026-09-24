@@ -32,9 +32,20 @@ A local 0.1.0 candidate implements the CLI, terminal overlay, SQLite indexing, a
 
 ## Download
 
-Download the Apple Silicon macOS package from [v0.1.0-rc.1](https://github.com/mikitahimpel/herdr-agent-history/releases/tag/v0.1.0-rc.1). This is a prerelease; native resume and clean-user installation acceptance remain pending. Intel macOS, Windows, and Linux binaries are not included.
+**[Download for Apple Silicon macOS — v0.1.0-rc.2](https://github.com/mikitahimpel/herdr-agent-history/releases/latest)**
 
-Extract `agent-history-macos-arm64.tar.gz`, open a terminal in the extracted `agent-history` folder, and run `./install` (standalone) or `./install --with-herdr` (optional integration). Add `~/.local/bin` to your PATH, then run `agent-history browse`. See below for Herdr plugin registration.
+```sh
+tar -xzf agent-history-macos-arm64.tar.gz
+cd agent-history
+./install                # standalone
+./install --with-herdr   # also the Herdr integration and plugin
+export PATH="$HOME/.local/bin:$PATH"
+agent-history browse
+```
+
+Verify the download with `shasum -a 256 -c agent-history-macos-arm64.tar.gz.sha256`. See below for Herdr plugin registration.
+
+This is a prerelease. Claude resume is verified live on macOS; Codex resume is verified only by conversation replay, and clean-user installation acceptance remains pending. Apple Silicon only — no Intel, Windows or Linux binaries.
 
 ## Build and install
 
