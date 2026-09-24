@@ -52,7 +52,7 @@ pub fn draw(frame: &mut Frame, state: &mut BrowserState, integration: &impl Inte
         );
         return;
     }
-    let message_height = u16::from(state.error.is_some());
+    let message_height = u16::from(state.error.is_some() || state.notice.is_some());
     let [header, search, filters, body, message, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(3),
@@ -81,14 +81,23 @@ pub fn draw(frame: &mut Frame, state: &mut BrowserState, integration: &impl Inte
     if state.mode == Mode::Action {
         draw_action(frame, body, &integration.action_lines(), &p);
     }
-    if let Some(error) = &state.error {
+    // An error outranks a notice: a failure matters more than a confirmation.
+    if let Some((glyph, text, style)) =
+        state
+            .error
+            .as_ref()
+            .map(|e| (" ✗ ", e, p.error()))
+            .or_else(|| {
+                state
+                    .notice
+                    .as_ref()
+                    .map(|n| (" ✓ ", n, Style::new().fg(p.green)))
+            })
+    {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(" ✗ ", p.error()),
-                Span::styled(
-                    safe(error, message.width.saturating_sub(3).into()),
-                    p.error(),
-                ),
+                Span::styled(glyph, style),
+                Span::styled(safe(text, message.width.saturating_sub(3).into()), style),
             ])),
             message,
         );
@@ -298,10 +307,9 @@ fn date(r: &SearchResult) -> String {
 }
 
 fn context_spans(r: &SearchResult, p: &Palette) -> Vec<Span<'static>> {
-    let repo = r
-        .repository
-        .as_deref()
-        .map(|a| a.rsplit('/').next().unwrap_or(a).to_string());
+    // Already a short `owner/name` label rather than a path, and the owner
+    // distinguishes same-named repositories, so it is shown whole.
+    let repo = r.repository.clone();
     match (repo, r.branch.clone()) {
         (Some(repo), Some(branch)) => vec![
             Span::styled(repo, Style::new().fg(p.text)),

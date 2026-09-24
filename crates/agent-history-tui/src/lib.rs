@@ -133,6 +133,10 @@ pub struct BrowserState {
     /// First result shown in the results pane.
     pub list_offset: usize,
     pub error: Option<String>,
+    /// Confirms something that happened elsewhere, such as a resumed session.
+    /// The host usually takes focus at that moment, so without this the browser
+    /// would look as though nothing had happened. Cleared by the next keystroke.
+    pub notice: Option<String>,
     pub closed: bool,
     pub status: String,
     pub role_filter: RoleFilter,
@@ -570,6 +574,9 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
             terminal::set_mouse_capture(&mut io::stdout(), state.mouse_capture)?;
             continue;
         }
+        // A confirmation describes the keystroke that caused it, so it is
+        // cleared before the next one rather than lingering over new results.
+        state.notice = None;
         if let Some(key) = map_key(k.code) {
             let handled = match integration.handle(key, &mut state, &store) {
                 Ok(handled) => handled,

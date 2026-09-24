@@ -2,6 +2,30 @@
 
 Local Claude Code and Codex conversation search for macOS. Search and preview work independently; optional Herdr integration adds session resume and worktree recovery.
 
+![Agent History searching past Claude and Codex sessions](docs/media/agent-history.png)
+
+*Running inside Herdr, so colors follow the configured Herdr theme and Enter resumes the selected session. The conversations shown are fictional fixtures, not captured history.*
+
+## Two ways to run it
+
+Agent History runs **with or without Herdr**. Searching, previewing and indexing never need Herdr, a running coding agent, or a network connection — they read the native transcript files already on disk.
+
+| | Standalone | Inside Herdr |
+| --- | --- | --- |
+| Command | `agent-history browse` (or `agent-history-overlay`) | `agent-history-herdr`, usually via the plugin pane |
+| Search, role filters, preview | yes | yes |
+| <kbd>Enter</kbd> | opens the conversation preview | resumes that Claude or Codex session |
+| Worktree recovery | not offered | offered, and never mutates Git without confirmation |
+| Colors | your terminal's own palette | the theme from Herdr's `config.toml` |
+| Requires | nothing but the binary | Herdr, plus the matching agent executable to resume |
+
+The standalone build has no dependency on the Herdr crate and does not read Herdr's configuration; the two entry points simply share the same index. Install the integration only if you want it:
+
+```sh
+./install                # standalone only
+./install --with-herdr   # also installs the integration and plugin
+```
+
 ## Status
 
 A local 0.1.0 candidate implements the CLI, terminal overlay, SQLite indexing, and confirmed worktree recovery. **V1 is not released:** real native-agent resume in Herdr and clean-user macOS installation acceptance remain pending. See [release status](docs/RELEASE_STATUS.md), [indexing limitations](docs/INDEXING.md), and [synthetic performance measurements](docs/PERFORMANCE.md).
@@ -50,6 +74,8 @@ cargo build --release -p agent-history-cli
 ```
 
 The existing `./target/release/agent-history-overlay` launch command is also standalone. Use `agent-history-herdr` inside a Herdr-managed pane when you want Enter to resume. Its title and controls identify that integration explicitly.
+
+Both builds share one keyboard model: type to search, **Down/Tab** focuses results, **Space** previews, **F2** cycles the role filter, **F3** toggles mouse capture, and **Esc** goes back. The mouse is additive — click a pane to focus it, click a result to select it, and scroll the pane under the pointer. Because capturing the mouse takes drag-to-select away from your terminal, **F3** hands it back; most terminals also keep selection available while holding **Shift** (iTerm2, Terminal.app, kitty, WezTerm) or **Option** (Alacritty).
 
 ```sh
 agent-history index
