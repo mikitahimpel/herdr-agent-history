@@ -36,16 +36,29 @@ if $with_herdr; then
   fi
   if [ -z "$plugin_source" ]; then echo "install: --with-herdr requested but the Herdr plugin manifest is missing" >&2; exit 2; fi
 fi
+# Replace the directory entry rather than writing through it. macOS validates a
+# code signature against the inode it already mapped, so overwriting a binary in
+# place leaves the next launch with a signature that no longer matches its
+# contents, and the kernel kills it on sight. A rename swaps the name onto a
+# fresh inode instead, and is atomic for anything reading the old one.
+install_file() {
+	src=$1
+	dest=$2
+	mode=$3
+	tmp="$dest.install.$$"
+	cp "$src" "$tmp"
+	chmod "$mode" "$tmp"
+	mv -f "$tmp" "$dest"
+}
+
 mkdir -p "$prefix"
-cp "$source_dir/agent-history" "$prefix/agent-history"
-cp "$source_dir/agent-history-overlay" "$prefix/agent-history-overlay"
-chmod 755 "$prefix/agent-history" "$prefix/agent-history-overlay"
+install_file "$source_dir/agent-history" "$prefix/agent-history" 755
+install_file "$source_dir/agent-history-overlay" "$prefix/agent-history-overlay" 755
 if $with_herdr; then
   plugin_dir="$prefix/../share/agent-history/plugin"
   mkdir -p "$plugin_dir"
-  cp "$source_dir/agent-history-herdr" "$prefix/agent-history-herdr"
-  chmod 755 "$prefix/agent-history-herdr"
-  cp "$plugin_source" "$plugin_dir/herdr-plugin.toml"
+  install_file "$source_dir/agent-history-herdr" "$prefix/agent-history-herdr" 755
+  install_file "$plugin_source" "$plugin_dir/herdr-plugin.toml" 644
   echo "installed Agent History CLI, overlay, and Herdr integration in $prefix"
   printf 'Link the plugin from a Herdr-managed pane: herdr plugin link "%s"\n' "$plugin_dir"
 else

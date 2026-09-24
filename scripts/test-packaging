@@ -46,6 +46,20 @@ test "$(cat "$tmp/native-history")" = native
 if PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" --unknown "$tmp/default-prefix" >/dev/null 2>&1; then exit 1; fi
 if sh "$package/uninstall" relative >/dev/null 2>&1; then exit 1; fi
 
+# Reinstalling over an existing install must replace the binary by rename, not
+# write through the inode: macOS kills a binary whose signature no longer matches
+# the pages it already mapped, so an in-place overwrite only breaks on upgrade
+# and never on a clean install.
+reinstall_prefix="$tmp/reinstall-prefix"
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" "$reinstall_prefix" >/dev/null
+first_inode=$(ls -i "$reinstall_prefix/agent-history" | awk '{print $1}')
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" "$reinstall_prefix" >/dev/null
+second_inode=$(ls -i "$reinstall_prefix/agent-history" | awk '{print $1}')
+test "$first_inode" != "$second_inode"
+test -x "$reinstall_prefix/agent-history"
+# No temporary file is left behind by either install.
+test -z "$(find "$reinstall_prefix" -name '*.install.*' -print -quit)"
+
 # Packaging refuses to overwrite an existing archive and preserves neighbors.
 printf marker > "$tmp/out/keep"
 printf old > "$tmp/out/agent-history-macos-arm64.tar.gz"
