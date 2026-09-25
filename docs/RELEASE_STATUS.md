@@ -1,6 +1,6 @@
-# V1 release status — 0.1.0-rc.1 prerelease
+# V1 release status — 0.1.0-rc.2 prerelease
 
-Stable V1 is **not released** and GitHub issue #13 remains open. The 0.1.0-rc.1 prerelease is intended for testing on another Apple Silicon Mac; publication does not establish the remaining acceptance criteria. The repository now contains a working local CLI, terminal overlay, verified-source preview, host resume adapter, confirmed Git worktree recreation, installable package scripts, and synthetic measurements. Implementation and local tests do not establish native-agent resume compatibility or clean-user installation acceptance.
+Stable V1 is **not released** and GitHub issue #13 remains open. The 0.1.0-rc.2 prerelease is intended for testing on another Apple Silicon Mac; publication does not establish the remaining acceptance criteria. The repository now contains a working local CLI, terminal overlay, verified-source preview, host resume adapter, confirmed Git worktree recreation, installable package scripts, and synthetic measurements. Implementation and local tests do not establish native-agent resume compatibility or clean-user installation acceptance.
 
 ## Architecture
 
@@ -20,8 +20,8 @@ Stable V1 is **not released** and GitHub issue #13 remains open. The 0.1.0-rc.1 
 | #9 Native resume | UUID-only argv, source validation, official session provenance, no plain-session fallback; live macOS resume of both agents after process exit, with resumed turns appended to the original transcript and session ID | Codex could not produce a post-resume model turn (account usage limit); historical sessions with absent or non-UUID native IDs remain unexercised |
 | #6 Herdr | Functional terminal overlay, confirmed isolated Git recovery; live active/closed workspace resume, deleted-worktree recreation, unavailable-repository handling, and the linked plugin overlay route | A Herdr-rendered native overlay is still outside plugin v1; overlay placement remains a terminal pane |
 | #11 Safeguards | Private index, safe open/sidecar rejection, rollback/corruption errors, confirmed recovery | Broader security review; see documented source-mutation limits |
-| #10 Packaging | Apple Silicon archive/checksum, extracted installer, durable plugin path, isolated smoke | Clean-user Mac installation and GitHub release artifacts |
-| #12 Documentation | README, indexing/privacy/recovery notes, plugin guide, benchmark and troubleshooting | Real UI screenshots/native acceptance evidence |
+| #10 Packaging | Apple Silicon archive/checksum published as GitHub prereleases rc.1 and rc.2; extracted installer, durable plugin path, isolated smoke; the published rc.2 artifact installed, upgraded and uninstalled with no toolchain or checkout (see the clean-install simulation below) | Installation on a second Mac or fresh user account; unnotarized binaries are blocked by Gatekeeper when browser-downloaded and Finder-extracted, currently handled by a documented manual step |
+| #12 Documentation | README, indexing/privacy/recovery notes, plugin guide, benchmark and troubleshooting; install and first-run path walked literally from the release page in a stripped environment, with gaps fixed | A new user following the documentation alone on a clean machine, through resume |
 | #13 Release gate | Local quality gate, synthetic integration evidence, and scenarios 5-8 executed live against a running Herdr host for both agents | Scenarios 1-4 and 9-10 on a real installation, clean-user macOS installation, and remote CI/branch protection; no release tag |
 
 All GitHub issues were inspected as the source backlog. No issue is closed by this prerelease. GitHub CI passed on integration commit `3dc90cf`; branch protection has not been verified. The integration work is being promoted to `main` for prerelease distribution.
@@ -154,6 +154,91 @@ it and consumes it:
   `Command::new("git")` fails the gate instead of silently reintroducing the
   defect.
 
+## Clean-install simulation (September 25)
+
+Issues #10 and #12 require installation on a clean Mac and a newcomer following
+the documentation alone. Neither was possible here: there was no second Mac and
+no fresh macOS user account. This run instead removed every advantage the
+development machine has and followed the README literally. **It does not close
+either criterion.**
+
+### Conditions
+
+- The published v0.1.0-rc.2 assets were downloaded with `curl`, not built; the
+  archive's SHA-256 (`3050d9cb…3f04c`) matched the published `.sha256`. The
+  published rc.1 assets were downloaded the same way for the upgrade check.
+- Every command ran under `env -i` with a scratch `HOME` holding only synthetic
+  Claude and Codex fixtures at the native default locations, and
+  `PATH=/usr/bin:/bin:/usr/sbin:/sbin`: no Rust toolchain and no repository
+  checkout reachable. Installs went to the scratch `HOME`'s `~/.local/bin` and to
+  isolated `--prefix` directories. The real `~/.claude`, `~/.codex`, shared index
+  and `~/.local/bin` were not read or written.
+- macOS 26.6.2 (25G83), Apple Silicon, Gatekeeper assessments enabled.
+
+### Verified
+
+- **Install → index → search → preview → browse, from the release alone.**
+  Default-root and explicit `--claude-root`/`--codex-root`/`--db` indexing found
+  both fixtures; term, phrase, prefix and `--role` searches returned the expected
+  rows; `preview` showed both conversations; `browse` in a 140×40 PTY searched,
+  previewed with Space and exited with status 0. Fixture hashes were unchanged.
+- **Upgrade over an existing install, published artifacts only.** rc.1 was
+  installed with `--with-herdr` and run, then rc.2 installed over it, then rc.2
+  over itself, with nothing removed in between. Every install produced new
+  inodes, every binary launched (none SIGKILLed), `codesign -v` passed, and an
+  index built by rc.1 was read by rc.2 with identical counts. rc.1 refuses an
+  index written by rc.2 with an explicit schema-version error.
+- **Uninstall.** `./uninstall` removed the three binaries and the plugin manifest
+  from both the default and an isolated prefix, kept the index and the native
+  fixtures, and was idempotent.
+
+### Found and fixed in the documentation
+
+- **Release blocker — Gatekeeper.** With `com.apple.quarantine` set on the archive
+  as a browser sets it, command-line `tar` did not propagate the attribute, but
+  extracting with Finder's Archive Utility put it on every file, and `./install`
+  copied it into the prefix. Launching either copy printed `Killed: 9` (exit 137)
+  and macOS showed “agent-history” Not Opened / “Apple could not verify
+  “agent-history” is free of malware that may harm your Mac or compromise your
+  privacy.”, whose highlighted button moves the binary to the Trash. The system
+  log recorded `Terminating process due to Gatekeeper rejection`. Clearing the
+  attribute on the extracted folder, on the archive before extraction, or on the
+  installed binaries each fixed it, as did downloading with `curl`. The README
+  now leads with the `curl` path and documents the remedy; TROUBLESHOOTING covers
+  the symptom. Notarizing the binaries would remove the manual step and remains
+  open.
+- The download link pointed at `releases/latest`, which only redirects to the
+  release list because GitHub never treats a prerelease as latest; the matching
+  `releases/latest/download/…` asset URL returns 404. It now links the tag.
+- The README never said to download the `.sha256` file and placed verification
+  after extraction.
+- `export PATH=…` was presented without saying it lasts only for one window.
+- `preview` needs a session ID, but nothing said where it comes from; search
+  output columns were undocumented. Search with no matches prints nothing, and
+  `indexed 0 files` does not say where it looked; the default roots were never
+  stated.
+- Building from source (Rust toolchain, `cargo build`) was interleaved with the
+  release instructions; `./uninstall` needs the extracted folder and the same
+  prefix, with no fallback documented.
+
+### Not fixed here (code, outside this documentation change)
+
+- `agent-history --version` prints `0.1.0`, not the prerelease tag.
+- `agent-history-overlay` and `agent-history-herdr` print errors as a Rust debug
+  structure (`Error: Custom { kind: Other, error: "…" }`).
+- Uninstall leaves the empty `share/agent-history/plugin` directory behind.
+
+### Still requires a second Mac or a fresh user account
+
+- A first launch on a machine whose Gatekeeper has never seen these binaries,
+  including whether **Privacy & Security → Open Anyway** is offered for them.
+- Safari's default *open safe files after downloading* behavior, which may
+  decompress the archive itself; only Archive Utility extraction was reproduced.
+- A newcomer following the README without the author's knowledge. This run
+  followed it literally, but by someone who knows the code.
+- A real history of useful size: fixtures here are two synthetic sessions.
+- Resume from Herdr, tracked by #9 and #13.
+
 ## Exact external blocker and next step
 
 Codex could not produce a *new* model turn after resume: this machine's Codex
@@ -176,3 +261,4 @@ those results before tagging stable V1; mocked tests are not substitutes.
 - The overlay is a terminal plugin, not an in-process native Herdr widget. Herdr 0.7.1 is the target; later CLI changes require compatibility work.
 - Safe worktree recreation uses the captured commit in detached HEAD state; it does not recreate uncommitted changes or reconstruct unavailable commits.
 - The package is a testing prerelease; clean-user installation acceptance remains pending.
+- The binaries are not notarized. A browser download extracted in Finder is blocked by Gatekeeper until the quarantine attribute is cleared; see TROUBLESHOOTING.md.
