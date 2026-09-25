@@ -1,6 +1,7 @@
 # Herdr host compatibility evidence
 
-Research date: 2026-09-14; live host validation added 2026-09-20. This records
+Research date: 2026-09-14; live host validation added 2026-09-20; live Codex
+resume check added 2026-09-25. This records
 the installed tools and the local Herdr source that were inspected for issues #6
 (overlay and resume UX) and #9 (native resume compatibility), and the behavior
 observed when the adapter was run against the running host.
@@ -13,7 +14,7 @@ The installed commands report:
 | --- | --- |
 | Herdr CLI | `herdr --version` → `herdr 0.7.1` |
 | Claude Code | `claude --version` → `2.1.278 (Claude Code)` on 2026-09-20 (`2.1.241` when first researched) |
-| Codex CLI | `codex --version` → `codex-cli 0.153.4` |
+| Codex CLI | `codex --version` → `codex-cli 0.157.0` at the end of the 2026-09-25 run (`0.156.1` at its start, before Codex updated itself; `0.153.4` when first researched) |
 | Herdr Claude integration | `herdr integration status` → current, v7 |
 | Herdr Codex integration | `herdr integration status` → current, v6 |
 
@@ -33,9 +34,11 @@ using `pane.report_agent_session`. Claude also reports a transcript path, but
 Herdr's resume planner uses the ID for Claude and Codex.
 
 The two integrations do not report equally. Codex's hook is registered for
-`SessionStart` only (`~/.codex/hooks.json`), and a live pane running
-`codex resume <id>` carries no `agent_session` field in `herdr agent list`;
-Claude's pane reports its session ID on resume as well. The adapter therefore
+`SessionStart` only (`~/.codex/hooks.json`). With Codex 0.153.4, a live pane
+running `codex resume <id>` never carried an `agent_session` field in
+`herdr agent list`. With Codex 0.157.0 (2026-09-25), such a pane reports the
+original session ID only after its first post-resume model turn, and has none
+before that. Claude's pane reports its session ID on resume as well. The adapter therefore
 cannot identify a resumed Codex pane by native session ID. It names every pane
 it starts `agent-history-<native session id>` and falls back to that name when
 the host reports no session ID, while still refusing to match a pane that
@@ -50,7 +53,10 @@ The installed CLI help is direct evidence for these invocations:
 * Claude: `claude --resume <session-id>` (`-r, --resume [value]` accepts a
   session ID).
 * Codex: `codex resume <session-id>` (the positional session ID is a UUID or
-  session name; `--cd <DIR>` selects the working directory).
+  session name; `-C, --cd <DIR>` selects the working directory). Re-confirmed
+  unchanged from `codex resume --help` on 0.156.1 and 0.157.0 on 2026-09-25:
+  `Usage: codex resume [OPTIONS] [SESSION_ID] [PROMPT]`, where "UUIDs take
+  precedence if it parses".
 
 Herdr's source implementation independently constructs exactly those argv
 vectors in `src/agent_resume.rs`:
@@ -70,7 +76,11 @@ and answered a question that only the earlier turn supported; the new turns were
 appended to the original transcript file under the original session ID, so the
 resume continued that conversation rather than starting an unrelated one.
 `codex resume <id>` restored the recorded conversation and warned that the
-session had been recorded under a different model. Deleted-worktree recovery was
+session had been recorded under a different model. The account's usage limit
+blocked a post-resume Codex turn on that date. On 2026-09-25 the same check
+passed for Codex: the resumed agent recalled a beacon phrase that only the
+earlier turn contained. Its new turns were appended to the original rollout
+file under the original session ID, and the original bytes were unchanged. Deleted-worktree recovery was
 exercised for both agents against a disposable repository: the recovery menu
 appears with no host command and no filesystem change, declining leaves the
 checkout absent and the main checkout untouched, and confirming recreates the
@@ -155,9 +165,13 @@ recorded in an ADR before implementation.
   installed versions are current (Claude v7, Codex v6); Herdr 0.7.5's session
   state documentation lists native restore minimums of Claude v6 and Codex v5.
 * Native resume command construction and actual historical resume behavior are
-  both verified on macOS for Claude. Codex resume is verified up to conversation
-  restoration; a post-resume model turn is still unverified because the account
-  is rate limited.
+  verified on macOS for both agents, including a post-resume model turn that
+  answers from the earlier conversation and continues the original transcript.
+* Operational notes for Codex: the first launch in a new directory stops at a
+  folder-trust prompt that saves to `~/.codex/config.toml`. Also, Codex 0.156.1
+  ran `brew upgrade --cask codex` on its own when a resumed pane launched,
+  after an earlier run had recorded a newer version. That process then exited
+  without reaching the conversation, and a second Enter resumed normally.
 * A terminal-pane plugin is implementable against the current host contract.
   A native search overlay is blocked on a Herdr companion change because
   plugin v1 has no native non-terminal UI extension point.

@@ -17,8 +17,8 @@ Stable V1 is **not released** and GitHub issue #13 remains open. The 0.1.0-rc.1 
 | #4 Git context | Main/linked/bare/separate Git directory tests; preserved observations | Index-time metadata is not proof of historical branch state |
 | #5 CLI | Cross-process index/search/status/preview/append tests | Real-history user validation |
 | #8 Core integration | Both agents through discovery → index → search → original preview; synthetic benchmark | Representative private-history validation without committing data |
-| #9 Native resume | UUID-only argv, source validation, official session provenance, no plain-session fallback; live macOS resume of both agents after process exit, with resumed turns appended to the original transcript and session ID | Codex could not produce a post-resume model turn (account usage limit); historical sessions with absent or non-UUID native IDs remain unexercised |
-| #6 Herdr | Functional terminal overlay, confirmed isolated Git recovery; live active/closed workspace resume, deleted-worktree recreation, unavailable-repository handling, and the linked plugin overlay route | A Herdr-rendered native overlay is still outside plugin v1; overlay placement remains a terminal pane |
+| #9 Native resume | UUID-only argv, source validation, official session provenance, no plain-session fallback; live macOS resume of both agents after process exit, each answering from the earlier turn with the new turns appended to the original transcript under the original session ID (Codex on 2026-09-25) | Historical sessions with absent or non-UUID native IDs remain unexercised; the product reports them as unavailable to resume rather than resuming them |
+| #6 Herdr | Functional terminal overlay, confirmed isolated Git recovery; live active/closed workspace resume, deleted-worktree recreation, unavailable-repository handling, the linked plugin overlay route, and Claude/Codex parity through a post-resume model turn | A Herdr-rendered native overlay is still outside plugin v1; overlay placement remains a terminal pane |
 | #11 Safeguards | Private index, safe open/sidecar rejection, rollback/corruption errors, confirmed recovery | Broader security review; see documented source-mutation limits |
 | #10 Packaging | Apple Silicon archive/checksum, extracted installer, durable plugin path, isolated smoke | Clean-user Mac installation and GitHub release artifacts |
 | #12 Documentation | README, indexing/privacy/recovery notes, plugin guide, benchmark and troubleshooting | Real UI screenshots/native acceptance evidence |
@@ -154,16 +154,108 @@ it and consumes it:
   `Command::new("git")` fails the gate instead of silently reintroducing the
   defect.
 
-## Exact external blocker and next step
+## Live Codex resume check (September 25)
 
-Codex could not produce a *new* model turn after resume: this machine's Codex
-account is rate limited until September 22, and every Codex turn returned
-`You've hit your usage limit`. Codex resume was therefore verified by recorded
-conversation replay and by Codex's own recorded-model warning, not by asking the
-resumed agent to recall an earlier fact. Repeat the Claude recall check for
-Codex once credits are available.
+The September 20 run could not get a new Codex model turn after resuming,
+because every turn returned `You've hit your usage limit`. The account limit has
+now expired, and the recall check that Claude passed was repeated for Codex.
+The run was made from a Herdr-managed pane (`HERDR_ENV=1`, workspace `wCB`,
+pane `wCB:p2`) with Herdr `0.7.1`. Codex CLI was `0.156.1` at the start of the
+run and `0.157.0` at the end (see the self-update below). No step was mocked.
 
-The remaining V1 acceptance work is unchanged by this run: issue #13 scenarios
+### Setup
+
+* Disposable repository `/Users/mikitahimpel/Developer/hah-codex-sandbox/repo`
+  with commit `76f0d67` (`sandbox: initial commit`). A Herdr workspace `wCD`
+  was created for it with `herdr workspace create --cwd <repo> --label
+  hah-codex-sandbox`, without `--focus`.
+* Private index `hah-codex-sandbox/state/db/index.sqlite` in a mode-700
+  directory. Every indexing and overlay run passed all three options
+  explicitly: `--db <private db> --claude-root <empty directory>
+  --codex-root ~/.codex/sessions/2026/09/25`. The shared index was not
+  touched and default discovery was never used.
+* Host commands were recorded by setting `HERDR_BIN_PATH` to a wrapper that
+  logs each call and then runs the real `herdr` binary.
+
+### Steps and evidence
+
+1. **Beacon turn.** `herdr agent start hah-codex-beacon --workspace wCD --cwd
+   <repo> --no-focus -- codex "This is a memory test. The beacon phrase is:
+   cobalt-heron-7309. Do not run any commands or edit any files. Reply with
+   exactly one line: BEACON ACKNOWLEDGED."` Codex (PID `21064`, model
+   `gpt-5.6-sol`) replied `BEACON ACKNOWLEDGED.` Herdr reported
+   `agent_session` `01a0d97c-3a5c-72c2-a47e-5ce9549b7401`, and the transcript
+   was `rollout-2026-09-25T18-53-12-01a0d97c-3a5c-72c2-a47e-5ce9549b7401.jsonl`:
+   15 records, 76,533 bytes, SHA-256 `799b087a…abe259dd0d`. Codex was then
+   stopped, and PID `21064` was confirmed gone.
+2. **Index and find.** `agent-history index` reported `indexed 1 files
+   (0 failed), 15 records (76533 bytes, 3 chunks; 0 malformed)`. Searching for
+   `cobalt` in `agent-history-herdr` showed the session as `resumable`.
+3. **Resume with Enter.** The adapter issued `workspace focus wCD`,
+   `agent list`, and `agent start
+   agent-history-01a0d97c-3a5c-72c2-a47e-5ce9549b7401 --workspace wCD --cwd
+   <repo> --focus -- codex resume 01a0d97c-3a5c-72c2-a47e-5ce9549b7401`.
+   The workspace was open but had no live agent. The first attempt did not
+   reach a turn (see the self-update below). On the second Enter the resumed
+   Codex (PID `23179`) replayed the recorded conversation.
+4. **The check.** The resumed Codex was asked: "What was the beacon phrase I
+   gave you earlier in this conversation? Answer with the phrase only. Do not
+   run any commands or read any files." It answered `cobalt-heron-7309`. The
+   appended records contain no tool or shell calls, and the phrase exists only
+   in the earlier turn: it appears nowhere in the repository or the new prompt.
+5. **Continuation, not a fork.** After PID `23179` exited, the same file had
+   grown to 27 records and 90,663 bytes. The first 76,533 bytes still hash to
+   `799b087a…abe259dd0d`, so the change was a pure append. There was still one
+   file under `~/.codex/sessions/2026/09/25`, and `session_index.jsonl` gained
+   no new entry. Re-indexing read only the appended data: `12 records (14130
+   bytes, 3 chunks; 0 malformed)`. Status still showed `sessions: 1`, and an
+   assistant-only search returned `cobalt-heron-7309` under the original ID
+   `01a0d97c-3a5c-72c2-a47e-5ce9549b7401`, at byte range `88217-88707` of the
+   original file.
+6. **No duplicate on 0.157.0.** With a newly resumed pane (`wCD:p8`, PID
+   `24136`) live and not yet reporting `agent_session`, Enter from a freshly
+   started overlay issued `workspace focus wCD`, `agent list`, and
+   `agent focus wCD:p8`, with no `agent start`. It remained one process, and
+   the PID was unchanged. That match relied on the `agent-history-<id>` pane
+   name.
+
+Afterwards workspace `wCD`, which this run had created, was closed.
+
+### Observations from the run
+
+* **The trust prompt blocks a first launch.** In a new directory, Codex
+  0.156.1 will not start until the folder is trusted, and trusting it saves a
+  `[projects."<path>"]` entry to `~/.codex/config.toml`. Neither
+  `-c projects."<path>".trust_level="trusted"` nor `-s read-only -a
+  on-request` skipped the prompt. With the owner's approval the prompt was
+  accepted once. Codex's own changes to `config.toml` were that trust entry and
+  one announcement counter. This affects only the first launch in a new
+  directory; `codex resume` did not prompt again.
+* **Codex updated itself in the middle of the run.** During the beacon turn,
+  Codex recorded `latest_version 0.157.0` in `~/.codex/version.json`. When the
+  first `codex resume` then launched in the resumed pane, it ran
+  `brew upgrade --cask codex`, and the process exited after upgrading
+  (`0.156.1 -> 0.157.0`). No keys were sent to that pane, and why the upgrade
+  ran without a prompt was not established. The transcript was byte-identical
+  afterwards, and the resume contract on 0.157.0 is unchanged. The recall
+  check above ran on 0.157.0 against a session recorded by 0.156.1.
+* **Session reporting on resume changed.** On 0.157.0, a resumed pane *did*
+  report `agent_session` with the original ID after its first model turn. It
+  did not report it before that turn (step 6). So the name-based match is
+  still required. Whether 0.156.1 differed could not be observed, because that
+  binary upgraded itself before the resumed pane ran.
+* **A stale overlay result is refused safely.** An overlay started before the
+  transcript grew rejected Enter with `unsupported: source generation is stale;
+  index again` and issued no host command. Restarting the overlay re-indexed
+  and cleared the error.
+* **A hyphenated query fails in core.** An unrelated defect outside this
+  change: `agent-history search cobalt-heron` fails with `storage error: no such
+  column: heron`. The raw query is passed to FTS5 `MATCH`, where `-` is query
+  syntax. A quoted phrase or a plain word works.
+
+## Next step
+
+Codex no longer blocks issue #9. The remaining V1 acceptance work is unchanged by this run: issue #13 scenarios
 1-4 and 9-10 against a real installation, clean-user macOS installation of the
 Apple Silicon artifact, and verified remote CI and branch protection. Record
 those results before tagging stable V1; mocked tests are not substitutes.
