@@ -59,6 +59,10 @@ impl Options {
         let mut i = 0;
         while i < args.len() {
             let a = &args[i];
+            if a == "--" {
+                o.positional.extend(args[i + 1..].iter().cloned());
+                break;
+            }
             if a == "--role" {
                 i += 1;
                 let value = args
@@ -77,7 +81,11 @@ impl Options {
                 "--db" => &mut o.db,
                 "--claude-root" => &mut o.claude_root,
                 "--codex-root" => &mut o.codex_root,
-                a if a.starts_with('-') => return Err(format!("unknown option '{a}'")),
+                a if a.starts_with('-') && a != "-" => {
+                    return Err(format!(
+                        "unknown option '{a}' (put -- before a query that starts with '-')"
+                    ))
+                }
                 _ => {
                     o.positional.push(a.clone());
                     i += 1;
@@ -232,7 +240,7 @@ fn role_name(kind: EventKind) -> &'static str {
     }
 }
 fn print_help() {
-    println!("agent-history {VERSION}\n\nUSAGE:\n  agent-history <command> [options]\n\nCOMMANDS:\n  browse                Open standalone search and preview (no Herdr required)\n  index                 Index Claude and Codex sessions\n  search <query>        Search indexed conversations\n  status                Show index counts and database size\n  preview <agent> <id>  Preview a native session\n\nOPTIONS:\n  --role <role>         Search all, user, or assistant messages\n  --db <path>           SQLite database path\n  --claude-root <path>  Claude projects root\n  --codex-root <path>   Codex sessions root\n  -h, --help            Show help\n  -V, --version         Show version");
+    println!("agent-history {VERSION}\n\nUSAGE:\n  agent-history <command> [options]\n\nCOMMANDS:\n  browse                Open standalone search and preview (no Herdr required)\n  index                 Index Claude and Codex sessions\n  search <query>        Search indexed conversations\n  status                Show index counts and database size\n  preview <agent> <id>  Preview a native session\n\nOPTIONS:\n  --role <role>         Search all, user, or assistant messages\n  --db <path>           SQLite database path\n  --claude-root <path>  Claude projects root\n  --codex-root <path>   Codex sessions root\n  --                    Treat the remaining arguments as the query\n  -h, --help            Show help\n  -V, --version         Show version");
 }
 
 #[cfg(test)]
@@ -250,6 +258,20 @@ mod tests {
         let options = Options::parse(&args).unwrap();
         assert_eq!(options.role, Some(EventKind::Assistant));
         assert_eq!(options.query, vec!["multiword", "query"]);
+    }
+
+    #[test]
+    fn dash_queries_are_positional() {
+        let args: Vec<String> = ["-", "--db", "x", "--", "-foo", "--role"]
+            .map(String::from)
+            .into();
+        let options = Options::parse(&args).unwrap();
+        assert_eq!(options.query, vec!["-", "-foo", "--role"]);
+        assert_eq!(options.db, Some(PathBuf::from("x")));
+        match Options::parse(&["-foo".to_string()]) {
+            Err(err) => assert!(err.contains("put -- before"), "{err}"),
+            Ok(_) => panic!("-foo must be rejected as an unknown option"),
+        }
     }
 
     #[test]

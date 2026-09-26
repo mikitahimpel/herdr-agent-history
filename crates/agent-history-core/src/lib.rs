@@ -7,6 +7,7 @@ pub mod domain;
 pub mod git;
 pub mod index;
 pub mod preview;
+pub mod query;
 pub mod storage;
 pub mod test_support;
 pub use contracts::{

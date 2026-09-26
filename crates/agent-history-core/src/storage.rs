@@ -377,10 +377,11 @@ impl Store for SqliteStore {
             return Ok(Vec::new());
         }
         let limit = limit.min(MAX_LIMIT);
+        let expression = crate::query::fts_match_expression(query);
         let mut st=self.conn.prepare("SELECT c.agent,c.native_id,s.repository,s.branch,s.cwd,c.timestamp,c.kind,c.source_path,c.source_file_id,c.source_generation,c.source_start,c.source_end,snippet(chunks_fts,0,'','', ' … ', 24),s.repository_url,s.git_origin FROM chunks_fts JOIN search_chunks c ON c.rowid=chunks_fts.rowid JOIN sessions s ON s.agent=c.agent AND s.native_id=c.native_id WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?) ORDER BY bm25(chunks_fts),c.agent,c.native_id,c.ordinal LIMIT ?")?;
         let rows = st
             .query_map(
-                params![query, role.map(kind_i), role.map(kind_i), limit as i64],
+                params![expression, role.map(kind_i), role.map(kind_i), limit as i64],
                 |r| {
                     Ok(SearchResult {
                         session_id: SessionId::new(agent_from(r.get(0)?)?, r.get::<_, String>(1)?),
@@ -596,6 +597,78 @@ mod tests {
             .unwrap(),
             text: text.into(),
         }
+    }
+    #[test]
+    fn user_queries_with_punctuation_search_words_through_fts() {
+        let dir = crate::test_support::TempDir::new("storage-query").unwrap();
+        let mut db = SqliteStore::open(dir.path().join("private/index.sqlite")).unwrap();
+        let texts = [
+            "beacon cobalt-heron-7309 recorded",
+            "we hit the rate limit again",
+            "is C++ faster here",
+            "config foo:bar key",
+            "what? nobody knows",
+            "call a(b) twice",
+            "mail dev@example.com today",
+            "binary in /usr/local/bin",
+            "she said \"quoted\" words",
+            "café crème ordered",
+            "日本語 の テキスト",
+            "portfolio visibility",
+        ];
+        let s = session(Agent::Claude, "q", 3, 1);
+        db.commit_batch(IndexBatch {
+            sessions: vec![s.clone().into()],
+            chunks: texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| chunk(&s.id, 3, 1, i as u64, t))
+                .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+        let hits = |q: &str| -> Vec<String> {
+            db.search(q, 50)
+                .unwrap_or_else(|e| panic!("query {q:?} failed: {e}"))
+                .into_iter()
+                .map(|r| r.snippet)
+                .collect()
+        };
+        let only = |q: &str, needle: &str| {
+            let found = hits(q);
+            assert_eq!(found.len(), 1, "{q:?} -> {found:?}");
+            assert!(found[0].contains(needle), "{q:?} -> {found:?}");
+        };
+        only("cobalt-heron", "cobalt-heron-7309");
+        only("cobalt-heron-7309", "cobalt-heron-7309");
+        only("rate-limit", "rate limit");
+        only("foo:bar", "foo:bar");
+        only("what?", "what?");
+        only("a(b)", "a(b)");
+        only("dev@example.com", "dev@example.com");
+        only("/usr/local/bin", "/usr/local/bin");
+        only("\"quoted\" words", "\"quoted\" words");
+        only("said \"quoted", "\"quoted\"");
+        only("café-crème", "café crème");
+        only("日本語", "日本語");
+        assert!(hits("C++").iter().any(|s| s.contains("C++")));
+        only("C++ faster", "C++");
+        only("\"portfolio visibility\"", "portfolio");
+        only("portfol*", "portfolio");
+        only("rate-lim*", "rate limit");
+        only("portfolio AND visibility", "portfolio");
+        assert_eq!(hits("portfolio OR nobody").len(), 2);
+        assert!(hits("portfolio NOT visibility").is_empty());
+        only("portfolio AND NOT nobody", "portfolio");
+        assert!(hits("\"visibility portfolio\"").is_empty());
+        for q in [
+            "-", "\"", "\"\"", "?!", "*", "()", "AND", "NOT", "a OR", "NEAR(",
+        ] {
+            hits(q);
+        }
+        let long = vec!["rate-limit"; 2000].join(" ");
+        only(&long, "rate limit");
+        assert!(hits(&"zz-yy ".repeat(2000)).is_empty());
     }
     #[test]
     fn fts_insert_delete_and_reindex_are_transactional() {
