@@ -93,6 +93,54 @@ fn index_search_status_preview_and_append_work_across_processes() {
 }
 
 #[test]
+fn punctuated_queries_search_words_without_leaking_sql_errors() {
+    let (root, claude, codex) = fixture();
+    fs::write(
+        claude.join("punctuation.jsonl"),
+        br#"{"type":"user","sessionId":"punctuation","message":{"content":"beacon cobalt-heron-7309 near the rate limit in C++"}}
+"#,
+    )
+    .unwrap();
+    let db = root.path().join("private/index.sqlite");
+    assert!(run(&db, &claude, &codex, &["index"]).status.success());
+    for query in [
+        "cobalt-heron",
+        "cobalt-heron-7309",
+        "rate-limit",
+        "C++",
+        "\"rate limit\"",
+        "rate-lim*",
+        "cobalt AND heron",
+    ] {
+        let out = run(&db, &claude, &codex, &["search", query]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{query:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("punctuation"), "{query:?}: {stdout}");
+    }
+    for query in [
+        "foo:bar",
+        "what?",
+        "a(b)",
+        "dev@example.com",
+        "/usr/local/bin",
+        "-",
+        "\"",
+        "?!",
+        "NOT",
+    ] {
+        let out = run(&db, &claude, &codex, &["search", query]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{query:?}: {stderr}");
+        assert!(stderr.is_empty(), "{query:?}: {stderr}");
+        assert!(out.stdout.is_empty(), "{query:?}");
+    }
+}
+
+#[test]
 fn help_version_and_argument_errors_are_deterministic() {
     let bin = env!("CARGO_BIN_EXE_agent-history");
     let out = Command::new(bin).arg("--version").output().unwrap();
