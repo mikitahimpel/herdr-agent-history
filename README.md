@@ -53,7 +53,7 @@ cd agent-history
 
 ### Downloaded with a browser? Clear the quarantine first
 
-The binaries are ad-hoc signed and **not notarized by Apple**. A browser marks what it downloads as quarantined, and double-clicking the archive in Finder passes that mark on to every extracted file — including through `./install` into `~/.local/bin`. macOS then refuses to run the program: Terminal prints only `Killed: 9`, and a dialog says:
+The rc.2 binaries are ad-hoc signed and **not notarized by Apple**. A browser marks what it downloads as quarantined, and double-clicking the archive in Finder passes that mark on to every extracted file — including through `./install` into `~/.local/bin`. macOS then refuses to run the program: Terminal prints only `Killed: 9`, and a dialog says:
 
 > **“agent-history” Not Opened**
 > Apple could not verify “agent-history” is free of malware that may harm your Mac or compromise your privacy.
@@ -174,7 +174,7 @@ Building needs a checkout of this repository and the Rust toolchain pinned in `r
 ./scripts/package
 ```
 
-The archive and SHA-256 checksum are written to `dist/`; install from it exactly as from a release. A locally built archive is not quarantined. To build and run just the standalone app without compiling the Herdr integration:
+The archive and SHA-256 checksum are written to `dist/`; install from it exactly as from a release. A locally built archive is not quarantined. By default it is ad-hoc signed, and `package` ends with a warning saying so: a copy of it that a browser downloads will be killed by Gatekeeper. Maintainers produce a Developer ID signed and notarized archive by setting `AGENT_HISTORY_SIGN_IDENTITY` and `AGENT_HISTORY_NOTARY_PROFILE`. The one-time credential setup and the exact release command are in [release status](docs/RELEASE_STATUS.md#what-the-owner-must-run). To build and run just the standalone app without compiling the Herdr integration:
 
 ```sh
 cargo build --release -p agent-history-cli
