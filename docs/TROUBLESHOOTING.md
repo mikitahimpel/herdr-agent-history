@@ -2,7 +2,7 @@
 
 ## “agent-history” Not Opened, or `Killed: 9`
 
-The release binaries are ad-hoc signed and not notarized by Apple. If the archive was downloaded with a browser and extracted by double-clicking it in Finder, every extracted file carries the `com.apple.quarantine` attribute, and `./install` copies it into the install directory. Running any of the programs then prints only `Killed: 9` (exit status 137) in Terminal, and macOS shows:
+The v0.1.0-rc.1 and rc.2 release binaries are ad-hoc signed and not notarized by Apple. If the archive was downloaded with a browser and extracted by double-clicking it in Finder, every extracted file carries the `com.apple.quarantine` attribute, and `./install` copies it into the install directory. Running any of the programs then prints only `Killed: 9` (exit status 137) in Terminal, and macOS shows:
 
 > **“agent-history” Not Opened**
 > Apple could not verify “agent-history” is free of malware that may harm your Mac or compromise your privacy.
@@ -22,6 +22,8 @@ xattr -d com.apple.quarantine ~/.local/bin/agent-history*
 ```
 
 `xattr -l ~/.local/bin/agent-history` shows whether the attribute is present. Downloading with `curl` and extracting with `tar`, as the README shows, never sets it. The `./install` script itself is not blocked, which is why installation appears to succeed. Approving the program through **System Settings → Privacy & Security → Open Anyway** has not been tested with these command-line binaries; clearing the attribute has.
+
+Signing is not enough on its own. A binary signed with a Developer ID certificate but not notarized is killed the same way when quarantined; only notarization avoids it. To see what a binary carries, run `codesign -dvv <binary>` (a notarizable build lists `Authority=Developer ID Application: …` and `flags=0x10000(runtime)`) and `spctl --assess --type execute --verbose=4 <binary>`, which prints `source=Notarized Developer ID` only for a notarized one. It prints `rejected` for everything else, including a local build that runs normally, because it does not consider whether the file is quarantined.
 
 If `Killed: 9` appears on a binary with no quarantine attribute, it was most likely overwritten in place by something other than `./install`. Rerun the release's `./install`, which replaces files by rename.
 
@@ -73,6 +75,15 @@ Preview reads the canonical transcript at the stored source range. A deleted or 
 ## Packaging or installation stops before copying binaries
 
 The installer runs only on macOS Apple Silicon (`install: only macOS Apple Silicon (Darwin arm64) is supported` elsewhere) and needs an absolute directory when one is given. The release includes the standalone `agent-history` and `agent-history-overlay` binaries plus the optional `agent-history-herdr` binary. Herdr itself is not needed to build or install the standalone app. Use `--with-herdr` when installing the optional integration. The scripts do not claim clean-user installation or real native-session acceptance. See RELEASE_STATUS.md for the remaining release gate.
+
+`scripts/package` signs and notarizes only when asked to (see RELEASE_STATUS.md for the exact commands):
+
+- `package: AGENT_HISTORY_NOTARY_PROFILE needs AGENT_HISTORY_SIGN_IDENTITY`: Apple notarizes only Developer ID signed code; set both.
+- `package: no valid Developer ID Application identity matches …`: `security find-identity -v -p codesigning` lists what the keychain holds. *Apple Development* and *Apple Distribution* certificates cannot be used outside the App Store.
+- `package: notarytool cannot use keychain profile "…"`: the profile has not been created on this machine (`xcrun notarytool store-credentials`), or its credentials were revoked.
+- `package: notarization failed (status: Invalid …)`: Apple's log for the submission follows the message and names each rejected file.
+
+Without either variable the archive is still built, ad-hoc signed, and the output ends with a `WARNING` and `signing: ad-hoc only, NOT notarized`. Such an archive is fine for local use and must not be published.
 
 ## Uninstalling without the extracted folder
 

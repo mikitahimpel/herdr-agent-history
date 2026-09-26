@@ -20,7 +20,7 @@ Stable V1 is **not released** and GitHub issue #13 remains open. The 0.1.0-rc.2 
 | #9 Native resume | UUID-only argv, source validation, official session provenance, no plain-session fallback; live macOS resume of both agents after process exit, each answering from the earlier turn with the new turns appended to the original transcript under the original session ID (Codex on 2026-09-25) | Historical sessions with absent or non-UUID native IDs remain unexercised; the product reports them as unavailable to resume rather than resuming them |
 | #6 Herdr | Functional terminal overlay, confirmed isolated Git recovery; live active/closed workspace resume, deleted-worktree recreation, unavailable-repository handling, the linked plugin overlay route, and Claude/Codex parity through a post-resume model turn | A Herdr-rendered native overlay is still outside plugin v1; overlay placement remains a terminal pane |
 | #11 Safeguards | Private index, safe open/sidecar rejection, rollback/corruption errors, confirmed recovery | Broader security review; see documented source-mutation limits |
-| #10 Packaging | Apple Silicon archive/checksum published as GitHub prereleases rc.1 and rc.2; extracted installer, durable plugin path, isolated smoke; the published rc.2 artifact installed, upgraded and uninstalled with no toolchain or checkout (see the clean-install simulation below) | Installation on a second Mac or fresh user account; unnotarized binaries are blocked by Gatekeeper when browser-downloaded and Finder-extracted, currently handled by a documented manual step |
+| #10 Packaging | Apple Silicon archive/checksum published as GitHub prereleases rc.1 and rc.2; extracted installer, durable plugin path, isolated smoke; the published rc.2 artifact installed, upgraded and uninstalled with no toolchain or checkout (see the clean-install simulation below); `scripts/package` signs with Developer ID and a hardened runtime, and submits for notarization, when given an identity and a notary profile (see signing and notarization below) | Installation on a second Mac or fresh user account; the notarization submit has never run because no notary profile exists yet, and published rc.1/rc.2 binaries are still blocked by Gatekeeper when browser-downloaded and Finder-extracted |
 | #12 Documentation | README, indexing/privacy/recovery notes, plugin guide, benchmark and troubleshooting; install and first-run path walked literally from the release page in a stripped environment, with gaps fixed | A new user following the documentation alone on a clean machine, through resume |
 | #13 Release gate | Local quality gate, synthetic integration evidence, and scenarios 5-8 executed live against a running Herdr host for both agents | Scenarios 1-4 and 9-10 on a real installation, clean-user macOS installation, and remote CI/branch protection; no release tag |
 
@@ -34,7 +34,7 @@ All GitHub issues were inspected as the source backlog. No issue is closed by th
 - Host tests cover exact live-session matching, safe command construction, UI effects, explicit recovery cancellation/confirmation, locked and existing worktree targets, and preserving the original checkout.
 - The current release overlay passed a synthetic PTY interaction check: a 200,000-tool-record startup displayed live elapsed/per-agent progress; F2 restricted visible results to User then Assistant; original preview excluded tools and scrolled to the end of a long wrapped reply; Esc preserved the query/filter and Ctrl-C exited cleanly. No native agent was launched.
 - Independent conversation-flow tests verify both agents’ role filters, excluded tool/reasoning traffic, source immutability, append/restart, and schema 2 upgrade with captured context retained.
-- Packaging smoke installs/uninstalls into an isolated prefix and checks that unrelated output files and synthetic native history remain intact.
+- Packaging smoke installs/uninstalls into an isolated prefix and checks that unrelated output files and synthetic native history remain intact. It also runs `scripts/package` against a synthetic source tree with stubbed build and Apple tools, covering the ad-hoc fallback, signing only, signing plus notarization, and each refusal.
 
 ## Standalone and optional Herdr modules
 
@@ -245,12 +245,14 @@ The September 20 blocker is resolved: Codex produced a post-resume model turn on
 September 25, recorded below. Three blockers remain, and two of them need a
 machine other than this one.
 
-1. **Gatekeeper refuses browser-downloaded binaries.** They are ad-hoc signed and
-   not notarized, so an archive carrying `com.apple.quarantine` yields
-   `Killed: 9` and a *Move to Trash* dialog. A `curl` download or one `xattr -dr`
-   command avoids it, and both are documented, but a browser user still has a
-   manual step. Notarization would remove it and needs an Apple Developer
-   account.
+1. **Gatekeeper refuses browser-downloaded binaries.** The published rc.1 and
+   rc.2 binaries are ad-hoc signed and not notarized, so an archive carrying
+   `com.apple.quarantine` yields `Killed: 9` and a *Move to Trash* dialog. A
+   `curl` download or one `xattr -dr` command avoids it, and both are
+   documented, but a browser user still has a manual step. Developer ID signing
+   alone was shown not to help. `scripts/package` can now notarize, but the
+   owner must first create a notary profile and cut a new release (see
+   signing and notarization above). Until then the submit path is untested.
 2. **No clean Mac or fresh user account** has installed from the release page.
    The simulation above removed this machine's advantages but cannot establish
    a first launch where Gatekeeper has never seen these binaries.
@@ -258,6 +260,119 @@ machine other than this one.
    plugin v1, which has no non-terminal UI extension point. The surface is a
    terminal pane instead; accepting that deviation, or funding a companion Herdr
    change, is a product decision (#6).
+
+## Signing and notarization (September 26)
+
+The clean-install simulation found that browser-downloaded binaries are killed
+by Gatekeeper. `scripts/package` can now sign and notarize a release. Signing
+has been done for real. Notarization has not, because no notarytool credential
+profile exists on this machine yet.
+
+### What packaging does
+
+Signing is **opt-in**, controlled by two environment variables. Neither holds a
+secret:
+
+| Variables set | Result |
+| --- | --- |
+| neither | ad-hoc build, as before; ends with a `WARNING` and `signing: ad-hoc only, NOT notarized` |
+| `AGENT_HISTORY_SIGN_IDENTITY` | each binary signed with that Developer ID Application identity, hardened runtime, secure timestamp and identifier `io.github.mikitahimpel.<name>`; ends with a `WARNING` and `signing: Developer ID signed, NOT notarized` |
+| both, plus `AGENT_HISTORY_NOTARY_PROFILE` | the signed binaries are zipped with `ditto`, submitted with `notarytool submit --keychain-profile <name> --wait`, and the archive is only written if Apple returns `Accepted` and `spctl` then reports `source=Notarized Developer ID` for all three; ends with `signing: Developer ID signed and notarized by Apple…` |
+
+The identity and profile are checked before the quality gate runs, so a typo
+fails in seconds. A profile without an identity is refused. After signing,
+each binary must pass `codesign --verify --strict`, carry
+`Authority=Developer ID Application:`, and have the runtime flag. A rejected
+submission prints Apple's log and leaves no archive. Auto-detecting the
+identity was rejected: a machine that happened to hold the certificate would
+silently produce different artifacts from CI.
+
+### Verified on this machine
+
+- `AGENT_HISTORY_SIGN_IDENTITY=<SHA-1 of Developer ID Application: Mikita Himpel (2666YPBJTB)> ./scripts/package`
+  under Rust 1.98.1 passed the full quality gate and signed all three binaries
+  with no keychain prompt. From the extracted archive, every binary passed
+  `codesign --verify --strict --verbose=2`, and `codesign -dvv` showed
+  `flags=0x10000(runtime)`, the Developer ID → Developer ID Certification
+  Authority → Apple Root CA chain, a secure timestamp and `TeamIdentifier=2666YPBJTB`.
+  `spctl --assess` reported `rejected source=Unnotarized Developer ID`, as
+  expected before notarization.
+- The hardened runtime does not break the programs: the installed signed
+  `agent-history` indexed, reported status and searched against a synthetic
+  index, and `agent-history-overlay --help` exited 0.
+- With a real but nonexistent profile name, packaging stopped before building
+  with notarytool's `No Keychain password item found for profile` and wrote
+  nothing.
+
+### Signing alone does not get past Gatekeeper
+
+This was an open question, and the answer is that notarization is required.
+The same release binary was copied twice. One copy kept the linker's ad-hoc
+signature. The other was re-signed with the Developer ID identity, hardened
+runtime and timestamp. Both ran normally. Both got
+`com.apple.quarantine` set to `0083;<time>;Safari;`, as a browser sets it.
+Then:
+
+| Binary, quarantined | `--version` | syspolicyd |
+| --- | --- | --- |
+| ad-hoc | `Killed: 9`, exit 137 | `GK evaluateScanResult: 1 … (team: (null))`, `Prompt shown` |
+| Developer ID signed, not notarized | `Killed: 9`, exit 137 | `GK evaluateScanResult: 1 … (team: 2666YPBJTB), (id: agent-history)`, `Prompt shown` |
+
+The same result held for the signed archive installed with its own
+`./install` from quarantined files: the installed copy was killed with exit 137,
+while an unquarantined install of the same archive ran. The dialog's wording
+for the signed case was not captured. Shipping a signed but unnotarized build
+therefore changes nothing for a browser user.
+
+### Not exercised: submit, and why there is no staple
+
+- `notarytool submit`, the `Accepted` check, the Apple log on rejection and the
+  post-notarization `spctl` check have run only against stubs in
+  `scripts/test-packaging`, never against Apple. The first real release run is
+  their first real test.
+- **Nothing is stapled.** Apple does not support stapling tickets to bare Mach-O
+  executables, and a `.tar.gz` cannot hold a ticket either. The ticket
+  therefore lives only on Apple's servers. On the first launch of a quarantined
+  copy, Gatekeeper looks it up online. That is the same lookup the packaging
+  script's `spctl` check performs. A quarantined first launch with no network
+  is expected to be refused. That is unverified. Covering the offline case would
+  mean shipping a signed, notarized and stapled `.dmg` (or a `.pkg`, which
+  needs a *Developer ID Installer* certificate this machine lacks) instead of
+  the tar.gz, and changing the install instructions to match.
+
+### What the owner must run
+
+Once per machine, create the credential profile. This is the only step that
+touches a credential. Replace the Apple ID placeholder with your own, and when
+prompted, enter an app-specific password generated at
+[account.apple.com](https://account.apple.com) → Sign-In and Security →
+App-Specific Passwords. Omitting `--password` makes notarytool prompt for it
+instead of leaving it in shell history:
+
+```sh
+xcrun notarytool store-credentials agent-history-notary --apple-id <your-apple-id> --team-id 2666YPBJTB
+```
+
+Then cut a signed, notarized release from a clean checkout of the release commit:
+
+```sh
+AGENT_HISTORY_SIGN_IDENTITY="Developer ID Application: Mikita Himpel (2666YPBJTB)" \
+AGENT_HISTORY_NOTARY_PROFILE=agent-history-notary \
+./scripts/package
+```
+
+The last line must read `signing: Developer ID signed and notarized by Apple; …`.
+Submission usually takes a few minutes. Before publishing, check the result as
+a browser user would get it:
+
+```sh
+tar -xzf dist/agent-history-macos-arm64.tar.gz -C /tmp
+xattr -w -r com.apple.quarantine "0083;$(printf %x "$(date +%s)");Safari;" /tmp/agent-history
+/tmp/agent-history/agent-history --version    # must print the version, not Killed: 9
+```
+
+After that release is published, the quarantine sections in the README and
+TROUBLESHOOTING can be limited to rc.1 and rc.2.
 
 ## Live Codex resume check (September 25)
 
@@ -373,4 +488,4 @@ those results before tagging stable V1; mocked tests are not substitutes.
 - The overlay is a terminal plugin, not an in-process native Herdr widget. Herdr 0.7.1 is the target; later CLI changes require compatibility work.
 - Safe worktree recreation uses the captured commit in detached HEAD state; it does not recreate uncommitted changes or reconstruct unavailable commits.
 - The package is a testing prerelease; clean-user installation acceptance remains pending.
-- The binaries are not notarized. A browser download extracted in Finder is blocked by Gatekeeper until the quarantine attribute is cleared; see TROUBLESHOOTING.md.
+- The published binaries are not notarized. A browser download extracted in Finder is blocked by Gatekeeper until the quarantine attribute is cleared; see TROUBLESHOOTING.md. Packaging can notarize, but that path has not yet run against Apple, and notarized bare executables cannot be stapled, so a quarantined first launch needs network access.
