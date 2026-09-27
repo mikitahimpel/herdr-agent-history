@@ -138,7 +138,13 @@ agent-history preview codex <session-id>
 
 Search includes user messages and assistant replies, excluding tool calls/results, loaded files, reasoning, and system/developer messages. Code deliberately included in a message remains searchable. Use `--role user`, `--role assistant`, or `--role all` (the default); in the overlay, **F2** cycles the same filters.
 
-Search uses SQLite FTS5: ordinary terms, quoted phrases, prefixes such as `portfolio*`, and boolean operators. Shell quoting must preserve FTS phrase quotes, for example `agent-history search '"portfolio visibility"'`.
+Search uses SQLite FTS5. Type ordinary text: punctuation is never query syntax, so `rate-limit`, `foo:bar`, `what?`, `C++` or an email address search for the words they contain (`rate-limit` finds "rate limit"). Words are split on punctuation, so `C++` matches the word `C`. Three things keep a special meaning:
+
+- a double-quoted phrase, `"portfolio visibility"` (an unclosed quote runs to the end of the query);
+- a trailing `*` for a prefix, `portfol*`;
+- the uppercase operators `AND`, `OR` and `NOT` between two terms, as in `portfolio NOT draft`. Lowercase `and`/`or`/`not`, or an operator with nothing on one side, is searched as a word.
+
+`-` does not exclude a word; use `NOT`. Parentheses and FTS column filters are not supported and are searched as text. Shell quoting must preserve phrase quotes, for example `agent-history search '"portfolio visibility"'`; put `--` before a query that starts with `-`, for example `agent-history search -- -v`.
 
 Both apps share the index at `~/Library/Application Support/Herdr Agent History/index.sqlite`; `agent-history status` prints its location and counts. The historical directory name is retained to reuse existing data; it does not imply a Herdr dependency. Use a dedicated private directory for `--db`; existing shared directories are refused. Custom histories are supported without changing native files:
 
