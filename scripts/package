@@ -89,14 +89,36 @@ if [ -n "$profile" ]; then
   echo "package: notarization accepted (submission $submission_id)"
   rm -f "$submission" "$result"
   # A bare Mach-O cannot hold a stapled ticket, so Gatekeeper confirms it
-  # online on first launch. spctl performs that same lookup.
+  # online on first launch.
+  #
+  # `spctl --assess --type execute` cannot verify this: it evaluates
+  # application bundles, and answers "rejected (the code is valid but does not
+  # seem to be an app)" for any command-line tool, notarized or not. Checking
+  # it that way fails a correct build.
+  #
+  # Test the way a user meets it instead: quarantine a copy, exactly as a
+  # browser download is marked, and run it. That exercises the real Gatekeeper
+  # path, which kills an un-notarized binary with SIGKILL.
+  probe_dir=$(mktemp -d)
+  trap 'rm -rf "$probe_dir"' EXIT
   for name in $binaries; do
-    assessment=$(spctl --assess --type execute --verbose=4 "$stage/agent-history/$name" 2>&1 || true)
-    case "$assessment" in
-      *accepted*'source=Notarized Developer ID'*) ;;
-      *) printf 'package: Gatekeeper does not accept notarized %s:\n%s\n' "$name" "$assessment" >&2; exit 1 ;;
-    esac
+    probe="$probe_dir/$name"
+    cp "$stage/agent-history/$name" "$probe"
+    xattr -w com.apple.quarantine "0081;$(printf '%x' "$(date +%s)");Safari;" "$probe"
+    # Only SIGKILL means Gatekeeper refused it. Any ordinary exit status proves
+    # the binary was allowed to run, and these tools differ in which flags they
+    # accept, so a non-zero status is not evidence of rejection.
+    set +e
+    "$probe" --help >/dev/null 2>&1
+    status=$?
+    set -e
+    if [ "$status" -eq 137 ]; then
+      printf 'package: Gatekeeper killed quarantined %s (SIGKILL)\n' "$name" >&2
+      exit 1
+    fi
   done
+  rm -rf "$probe_dir"
+  trap - EXIT
 fi
 
 cp plugin/agent-history/herdr-plugin.toml "$stage/agent-history/plugin/agent-history/"
