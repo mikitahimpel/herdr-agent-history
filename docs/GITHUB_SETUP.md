@@ -2,7 +2,23 @@
 
 Remote: https://github.com/mikitahimpel/herdr-agent-history
 
-Local setup is complete. GitHub publication was blocked by the session's approval policy. The repository was created by the owner and is public. No file writes, issue creation, or branch-protection changes were confirmed remotely.
+The repository is public, the backlog issues are published, and CI runs on GitHub. The steps below are the original one-time publication procedure, kept for reference; they have already been carried out.
+
+## Current state (verified 2026-09-29)
+
+Read back with `gh api repos/mikitahimpel/herdr-agent-history/branches/main/protection` and `gh run list`:
+
+| Setting | `.github/branch-protection.json` | Live on `main` |
+| --- | --- | --- |
+| Required check `Quality gate`, branch up to date | yes | yes |
+| Force pushes and deletion blocked | yes | yes |
+| Pull request required | yes, zero approvals | **no** |
+| Conversations resolved | yes | **no** |
+| Applies to administrators | yes | **no** |
+
+`Quality gate` (`.github/workflows/ci.yml`, `./scripts/check` on `macos-latest`) runs on every push and pull request and was green on `main` at `4a25bcc`. The live rule is therefore weaker than the prepared policy: an administrator can push to `main` directly, and nothing requires a pull request. Applying the policy below would close that gap; it has not been applied.
+
+## One-time publication
 
 Run these steps from this checkout in a terminal with working GitHub access:
 

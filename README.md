@@ -28,7 +28,9 @@ The standalone build has no dependency on the Herdr crate and does not read Herd
 
 ## Status
 
-The 0.1.0-rc.2 prerelease implements the CLI, terminal overlay, SQLite indexing, and confirmed worktree recovery. **V1 is not released:** real native-agent resume in Herdr and clean-user macOS installation acceptance remain pending. See [release status](docs/RELEASE_STATUS.md), [indexing limitations](docs/INDEXING.md), and [synthetic performance measurements](docs/PERFORMANCE.md).
+The 0.1.0-rc.2 prerelease implements the CLI, terminal overlay, SQLite indexing, Herdr resume, and confirmed worktree recovery. **V1 is not released:** resume has been exercised live only on the development machine, and installation by a new user on a clean Mac remains pending. See [release status](docs/RELEASE_STATUS.md), [indexing limitations](docs/INDEXING.md), and [synthetic performance measurements](docs/PERFORMANCE.md).
+
+These docs describe the current source. The published rc.2 predates a few changes, each marked **(after rc.2)** where it matters: searching punctuation such as `rate-limit`, near matches for misspelled words, `--` before a query, the release tag in `--version`, one-line error messages from the overlay binaries, and `./uninstall` removing its empty directories.
 
 ## Install from a release
 
@@ -63,10 +65,12 @@ Click **Done**. The highlighted button is **Move to Trash** (**Move to Bin** in 
 ```sh
 cd ~/Downloads/agent-history            # wherever the archive was extracted
 xattr -dr com.apple.quarantine .
-./install
+./install                               # or ./install --with-herdr, if that is what you ran before
 ```
 
-If you already installed quarantined copies, clear them in place instead: `xattr -d com.apple.quarantine ~/.local/bin/agent-history*`. The Terminal commands above avoid this entirely: `curl` does not quarantine, and neither does extracting with `tar`. Only clear the quarantine on an archive whose checksum you verified.
+Repeat the install exactly as you first ran it. A plain `./install` replaces only the two standalone programs, so after an earlier `./install --with-herdr` the quarantined `agent-history-herdr` stays behind and is still killed.
+
+If you already installed quarantined copies, clear them in place instead: `xattr -d com.apple.quarantine ~/.local/bin/agent-history*`. It prints `No such xattr: com.apple.quarantine` for any copy that was already clear; that is harmless. The Terminal commands above avoid this entirely: `curl` does not quarantine, and neither does extracting with `tar`. Only clear the quarantine on an archive whose checksum you verified.
 
 ### Put it on your PATH
 
@@ -105,20 +109,51 @@ A search with no matches prints nothing. In `browse`, type to search, press **Do
 
 To upgrade, download and verify the new release the same way and run its `./install` over the existing one; there is no need to uninstall first. Close any running `agent-history browse` first. The index is kept and migrated automatically when needed. An older build refuses an index created by a newer one (`database schema version … is newer than supported`) rather than altering it.
 
-To remove the programs, run `./uninstall` from the extracted folder, passing the same directory if you installed somewhere other than `~/.local/bin`. It removes the binaries, the Herdr plugin manifest, and the `share/agent-history` directories once they are empty, and deliberately keeps both your native Claude/Codex history and the search index. If you no longer have the folder, delete the files yourself: `rm -f ~/.local/bin/agent-history ~/.local/bin/agent-history-overlay ~/.local/bin/agent-history-herdr ~/.local/share/agent-history/plugin/herdr-plugin.toml`. See [privacy and removal](#privacy-and-removal) for deleting the index.
+To remove the programs, run `./uninstall` from the extracted folder, passing the same directory if you installed somewhere other than `~/.local/bin`. It removes the binaries, the Herdr plugin manifest, and the `share/agent-history` directories once they are empty (rc.2 leaves those empty directories behind; remove them with `rmdir`), and deliberately keeps both your native Claude/Codex history and the search index. If you no longer have the folder, delete the files yourself: `rm -f ~/.local/bin/agent-history ~/.local/bin/agent-history-overlay ~/.local/bin/agent-history-herdr ~/.local/share/agent-history/plugin/herdr-plugin.toml`. See [privacy and removal](#privacy-and-removal) for deleting the index.
 
 ## Optional: resume from Herdr
 
-Searching existing native history files requires no Herdr installation or running coding agent. Resuming through the optional integration requires Herdr and the corresponding Claude Code or Codex executable; these are not bundled. The adapter targets the installed Herdr 0.7.1 CLI, with official native-session integrations enabled. Native compatibility evidence and remaining checks are in [host compatibility](docs/HOST_COMPATIBILITY.md).
+Searching existing native history files requires no Herdr installation or running coding agent. Resuming through the optional integration requires Herdr and the corresponding Claude Code or Codex executable; these are not bundled. The adapter targets the installed Herdr 0.7.1 CLI. Native compatibility evidence and remaining checks are in [host compatibility](docs/HOST_COMPATIBILITY.md).
 
-To also install the optional Herdr executable and plugin, run `./install --with-herdr`. The plugin is copied to `~/.local/share/agent-history/plugin`. From a Herdr-managed pane:
+**1. Check what Herdr needs.** Run these in a pane inside Herdr:
+
+```sh
+herdr --version                 # herdr 0.7.1
+command -v claude codex         # the agents you want to resume
+herdr integration status        # claude and codex should say "current"
+```
+
+If `claude` or `codex` shows `not installed`, run `herdr integration install claude` (or `codex`). The integration lets Herdr report which session a running agent has open, so Agent History can switch to a session that is already running instead of starting it a second time.
+
+**2. Install the integration.** Run `./install --with-herdr` from the extracted folder, as above. It adds `agent-history-herdr` next to `agent-history` and copies the plugin to `~/.local/share/agent-history/plugin`.
+
+**3. Link the plugin and open it.** From a pane inside Herdr:
 
 ```sh
 herdr plugin link "$HOME/.local/share/agent-history/plugin"
 herdr plugin pane open --plugin agent-history --entrypoint search
 ```
 
-See [overlay controls and recovery](docs/HERDR_PLUGIN.md) for keyboard behavior and the declared plugin action that can be bound in Herdr. Indexing runs on activation; there is no permanent daemon.
+The overlay is started by the Herdr server, using the `PATH` the server started with, not your shell's. If `plugin pane open` fails with `No viable candidates found in PATH`, the server was started before `~/.local/bin` was on your `PATH`. Save your work, run `herdr server stop` (this closes every pane and agent in Herdr), and start `herdr` again from a new Terminal window.
+
+**4. Give it a key.** Add this to `~/.config/herdr/config.toml`, then run `herdr server reload-config`:
+
+```toml
+[[keys.command]]
+key = "prefix+f"
+type = "shell"
+command = "herdr plugin pane open --plugin agent-history --entrypoint search"
+```
+
+Now **Ctrl-b** then **f** (Herdr's default prefix is Ctrl-b) opens the overlay. Use `type = "shell"`: the command opens its own pane, so `type = "pane"` would open an extra one around it.
+
+**5. Find the session and resume it.** Type words you remember, press **Tab** to reach the results, and **Space** to read the conversation. Results that can be resumed are marked `resumable`. Press **Enter** to resume the selected one: Herdr switches to the workspace for the directory the session ran in, creating it if needed, and starts `claude --resume <id>` or `codex resume <id>` in a new pane there. If that session is already running in Herdr, Enter switches to it instead. The overlay confirms with `✓ Resumed Claude session in <directory>`.
+
+If the recorded directory no longer exists, Enter offers choices instead, such as opening the repository, recreating a deleted worktree after you confirm, or only viewing the conversation; see [overlay controls and recovery](docs/HERDR_PLUGIN.md). A resumed agent may ask the questions it asks on any start, such as Codex's folder-trust prompt.
+
+**Esc** steps back from the preview and the results, and from the search box it closes the overlay. To close it from a script, pass its pane ID, which `herdr pane list` shows under the label `Agent History`: `herdr plugin pane close <pane_id>`. Unlike `open`, `close` does not take `--plugin` and `--entrypoint`.
+
+Without the plugin, running `agent-history-herdr` in any Herdr pane opens the same overlay. Indexing runs each time it opens; there is no permanent daemon.
 
 ## Standalone app and CLI reference
 
@@ -138,15 +173,17 @@ agent-history preview codex <session-id>
 
 Search includes user messages and assistant replies, excluding tool calls/results, loaded files, reasoning, and system/developer messages. Code deliberately included in a message remains searchable. Use `--role user`, `--role assistant`, or `--role all` (the default); in the overlay, **F2** cycles the same filters.
 
-Search uses SQLite FTS5. Type ordinary text: punctuation is never query syntax, so `rate-limit`, `foo:bar`, `what?`, `C++` or an email address search for the words they contain (`rate-limit` finds "rate limit"). Words are split on punctuation, so `C++` matches the word `C`. Three things keep a special meaning:
+Search uses SQLite FTS5. Type ordinary text: **(after rc.2)** punctuation is never query syntax, so `rate-limit`, `foo:bar`, `what?`, `C++` or an email address search for the words they contain (`rate-limit` finds "rate limit"). Words are split on punctuation, so `C++` matches the word `C`. Three things keep a special meaning:
 
 - a double-quoted phrase, `"portfolio visibility"` (an unclosed quote runs to the end of the query);
 - a trailing `*` for a prefix, `portfol*`;
 - the uppercase operators `AND`, `OR` and `NOT` between two terms, as in `portfolio NOT draft`. Lowercase `and`/`or`/`not`, or an operator with nothing on one side, is searched as a word.
 
-`-` does not exclude a word; use `NOT`. Parentheses and FTS column filters are not supported and are searched as text. Shell quoting must preserve phrase quotes, for example `agent-history search '"portfolio visibility"'`; put `--` before a query that starts with `-`, for example `agent-history search -- -v`.
+`-` does not exclude a word; use `NOT`. Parentheses and FTS column filters are not supported and are searched as text. Shell quoting must preserve phrase quotes, for example `agent-history search '"portfolio visibility"'`; **(after rc.2)** put `--` before a query that starts with `-`, for example `agent-history search -- -v`.
 
-**Near matches.** When a query matches nothing exactly, search retries once, widening each plain word that is not in the index to indexed words one edit away (two for words of eight or more letters; an edit is an added, missing, changed, or swapped pair of adjacent letters) and to words that start with it. `databse` finds "database" and `worktre` finds "worktree". The results are then near matches, and both apps say so: `search` prints `agent-history: no exact matches; showing near matches for databse → database, databse*` on stderr (stdout keeps its format), and the browser's results pane is labelled `≈ no exact match · near: …` and highlights the words that matched. Only plain words of four or more characters, with at least one letter, are widened. Phrases, `prefix*` terms, operators, words after `NOT`, punctuated words and words already in the index are always searched exactly as typed. The retry happens only after zero exact results, so it never changes a query that already matches. It compares spelling only, with no semantic matching, and it corrects only words whose first letter is right or whose first two letters are swapped.
+In rc.2, punctuation outside double quotes is still query syntax: `agent-history search rate-limit` fails with `storage error: no such column: limit`, and `C++`, `what?` or an email address fail with `fts5: syntax error`. Put such a query in double quotes, `agent-history search '"rate-limit"'`, and it works there too. An unclosed quote fails with `unterminated string`.
+
+**Near matches (after rc.2).** When a query matches nothing exactly, search retries once, widening each plain word that is not in the index to indexed words one edit away (two for words of eight or more letters; an edit is an added, missing, changed, or swapped pair of adjacent letters) and to words that start with it. `databse` finds "database" and `worktre` finds "worktree". The results are then near matches, and both apps say so: `search` prints `agent-history: no exact matches; showing near matches for databse → database, databse*` on stderr (stdout keeps its format), and the browser's results pane is labelled `≈ no exact match · near: …` and highlights the words that matched. Only plain words of four or more characters, with at least one letter, are widened. Phrases, `prefix*` terms, operators, words after `NOT`, punctuated words and words already in the index are always searched exactly as typed. The retry happens only after zero exact results, so it never changes a query that already matches. It compares spelling only, with no semantic matching, and it corrects only words whose first letter is right or whose first two letters are swapped.
 
 Both apps share the index at `~/Library/Application Support/Herdr Agent History/index.sqlite`; `agent-history status` prints its location and counts. The historical directory name is retained to reuse existing data; it does not imply a Herdr dependency. Use a dedicated private directory for `--db`; existing shared directories are refused. Custom histories are supported without changing native files:
 
@@ -182,7 +219,7 @@ Building needs a checkout of this repository and the Rust toolchain pinned in `r
 ./scripts/package
 ```
 
-The archive and SHA-256 checksum are written to `dist/`; install from it exactly as from a release. A locally built archive is not quarantined. By default it is ad-hoc signed, and `package` ends with a warning saying so: a copy of it that a browser downloads will be killed by Gatekeeper. Maintainers produce a Developer ID signed and notarized archive by setting `AGENT_HISTORY_SIGN_IDENTITY` and `AGENT_HISTORY_NOTARY_PROFILE`. The one-time credential setup and the exact release command are in [release status](docs/RELEASE_STATUS.md#what-the-owner-must-run). `package` stamps the binaries with the checkout's `git describe --tags --always --dirty` (or `AGENT_HISTORY_BUILD_ID`, when set), so `agent-history --version` prints for example `agent-history 0.1.0 (v0.1.0-rc.3)`; a plain `cargo build` prints `(development build)`. To build and run just the standalone app without compiling the Herdr integration:
+The archive and SHA-256 checksum are written to `dist/`; install from it exactly as from a release. A locally built archive is not quarantined. By default it is ad-hoc signed, and `package` ends with a warning saying so: a copy of it that a browser downloads will be killed by Gatekeeper. Maintainers produce a Developer ID signed and notarized archive by setting `AGENT_HISTORY_SIGN_IDENTITY` and `AGENT_HISTORY_NOTARY_PROFILE`. The one-time credential setup and the exact release command are in [release status](docs/RELEASE_STATUS.md#what-the-owner-must-run). `package` stamps the binaries with the checkout's `git describe --tags --always --dirty` (or `AGENT_HISTORY_BUILD_ID`, when set), so `agent-history --version` prints for example `agent-history 0.1.0 (v0.1.0-rc.3)`; a plain `cargo build` prints `(development build)`, and rc.2, built before this, prints only `agent-history 0.1.0`. To build and run just the standalone app without compiling the Herdr integration:
 
 ```sh
 cargo build --release -p agent-history-cli
@@ -202,4 +239,4 @@ See [module boundaries and entry points](docs/MODULES.md) for the standalone/int
 
 Run `./scripts/setup` once per checkout and `./scripts/check` after changes. The gate runs formatting, warnings-denied Clippy, all workspace tests, and the release build with the committed lockfile. `./scripts/test-packaging` checks isolated installation/removal behavior. Tests use synthetic histories and temporary repositories; they do not launch native agents.
 
-[AGENTS.md](AGENTS.md), the [RFC](docs/RFC.md), and GitHub issues [#1–#13](https://github.com/mikitahimpel/herdr-agent-history/issues) define the scope. The [backlog map](docs/BACKLOG.md) connects the detailed work items. Remote CI and branch protection have not been verified in this implementation run.
+[AGENTS.md](AGENTS.md), the [RFC](docs/RFC.md), and GitHub issues [#1–#13](https://github.com/mikitahimpel/herdr-agent-history/issues) define the scope. The [backlog map](docs/BACKLOG.md) connects the detailed work items. CI runs `./scripts/check` as the `Quality gate` check on every push and pull request, and `main` requires it to pass on an up-to-date branch; see [GitHub setup](docs/GITHUB_SETUP.md) for what the live protection does and does not enforce.
