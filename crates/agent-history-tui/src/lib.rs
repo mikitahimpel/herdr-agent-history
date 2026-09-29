@@ -26,6 +26,7 @@ use std::{
 
 mod availability;
 mod markdown;
+pub mod report;
 mod terminal;
 mod text;
 mod theme;

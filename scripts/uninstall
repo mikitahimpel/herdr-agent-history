@@ -12,7 +12,14 @@ for name in agent-history agent-history-overlay agent-history-herdr; do
   path="$prefix/$name"
   if [ -f "$path" ] || [ -L "$path" ]; then rm -f "$path"; echo "removed $path"; fi
 done
-plugin_dir="$prefix/../share/agent-history/plugin"
+share_dir="$prefix/../share/agent-history"
+plugin_dir="$share_dir/plugin"
 if [ -f "$plugin_dir/herdr-plugin.toml" ]; then rm -f "$plugin_dir/herdr-plugin.toml"; echo "removed $plugin_dir/herdr-plugin.toml"; fi
+# Only the two directories named for this program, and only while empty.
+# rmdir never recurses or follows a symlink; share/ and the prefix itself may
+# belong to other software and are left alone.
+for dir in "$plugin_dir" "$share_dir"; do
+  if [ -d "$dir" ] && [ ! -L "$dir" ] && rmdir "$dir" 2>/dev/null; then echo "removed empty directory $dir"; fi
+done
 if $had_herdr; then echo "In Herdr: herdr plugin unlink agent-history"; fi
 echo "Native histories and index retained."

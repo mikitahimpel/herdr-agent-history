@@ -186,7 +186,14 @@ fn help_version_and_argument_errors_are_deterministic() {
     let bin = env!("CARGO_BIN_EXE_agent-history");
     let out = Command::new(bin).arg("--version").output().unwrap();
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("agent-history 0.1.0"));
+    // An unpackaged build (no tag, no stamp) still builds and says what it is.
+    let build = option_env!("AGENT_HISTORY_BUILD_ID")
+        .filter(|id| !id.is_empty())
+        .unwrap_or("development build");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("agent-history {} ({build})\n", env!("CARGO_PKG_VERSION"))
+    );
     let out = Command::new(bin).arg("--help").output().unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("search <query>"));
@@ -247,4 +254,22 @@ fn missing_home_and_removed_reset_fail_without_modifying_files() {
         .unwrap();
     assert!(!out.status.success());
     assert_eq!(fs::read_to_string(native).unwrap(), "private fixture");
+}
+
+#[test]
+fn overlay_errors_are_one_sanitized_line_without_debug_formatting() {
+    let root = agent_history_core::test_support::TempDir::new("overlay-error").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-history-overlay"))
+        .arg("--bo\u{1b}[2Jgus")
+        .env("HOME", root.path())
+        .env_remove("AGENT_HISTORY_DB")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "agent-history-overlay: unknown option: --bo\u{fffd}[2Jgus\n"
+    );
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
 }

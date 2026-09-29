@@ -1,19 +1,12 @@
 use agent_history_core::adapters::{ClaudeAdapter, CodexAdapter};
 use agent_history_core::{Agent, AgentAdapter, EventKind, SqliteStore};
+use agent_history_tui::report::{self, sanitize};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 fn main() -> ExitCode {
-    match run(env::args().skip(1).collect()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("agent-history: {}", sanitize(&message));
-            ExitCode::from(2)
-        }
-    }
+    report::exit("agent-history", run(env::args().skip(1).collect()))
 }
 
 fn run(args: Vec<String>) -> Result<(), String> {
@@ -22,7 +15,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
     if args.len() == 1 && (args[0] == "--version" || args[0] == "-V") {
-        println!("agent-history {VERSION}");
+        println!("agent-history {}", report::version());
         return Ok(());
     }
     let command = args[0].as_str();
@@ -227,17 +220,6 @@ fn preview(db: PathBuf, o: Options) -> Result<(), String> {
 fn default_db() -> Result<PathBuf, String> {
     agent_history_core::default_index_path().ok_or_else(|| "HOME is unset; pass --db <path>".into())
 }
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_control() && c != '\n' && c != '\t' {
-                '�'
-            } else {
-                c
-            }
-        })
-        .collect()
-}
 fn role_name(kind: EventKind) -> &'static str {
     match kind {
         EventKind::User => "User",
@@ -246,7 +228,7 @@ fn role_name(kind: EventKind) -> &'static str {
     }
 }
 fn print_help() {
-    println!("agent-history {VERSION}\n\nUSAGE:\n  agent-history <command> [options]\n\nCOMMANDS:\n  browse                Open standalone search and preview (no Herdr required)\n  index                 Index Claude and Codex sessions\n  search <query>        Search indexed conversations\n  status                Show index counts and database size\n  preview <agent> <id>  Preview a native session\n\nOPTIONS:\n  --role <role>         Search all, user, or assistant messages\n  --db <path>           SQLite database path\n  --claude-root <path>  Claude projects root\n  --codex-root <path>   Codex sessions root\n  --                    Treat the remaining arguments as the query\n  -h, --help            Show help\n  -V, --version         Show version");
+    println!("agent-history {}\n\nUSAGE:\n  agent-history <command> [options]\n\nCOMMANDS:\n  browse                Open standalone search and preview (no Herdr required)\n  index                 Index Claude and Codex sessions\n  search <query>        Search indexed conversations\n  status                Show index counts and database size\n  preview <agent> <id>  Preview a native session\n\nOPTIONS:\n  --role <role>         Search all, user, or assistant messages\n  --db <path>           SQLite database path\n  --claude-root <path>  Claude projects root\n  --codex-root <path>   Codex sessions root\n  --                    Treat the remaining arguments as the query\n  -h, --help            Show help\n  -V, --version         Show version", report::version());
 }
 
 #[cfg(test)]
