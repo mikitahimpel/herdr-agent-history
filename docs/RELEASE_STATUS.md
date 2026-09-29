@@ -34,7 +34,7 @@ All GitHub issues were inspected as the source backlog. No issue is closed by th
 - Host tests cover exact live-session matching, safe command construction, UI effects, explicit recovery cancellation/confirmation, locked and existing worktree targets, and preserving the original checkout.
 - The current release overlay passed a synthetic PTY interaction check: a 200,000-tool-record startup displayed live elapsed/per-agent progress; F2 restricted visible results to User then Assistant; original preview excluded tools and scrolled to the end of a long wrapped reply; Esc preserved the query/filter and Ctrl-C exited cleanly. No native agent was launched.
 - Independent conversation-flow tests verify both agents’ role filters, excluded tool/reasoning traffic, source immutability, append/restart, and schema 2 upgrade with captured context retained.
-- Packaging smoke installs/uninstalls into an isolated prefix and checks that unrelated output files and synthetic native history remain intact. It also runs `scripts/package` against a synthetic source tree with stubbed build and Apple tools, covering the ad-hoc fallback, signing only, signing plus notarization, and each refusal.
+- Packaging smoke installs/uninstalls into an isolated prefix and checks that unrelated output files and synthetic native history remain intact. It also runs `scripts/package` against a synthetic source tree with stubbed build and Apple tools, covering the ad-hoc fallback, signing only, signing plus notarization, and each refusal, and checks that the git tag (or, with no tag, the commit) is stamped into `--version`. Uninstall is also checked to remove the empty `share/agent-history` directories it created while keeping anything else in them, `share/` itself, the index and the native fixtures.
 
 ## Standalone and optional Herdr modules
 
@@ -221,12 +221,15 @@ either criterion.**
   release instructions; `./uninstall` needs the extracted folder and the same
   prefix, with no fallback documented.
 
-### Not fixed here (code, outside this documentation change)
+### Fixed afterwards in code (#29, not in the rc.2 binaries)
 
-- `agent-history --version` prints `0.1.0`, not the prerelease tag.
-- `agent-history-overlay` and `agent-history-herdr` print errors as a Rust debug
-  structure (`Error: Custom { kind: Other, error: "…" }`).
-- Uninstall leaves the empty `share/agent-history/plugin` directory behind.
+- `agent-history --version` printed `0.1.0`, not the prerelease tag. Packaged
+  builds now print the tag they were built from, e.g. `0.1.0 (v0.1.0-rc.3)`.
+- `agent-history-overlay` and `agent-history-herdr` printed errors as a Rust
+  debug structure (`Error: Custom { kind: Other, error: "…" }`). They now print
+  one sanitized `name: message` line, as the CLI does.
+- Uninstall left the empty `share/agent-history/plugin` directory behind. It now
+  removes that directory and `share/agent-history` when they are empty.
 
 ### Still requires a second Mac or a fresh user account
 
@@ -353,7 +356,7 @@ instead of leaving it in shell history:
 xcrun notarytool store-credentials agent-history-notary --apple-id <your-apple-id> --team-id 2666YPBJTB
 ```
 
-Then cut a signed, notarized release from a clean checkout of the release commit:
+Then tag the release commit and cut a signed, notarized release from a clean checkout of that tag. The binaries report the tag in `--version`, and `package` prints the version it built (`package: agent-history 0.1.0 (v0.1.0-rc.3)`); a `-dirty` or `-N-g<hash>` suffix there means the checkout is not the tagged commit:
 
 ```sh
 AGENT_HISTORY_SIGN_IDENTITY="Developer ID Application: Mikita Himpel (2666YPBJTB)" \
