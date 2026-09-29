@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeResumePlan {
     pub agent: Agent,
-    /// Host agent name this integration assigns to the resumed pane. It carries
-    /// the validated native session ID, so a later overlay run can recognize
-    /// its own resume even when the host reports no session ID for that pane.
+    /// Host agent name this integration assigns to the resumed pane. It
+    /// encodes the whole validated native session ID, so a later overlay run
+    /// can recognize its own resume while the host reports no session ID for
+    /// that pane, as it does for the first seconds after `claude --resume`.
     pub agent_name: String,
     pub argv: Vec<String>,
 }
@@ -25,10 +26,29 @@ impl NativeResumePlan {
         };
         Ok(Self {
             agent: session.id.agent,
-            agent_name: format!("agent-history-{id}"),
+            agent_name: resume_name(id),
             argv,
         })
     }
+}
+
+/// Herdr 0.9 accepts agent names of at most 32 characters from `[a-z0-9_-]`,
+/// starting with a letter, which a hyphenated UUID does not fit. The 128-bit
+/// value in fixed-width base 36 (25 digits) does, so distinct sessions never
+/// share a name.
+fn resume_name(uuid: &str) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let hex: String = uuid.chars().filter(|c| *c != '-').collect();
+    let mut value = u128::from_str_radix(&hex, 16).expect("validated UUID is 32 hex digits");
+    let mut encoded = [b'0'; 25];
+    for digit in encoded.iter_mut().rev() {
+        *digit = DIGITS[(value % 36) as usize];
+        value /= 36;
+    }
+    format!(
+        "ah-{}",
+        std::str::from_utf8(&encoded).expect("base-36 digits are ASCII")
+    )
 }
 
 fn is_uuid(value: &str) -> bool {
@@ -49,6 +69,10 @@ pub struct WorkspaceRecord {
     pub root_pane_id: Option<String>,
     #[serde(default)]
     pub root_pane_occupied: bool,
+    /// Created by this resume, so its root pane is a new shell at the
+    /// session's directory that no one else is using.
+    #[serde(default)]
+    pub created: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +128,37 @@ mod tests {
             .argv,
             ["codex", "resume", "00000000-0000-4000-8000-000000000002"]
         );
+    }
+
+    #[test]
+    fn resume_names_fit_herdr_and_identify_exactly_one_session() {
+        let name = |id: &str| {
+            NativeResumePlan::for_session(&session(Agent::Codex, id))
+                .unwrap()
+                .agent_name
+        };
+        let ids = [
+            "00000000-0000-0000-0000-000000000000",
+            "00000000-0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-000000000002",
+            "10000000-0000-4000-8000-000000000001",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            "8f0f2724-2477-43d9-a05e-c8534d8d2beb",
+        ];
+        let names: Vec<String> = ids.iter().map(|id| name(id)).collect();
+        for n in &names {
+            // Herdr 0.9.3 rejects anything else with `invalid_agent_name`.
+            assert!(n.len() <= 32, "{n}");
+            assert!(n.starts_with(|c: char| c.is_ascii_lowercase()), "{n}");
+            assert!(n
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'));
+        }
+        let distinct: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(distinct.len(), ids.len());
+        assert_eq!(names[0], "ah-0000000000000000000000000");
+        assert_eq!(names[4], "ah-f5lxx1zz5pnorynqglhzmsp33");
+        assert_eq!(name("8F0F2724-2477-43D9-A05E-C8534D8D2BEB"), names[5]);
     }
 
     #[test]
