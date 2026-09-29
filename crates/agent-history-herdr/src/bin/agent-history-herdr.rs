@@ -3,10 +3,15 @@ use agent_history_herdr::{
     socket::{HerdrCli, ProcessRunner},
     theme,
 };
-use agent_history_tui::run;
+use agent_history_tui::{report, run};
 use std::io;
+use std::process::ExitCode;
 
-fn main() -> io::Result<()> {
+fn main() -> ExitCode {
+    report::exit("agent-history-herdr", start())
+}
+
+fn start() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         return run(

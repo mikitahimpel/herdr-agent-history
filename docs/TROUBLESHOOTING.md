@@ -82,6 +82,8 @@ The installer runs only on macOS Apple Silicon (`install: only macOS Apple Silic
 - `package: no valid Developer ID Application identity matches …`: `security find-identity -v -p codesigning` lists what the keychain holds. *Apple Development* and *Apple Distribution* certificates cannot be used outside the App Store.
 - `package: notarytool cannot use keychain profile "…"`: the profile has not been created on this machine (`xcrun notarytool store-credentials`), or its credentials were revoked.
 - `package: notarization failed (status: Invalid …)`: Apple's log for the submission follows the message and names each rejected file.
+- `package: cannot identify this build`: the source is not a git checkout, so there is no tag or commit to put in `--version`. Package from a checkout, or set `AGENT_HISTORY_BUILD_ID` to the release tag.
+- `package: build identifier "…" may contain only letters, digits and . _ + -`: `AGENT_HISTORY_BUILD_ID` holds something other than a tag-like name.
 
 Without either variable the archive is still built, ad-hoc signed, and the output ends with a `WARNING` and `signing: ad-hoc only, NOT notarized`. Such an archive is fine for local use and must not be published.
 

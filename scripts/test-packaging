@@ -43,6 +43,47 @@ PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/uninstall" "$tmp/default-pre
 test -f "$tmp/default-prefix/keep"
 test "$(cat "$tmp/native-history")" = native
 
+# Uninstall removes the agent-history directories the installer created once
+# they are empty, and nothing above them: share/ and the prefix are shared with
+# other software. The index and native history are never touched.
+tree="$tmp/tree"
+index="$tmp/home/Library/Application Support/Herdr Agent History/index.sqlite"
+mkdir -p "$tree" "$(dirname "$index")"
+printf index > "$index"
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" --with-herdr "$tree/bin" >/dev/null
+test -f "$tree/share/agent-history/plugin/herdr-plugin.toml"
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/uninstall" "$tree/bin" > "$tmp/uninstall.out"
+grep -q "removed empty directory $tree/bin/../share/agent-history/plugin" "$tmp/uninstall.out"
+test ! -e "$tree/share/agent-history"
+test -d "$tree/share"
+test -d "$tree/bin"
+test -z "$(ls -A "$tree/bin")"
+test "$(cat "$index")" = index
+test "$(cat "$tmp/native-history")" = native
+# Anything else in those directories keeps them, and is kept.
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" --with-herdr "$tree/bin" >/dev/null
+printf mine > "$tree/share/agent-history/plugin/notes"
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/uninstall" "$tree/bin" >/dev/null
+test ! -e "$tree/share/agent-history/plugin/herdr-plugin.toml"
+test "$(cat "$tree/share/agent-history/plugin/notes")" = mine
+rm "$tree/share/agent-history/plugin/notes"
+printf mine > "$tree/share/agent-history/notes"
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/uninstall" "$tree/bin" >/dev/null
+test ! -e "$tree/share/agent-history/plugin"
+test "$(cat "$tree/share/agent-history/notes")" = mine
+# A symlinked directory is not the installer's; neither it nor its target goes.
+rm -r "$tree/share/agent-history"
+mkdir -p "$tmp/elsewhere"
+ln -s "$tmp/elsewhere" "$tree/share/agent-history"
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/uninstall" "$tree/bin" >/dev/null
+test -L "$tree/share/agent-history"
+test -d "$tmp/elsewhere"
+rm "$tree/share/agent-history"
+# Uninstalling twice, or from a prefix that never had an install, is harmless.
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/uninstall" "$tree/bin" >/dev/null
+test -d "$tree/share"
+test "$(cat "$index")" = index
+
 if PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" --unknown "$tmp/default-prefix" >/dev/null 2>&1; then exit 1; fi
 if sh "$package/uninstall" relative >/dev/null 2>&1; then exit 1; fi
 
@@ -80,6 +121,12 @@ printf readme > "$src/README.md"
 printf agents > "$src/AGENTS.md"
 printf doc > "$src/docs/NOTE.md"
 printf 'id = "agent-history"\n' > "$src/plugin/agent-history/herdr-plugin.toml"
+printf 'target/\n' > "$src/.gitignore"
+git_src() { git -C "$src" -c user.name=test -c user.email=test@example.invalid -c commit.gpgsign=false -c tag.gpgsign=false "$@"; }
+git_src init -q
+git_src add -A
+git_src commit -q -m synthetic
+git_src tag v0.1.0-rc.9
 cp "$tmp/bin/uname" "$stubs/uname"
 stub() {
   printf '#!/bin/sh\necho "%s $*" >> "%s"\n%s\n' "$1" "$calls" "$2" > "$stubs/$1"
@@ -87,7 +134,18 @@ stub() {
 }
 printf '#!/bin/sh\necho "check" >> "%s"\n' "$calls" > "$src/scripts/check"
 chmod 755 "$src/scripts/check"
-stub cargo 'mkdir -p target/release; for n in agent-history agent-history-overlay agent-history-herdr; do printf "#!/bin/sh\\n" > target/release/$n; chmod 755 target/release/$n; done'
+# The cargo stub bakes the identifier it was given into agent-history
+# --version, unless STUB_VERSION_ID stands in for a build that ignored it.
+cat > "$stubs/cargo" <<EOF
+#!/bin/sh
+echo "cargo \$*" >> "$calls"
+echo "build-id \${AGENT_HISTORY_BUILD_ID-unset}" >> "$calls"
+mkdir -p target/release
+for n in agent-history-overlay agent-history-herdr; do printf '#!/bin/sh\n' > target/release/\$n; chmod 755 target/release/\$n; done
+printf '#!/bin/sh\necho "agent-history 0.1.0 (%s)"\n' "\${STUB_VERSION_ID-\$AGENT_HISTORY_BUILD_ID}" > target/release/agent-history
+chmod 755 target/release/agent-history
+EOF
+chmod 755 "$stubs/cargo"
 stub security 'echo "  1) 0000 \"${STUB_IDENTITY:-Developer ID Application: Test (TEAMID0000)}\""'
 stub codesign 'case "$1" in -dvv) echo "Authority=${STUB_AUTHORITY:-Developer ID Application: Test (TEAMID0000)}" >&2 ;; -dv) echo "CodeDirectory v=20500 flags=0x10000(runtime)" >&2 ;; esac'
 stub xcrun 'case "$2" in
@@ -100,7 +158,7 @@ stub spctl 'echo "$4: ${STUB_SPCTL:-accepted}" >&2; echo "source=Notarized Devel
 package_run() {
   rm -rf "$src/target" "$tmp/dist" "$calls"
   : > "$calls"
-  (cd "$src" && env -u AGENT_HISTORY_SIGN_IDENTITY -u AGENT_HISTORY_NOTARY_PROFILE PATH="$stubs:$PATH" "$@" \
+  (cd "$src" && env -u AGENT_HISTORY_SIGN_IDENTITY -u AGENT_HISTORY_NOTARY_PROFILE -u AGENT_HISTORY_BUILD_ID PATH="$stubs:$PATH" "$@" \
     sh "$repo/scripts/package" "$tmp/dist" > "$tmp/stdout" 2> "$tmp/stderr")
 }
 calls_to() { grep -c -E "^$1( |\$)" "$calls" || true; }
@@ -116,6 +174,39 @@ test "$(calls_to codesign)" = 0
 test "$(calls_to xcrun)" = 0
 test "$(calls_to check)" = 1
 test "$(tar -tzf "$tmp/dist/agent-history-macos-arm64.tar.gz" | grep -c -E '^agent-history/agent-history(-overlay|-herdr)?$')" = 3
+
+# The release tag is stamped into the build, and the built binary must report it.
+grep -q '^build-id v0.1.0-rc.9$' "$calls"
+grep -q '^package: agent-history 0.1.0 (v0.1.0-rc.9)$' "$tmp/stdout"
+tar -xzf "$tmp/dist/agent-history-macos-arm64.tar.gz" -C "$tmp" agent-history/agent-history
+test "$("$tmp/agent-history/agent-history" --version)" = "agent-history 0.1.0 (v0.1.0-rc.9)"
+# An explicit identifier wins over git.
+package_run AGENT_HISTORY_BUILD_ID=v0.1.0-rc.10
+grep -q '^build-id v0.1.0-rc.10$' "$calls"
+# A commit after the tag, and uncommitted changes, are both visible.
+printf changed > "$src/README.md"
+package_run
+grep -q '^build-id v0.1.0-rc.9-dirty$' "$calls"
+git_src commit -q -am next
+package_run
+grep -q "^build-id v0.1.0-rc.9-1-g$(git_src rev-parse --short HEAD)\$" "$calls"
+# A checkout with no tag at all still packages, identified by its commit.
+git_src tag -d v0.1.0-rc.9 >/dev/null
+package_run
+grep -q "^build-id $(git_src rev-parse --short HEAD)\$" "$calls"
+# Outside git and without an identifier, or with an unsafe one, nothing is built.
+if package_run GIT_DIR="$tmp/no-such-git"; then exit 1; fi
+grep -q 'cannot identify this build' "$tmp/stderr"
+test "$(calls_to check)" = 0
+if package_run AGENT_HISTORY_BUILD_ID='v1 $(touch pwned)'; then exit 1; fi
+grep -q 'may contain only letters' "$tmp/stderr"
+test "$(calls_to check)" = 0
+test ! -e "$src/pwned"
+# A build that did not pick the identifier up is refused rather than shipped.
+if package_run STUB_VERSION_ID=; then exit 1; fi
+grep -q 'not build ' "$tmp/stderr"
+test ! -e "$tmp/dist/agent-history-macos-arm64.tar.gz"
+git_src tag v0.1.0-rc.9
 
 # A notary profile without an identity is refused before any build.
 if package_run AGENT_HISTORY_NOTARY_PROFILE=release; then exit 1; fi

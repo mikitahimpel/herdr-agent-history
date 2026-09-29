@@ -105,7 +105,7 @@ A search with no matches prints nothing. In `browse`, type to search, press **Do
 
 To upgrade, download and verify the new release the same way and run its `./install` over the existing one; there is no need to uninstall first. Close any running `agent-history browse` first. The index is kept and migrated automatically when needed. An older build refuses an index created by a newer one (`database schema version … is newer than supported`) rather than altering it.
 
-To remove the programs, run `./uninstall` from the extracted folder, passing the same directory if you installed somewhere other than `~/.local/bin`. It removes the binaries and the Herdr plugin manifest, and deliberately keeps both your native Claude/Codex history and the search index. If you no longer have the folder, delete the files yourself: `rm -f ~/.local/bin/agent-history ~/.local/bin/agent-history-overlay ~/.local/bin/agent-history-herdr ~/.local/share/agent-history/plugin/herdr-plugin.toml`. See [privacy and removal](#privacy-and-removal) for deleting the index.
+To remove the programs, run `./uninstall` from the extracted folder, passing the same directory if you installed somewhere other than `~/.local/bin`. It removes the binaries, the Herdr plugin manifest, and the `share/agent-history` directories once they are empty, and deliberately keeps both your native Claude/Codex history and the search index. If you no longer have the folder, delete the files yourself: `rm -f ~/.local/bin/agent-history ~/.local/bin/agent-history-overlay ~/.local/bin/agent-history-herdr ~/.local/share/agent-history/plugin/herdr-plugin.toml`. See [privacy and removal](#privacy-and-removal) for deleting the index.
 
 ## Optional: resume from Herdr
 
@@ -180,7 +180,7 @@ Building needs a checkout of this repository and the Rust toolchain pinned in `r
 ./scripts/package
 ```
 
-The archive and SHA-256 checksum are written to `dist/`; install from it exactly as from a release. A locally built archive is not quarantined. By default it is ad-hoc signed, and `package` ends with a warning saying so: a copy of it that a browser downloads will be killed by Gatekeeper. Maintainers produce a Developer ID signed and notarized archive by setting `AGENT_HISTORY_SIGN_IDENTITY` and `AGENT_HISTORY_NOTARY_PROFILE`. The one-time credential setup and the exact release command are in [release status](docs/RELEASE_STATUS.md#what-the-owner-must-run). To build and run just the standalone app without compiling the Herdr integration:
+The archive and SHA-256 checksum are written to `dist/`; install from it exactly as from a release. A locally built archive is not quarantined. By default it is ad-hoc signed, and `package` ends with a warning saying so: a copy of it that a browser downloads will be killed by Gatekeeper. Maintainers produce a Developer ID signed and notarized archive by setting `AGENT_HISTORY_SIGN_IDENTITY` and `AGENT_HISTORY_NOTARY_PROFILE`. The one-time credential setup and the exact release command are in [release status](docs/RELEASE_STATUS.md#what-the-owner-must-run). `package` stamps the binaries with the checkout's `git describe --tags --always --dirty` (or `AGENT_HISTORY_BUILD_ID`, when set), so `agent-history --version` prints for example `agent-history 0.1.0 (v0.1.0-rc.3)`; a plain `cargo build` prints `(development build)`. To build and run just the standalone app without compiling the Herdr integration:
 
 ```sh
 cargo build --release -p agent-history-cli

@@ -27,14 +27,29 @@ if [ -n "$profile" ]; then
     echo "package: notarytool cannot use keychain profile \"$profile\"; create it with xcrun notarytool store-credentials" >&2; exit 2
   fi
 fi
+# Every 0.1.0 prerelease shares the crate version, so the binaries carry the
+# tag (or commit) they were built from; `--version` prints it.
+build_id=${AGENT_HISTORY_BUILD_ID:-}
+if [ -z "$build_id" ]; then build_id=$(git describe --tags --always --dirty 2>/dev/null || true); fi
+if [ -z "$build_id" ]; then
+  echo "package: cannot identify this build; run from a git checkout or set AGENT_HISTORY_BUILD_ID" >&2; exit 2
+fi
+case "$build_id" in
+  -*|*[!A-Za-z0-9._+-]*) echo "package: build identifier \"$build_id\" may contain only letters, digits and . _ + -" >&2; exit 2 ;;
+esac
 mkdir -p "$out"
 archive="$out/agent-history-macos-arm64.tar.gz"
 if [ -e "$archive" ]; then echo "package: refusing to overwrite $archive" >&2; exit 2; fi
 ./scripts/check
-cargo build --release --locked -p agent-history-cli -p agent-history-herdr
+AGENT_HISTORY_BUILD_ID=$build_id cargo build --release --locked -p agent-history-cli -p agent-history-herdr
 for name in $binaries; do
   if [ ! -x "target/release/$name" ]; then echo "package: required binary target/release/$name is missing" >&2; exit 2; fi
 done
+built_version=$(target/release/agent-history --version)
+case "$built_version" in
+  *"($build_id)") echo "package: $built_version" ;;
+  *) echo "package: target/release/agent-history reports \"$built_version\", not build $build_id" >&2; exit 1 ;;
+esac
 if [ ! -f plugin/agent-history/herdr-plugin.toml ]; then echo "package: Herdr plugin manifest is missing" >&2; exit 2; fi
 stage=$(mktemp -d "${TMPDIR:-/tmp}/agent-history-package.XXXXXX")
 trap 'rm -rf "$stage"' EXIT INT TERM
