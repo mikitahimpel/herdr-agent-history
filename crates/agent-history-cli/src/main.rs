@@ -138,10 +138,16 @@ fn search(db: PathBuf, o: Options) -> Result<(), String> {
         return Err("search requires a query".into());
     }
     let store = open(&db)?;
-    let results = store
-        .search_with_role(&o.query.join(" "), 50, o.role)
+    let outcome = store
+        .search_with_fallback(&o.query.join(" "), 50, o.role)
         .map_err(|e| sanitize(&e.to_string()))?;
-    for (i, r) in results.iter().enumerate() {
+    if let Some(widened) = outcome.approximation() {
+        eprintln!(
+            "agent-history: no exact matches; showing near matches for {}",
+            sanitize(&widened)
+        );
+    }
+    for (i, r) in outcome.results.iter().enumerate() {
         let agent = match r.agent {
             Agent::Claude => "Claude",
             Agent::Codex => "Codex",

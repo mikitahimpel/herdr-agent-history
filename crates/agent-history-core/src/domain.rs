@@ -123,6 +123,51 @@ pub struct SearchResult {
     pub source: SourceRef,
     pub snippet: String,
 }
+/// Search results, and how the query was widened if the exact query matched
+/// nothing.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, Eq, PartialEq)]
+pub struct SearchOutcome {
+    pub results: Vec<SearchResult>,
+    /// Empty when `results` match the query exactly as typed. Otherwise the
+    /// results are near matches and each entry is a word that was widened.
+    pub widened: Vec<Widening>,
+}
+impl SearchOutcome {
+    pub fn is_approximate(&self) -> bool {
+        !self.widened.is_empty()
+    }
+    /// One line describing the widening, e.g. `databse → database, databse*`.
+    pub fn approximation(&self) -> Option<String> {
+        if self.widened.is_empty() {
+            return None;
+        }
+        Some(
+            self.widened
+                .iter()
+                .map(Widening::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+}
+/// A query word that is not in the index, and the indexed words searched in
+/// its place. The word is also searched as a prefix.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct Widening {
+    /// The word as the index would store it: lowercase.
+    pub typed: String,
+    /// Indexed words within a small edit distance, closest first.
+    pub near: Vec<String>,
+}
+impl std::fmt::Display for Widening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} → ", self.typed)?;
+        for word in &self.near {
+            write!(f, "{word}, ")?;
+        }
+        write!(f, "{}*", self.typed)
+    }
+}
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct IndexedFile {
     pub path: PathBuf,

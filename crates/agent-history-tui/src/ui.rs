@@ -398,6 +398,16 @@ fn draw_results(
 ) {
     let focused = state.mode == Mode::Results;
     let mut block = pane("Results", focused, p);
+    if !state.widened.is_empty() {
+        // Room for the left title and the corners.
+        let room = usize::from(area.width).saturating_sub(width_of(" Results ") + 4);
+        let widened: Vec<String> = state.widened.iter().map(ToString::to_string).collect();
+        let label = safe(
+            &format!(" ≈ no exact match · near: {} ", widened.join("; ")),
+            room,
+        );
+        block = block.title(Line::styled(label, p.approximate()).right_aligned());
+    }
     if !state.results.is_empty() {
         block = block.title_bottom(
             Line::styled(
@@ -431,7 +441,7 @@ fn draw_results(
         state.list_offset = state.selected + 1 - per_page;
     }
     state.list_offset = state.list_offset.min(state.results.len() - 1);
-    let terms = query_terms(&state.query);
+    let terms = highlight_terms(state);
     let content_w = w.saturating_sub(3);
     let mut lines = Vec::new();
     for (i, r) in state
@@ -499,6 +509,17 @@ fn draw_results(
         lines.extend(item);
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The words to highlight: the query's own, plus the near words searched in
+/// place of any widened word.
+fn highlight_terms(state: &BrowserState) -> Vec<String> {
+    let mut terms = query_terms(&state.query);
+    for w in &state.widened {
+        terms.extend(w.near.iter().cloned());
+        terms.push(format!("{}*", w.typed));
+    }
+    terms
 }
 
 fn draw_empty(frame: &mut Frame, area: Rect, state: &BrowserState, p: &Palette) {
@@ -694,7 +715,7 @@ fn draw_preview(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Pal
         ));
         lines.into_iter().map(|l| (l, false)).collect()
     } else {
-        preview_lines(&state.preview, w, &query_terms(&state.query), p)
+        preview_lines(&state.preview, w, &highlight_terms(state), p)
     };
     let visible = usize::from(content.height);
     if state.preview_anchor {
@@ -1317,6 +1338,39 @@ mod tests {
             assert_eq!(buf[(x, sep)].bg, Color::Reset, "separator is not selected");
         }
         assert_eq!(buf[(inner.x + 1, ay)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn near_matches_are_labelled_and_highlight_the_indexed_word() {
+        let temp = TempDir::new("ui-near").unwrap();
+        let store = rememberable(temp.path());
+        let mut state = BrowserState {
+            query: "rememberabel".into(),
+            ..Default::default()
+        };
+        state.refresh(&store);
+        assert_eq!(state.results.len(), 2);
+        assert_eq!(state.widened.len(), 1);
+        let p = Palette::terminal();
+        let buf = render(&mut state, &Standalone, 160, 30);
+        let (lx, ly) = find(&buf, "≈ no exact match · near: rememberabel → rememberable")
+            .expect("near-match label");
+        assert_eq!(buf[(lx, ly)].fg, p.peach);
+        let (rx, ry) = find(&buf, "rememberable topic").expect("result text");
+        assert_eq!(buf[(rx, ry)].bg, p.yellow, "the matched indexed word");
+
+        state.query = "rememberable".into();
+        state.refresh(&store);
+        assert!(state.widened.is_empty());
+        let buf = render(&mut state, &Standalone, 160, 30);
+        assert!(find(&buf, "no exact match").is_none());
+
+        state.query = "zzzzqqqq".into();
+        state.refresh(&store);
+        assert!(state.results.is_empty() && state.widened.is_empty());
+        let buf = render(&mut state, &Standalone, 160, 30);
+        assert!(find(&buf, "No matching conversations").is_some());
+        assert!(find(&buf, "no exact match").is_none());
     }
 
     #[test]
