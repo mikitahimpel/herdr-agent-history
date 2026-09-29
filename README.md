@@ -50,7 +50,7 @@ curl -fsSL https://raw.githubusercontent.com/mikitahimpel/herdr-agent-history/ma
 
 To read the script before running it, download it with `curl -fsSLO …/install.sh`, then run `sh install.sh`.
 
-If the installer says `~/.local/bin is not on your PATH`, add it for new Terminal windows and open one. macOS's default shell is zsh:
+If the installer reports that its directory `is not on your PATH`, add it for new Terminal windows and open one. macOS's default shell is zsh:
 
 ```sh
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc

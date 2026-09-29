@@ -8,7 +8,7 @@
 #   ... | sh -s -- --prefix DIR       install into DIR (absolute) instead of ~/.local/bin
 #
 # It never uses sudo and never edits shell profiles or Herdr configuration.
-# The only network access is the two release URLs printed before downloading.
+# Its only network access is to the release URLs it prints before downloading.
 set -eu
 
 # Updated with every release. The hash is of the published archive.
@@ -121,10 +121,11 @@ esac
 echo "Search your history:  agent-history browse"
 echo "Resume from Herdr:    herdr plugin install $repo/plugin/agent-history --ref $tag"
 echo "                      herdr plugin pane open --plugin agent-history --entrypoint search"
-echo "Herdr starts the overlay with its server's PATH. If Herdr was already running"
-echo "before $prefix was on PATH, the pane fails with 'No viable candidates found"
-echo "in PATH': save your work, run 'herdr server stop' (closes every pane), and"
-echo "start herdr again from a new Terminal window."
+echo
+echo "Herdr runs the overlay with its server's PATH, not your shell's. If Herdr was"
+echo "started before $prefix was on PATH, 'plugin pane open' fails with"
+echo "'No viable candidates found in PATH'. Save your work, run 'herdr server stop'"
+echo "(it closes every pane), and start herdr again from a new Terminal window."
 }
 
 main "$@"
