@@ -4,19 +4,16 @@ use crate::{
     markdown,
     text::{self, matches, query_terms, safe, width},
     theme::Palette,
-    BrowserState, Integration, Mode, RoleFilter, SessionState, RESULT_LIMIT,
+    BrowserState, Indexing, Integration, Mode, RoleFilter, SessionState, RESULT_LIMIT,
 };
-use agent_history_core::{
-    availability::Availability, index::IndexProgress, Agent, EventKind, SearchResult,
-};
+use agent_history_core::{availability::Availability, Agent, EventKind, SearchResult};
 use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Clear, LineGauge, Paragraph},
+    widgets::{Block, BorderType, Clear, Paragraph},
     Frame,
 };
-use std::time::Duration;
 
 /// Below this width the results and preview panes stack vertically.
 pub(crate) const SIDE_BY_SIDE_MIN_WIDTH: u16 = 80;
@@ -170,10 +167,28 @@ fn width_of(s: &str) -> usize {
     width(s)
 }
 
+/// The index status for the header. Anything short of a finished scan is
+/// drawn in a warning color, because results may then be missing.
+fn index_status(state: &BrowserState, p: &Palette) -> (String, Style) {
+    let warning = Style::new().fg(p.yellow).add_modifier(Modifier::BOLD);
+    match state.indexing {
+        Indexing::Running { total: 0, .. } => {
+            ("Indexing… results may be incomplete".into(), warning)
+        }
+        Indexing::Running { checked, total } => (
+            format!("Indexing {checked}/{total} files… results may be incomplete"),
+            warning,
+        ),
+        Indexing::Incomplete => (state.status.clone(), warning),
+        Indexing::Settled => (state.status.clone(), p.muted()),
+    }
+}
+
 fn draw_header(frame: &mut Frame, area: Rect, state: &BrowserState, title: &str, p: &Palette) {
     let title = safe(title, area.width.saturating_sub(2).into());
     let room = usize::from(area.width).saturating_sub(width_of(&title) + 4);
-    let status = safe(&state.status, room);
+    let (status, style) = index_status(state, p);
+    let status = safe(&status, room);
     let gap = usize::from(area.width).saturating_sub(width_of(&title) + width_of(&status) + 2);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -182,7 +197,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &BrowserState, title: &str,
                 Style::new().fg(p.accent).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" ".repeat(gap)),
-            Span::styled(status, p.muted()),
+            Span::styled(status, style),
             Span::raw(" "),
         ])),
         area,
@@ -193,15 +208,16 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &BrowserState, title: &str,
 /// gets the whole width instead of repeating the host's title.
 fn draw_status_strip(frame: &mut Frame, area: Rect, state: &BrowserState, p: &Palette) {
     let label = "Index ";
+    let (status, style) = index_status(state, p);
     let status = safe(
-        &state.status,
+        &status,
         usize::from(area.width).saturating_sub(width_of(label) + 2),
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw(" "),
             Span::styled(label, p.key()),
-            Span::styled(status, p.muted()),
+            Span::styled(status, style),
         ])),
         area,
     );
@@ -537,6 +553,21 @@ fn draw_empty(frame: &mut Frame, area: Rect, state: &BrowserState, p: &Palette) 
             "Type words you remember from a Claude Code or Codex session.",
             p.muted(),
         );
+    } else if let Indexing::Running { checked, total } = state.indexing {
+        push(&mut lines, "No matches yet", p.error());
+        let progress = if total == 0 {
+            "Indexing is still looking for changed conversations".to_string()
+        } else {
+            format!("Indexing is still running ({checked} of {total} files checked)")
+        };
+        push(
+            &mut lines,
+            &format!(
+                "{progress}, so “{}” may match once it finishes. Results update on their own.",
+                state.query.trim()
+            ),
+            Style::new().fg(p.text),
+        );
     } else {
         push(&mut lines, "No matching conversations", p.error());
         push(
@@ -554,6 +585,14 @@ fn draw_empty(frame: &mut Frame, area: Rect, state: &BrowserState, p: &Palette) 
             "Try fewer words, a prefix such as portf*, or F2 to change the role filter.",
             p.muted(),
         );
+        if state.indexing == Indexing::Incomplete {
+            lines.push(Line::raw(""));
+            push(
+                &mut lines,
+                "The index was not fully updated, so recent conversations may be missing.",
+                Style::new().fg(p.yellow),
+            );
+        }
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -862,104 +901,6 @@ fn draw_keys(
         Paragraph::new(fit(spans, area.width.into())).style(p.bar()),
         area,
     );
-}
-
-/// `title` is `None` when the host already titles the pane.
-pub(crate) fn draw_progress(
-    frame: &mut Frame,
-    p: &Palette,
-    title: Option<&str>,
-    tick: usize,
-    elapsed: Duration,
-    progress: Option<&IndexProgress>,
-) {
-    let area = frame.area();
-    frame.render_widget(Block::new().style(p.base()), area);
-    let width = area.width.min(64);
-    let height = area.height.min(7);
-    if width < 8 || height < 3 {
-        return;
-    }
-    let box_area = Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + (area.height - height) / 2,
-        width,
-        height,
-    };
-    let mut block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(p.border(true));
-    if let Some(title) = title {
-        block = block.title(Span::styled(
-            format!(" {} ", safe(title, width.saturating_sub(4).into())),
-            p.pane_title(true),
-        ));
-    }
-    let inner = block.inner(box_area);
-    frame.render_widget(block, box_area);
-    let w = usize::from(inner.width);
-    let spinner = ['◐', '◓', '◑', '◒'][tick % 4];
-    let heading = format!("{spinner} Indexing conversations");
-    let secs = format!("{:.1}s", elapsed.as_secs_f32());
-    let gap = w.saturating_sub(width_of(&heading) + width_of(&secs) + 2);
-    let mut lines = vec![
-        fit(
-            vec![
-                Span::raw(" "),
-                Span::styled(heading, p.key()),
-                Span::raw(" ".repeat(gap)),
-                Span::styled(secs, p.muted()),
-            ],
-            w,
-        ),
-        // Row 1 is drawn over by the gauge.
-        Line::raw(""),
-    ];
-    let stats = match progress {
-        Some(pr) => format!(
-            " {} MB read · {} records · {} chunks · {} failed",
-            pr.bytes_read / (1024 * 1024),
-            pr.records,
-            pr.chunks,
-            pr.failed_files
-        ),
-        None => " Preparing conversation index…".into(),
-    };
-    lines.push(fit(vec![Span::styled(stats, p.muted())], w));
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(" Ctrl-C cancels", p.muted()));
-    frame.render_widget(Paragraph::new(lines), inner);
-    if let (Some(pr), true) = (progress, inner.height > 1) {
-        let (agent, color) = match pr.agent {
-            Agent::Claude => ("Claude", p.peach),
-            Agent::Codex => ("Codex", p.teal),
-        };
-        let ratio = if pr.agent_total_files == 0 {
-            0.0
-        } else {
-            (pr.agent_completed_files as f64 / pr.agent_total_files as f64).clamp(0.0, 1.0)
-        };
-        let row = Rect {
-            x: inner.x + 1,
-            y: inner.y + 1,
-            width: inner.width.saturating_sub(2),
-            height: 1,
-        };
-        frame.render_widget(
-            LineGauge::default()
-                .ratio(ratio)
-                .label(Span::styled(
-                    format!(
-                        "{agent} {}/{} files ",
-                        pr.agent_completed_files, pr.agent_total_files
-                    ),
-                    Style::new().fg(color).add_modifier(Modifier::BOLD),
-                ))
-                .filled_style(Style::new().fg(color))
-                .unfilled_style(Style::new().fg(p.surface1)),
-            row,
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1862,27 +1803,55 @@ mod tests {
     }
 
     #[test]
-    fn indexing_progress_omits_the_title_when_the_host_has_one() {
-        let draw_with = |title: Option<&str>| {
-            let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
-            terminal
-                .draw(|f| {
-                    draw_progress(
-                        f,
-                        &Palette::terminal(),
-                        title,
-                        0,
-                        std::time::Duration::from_secs(1),
-                        None,
-                    )
-                })
-                .unwrap();
-            let buf = terminal.backend().buffer().clone();
-            (0..20).map(|y| row(&buf, y)).collect::<String>()
+    fn a_running_scan_is_shown_and_an_empty_result_is_not_final() {
+        let temp = TempDir::new("ui-indexing").unwrap();
+        let (store, mut state) = searched(&temp);
+        state.indexing = Indexing::Running {
+            checked: 812,
+            total: 2510,
         };
-        assert!(draw_with(Some("Agent History (Standalone)")).contains("Agent History"));
-        let hosted = draw_with(None);
-        assert!(!hosted.contains("Agent History"));
-        assert!(hosted.contains("Indexing conversations"));
+        let buf = render(&mut state, &Standalone, 120, 30);
+        let (x, y) = find(&buf, "Indexing 812/2510 files… results may be incomplete")
+            .expect("progress replaces the settled status");
+        assert_eq!(buf[(x, y)].fg, Palette::terminal().yellow);
+        let top = row(&render(&mut state, &HostTitled, 120, 30), 0);
+        assert!(
+            top.contains("Index Indexing 812/2510 files… results may be incomplete"),
+            "{top:?}"
+        );
+
+        state.query = "nonexistent".into();
+        state.refresh(&store);
+        let buf = render(&mut state, &Standalone, 120, 30);
+        assert!(find(&buf, "No matches yet").is_some());
+        assert!(find(&buf, "No matching conversations").is_none());
+        assert!(find(&buf, "Indexing is still running (812 of 2510").is_some());
+        assert!(find(&buf, "may match once it").is_some());
+
+        state.indexing = Indexing::Running {
+            checked: 0,
+            total: 0,
+        };
+        let buf = render(&mut state, &Standalone, 120, 30);
+        assert!(find(&buf, "Indexing… results may be incomplete").is_some());
+    }
+
+    #[test]
+    fn an_unfinished_scan_stays_flagged_after_it_ends() {
+        let temp = TempDir::new("ui-incomplete").unwrap();
+        let (store, mut state) = searched(&temp);
+        state.indexing = Indexing::Incomplete;
+        state.status = "Index not updated: storage error".into();
+        state.query = "nonexistent".into();
+        state.refresh(&store);
+        let buf = render(&mut state, &Standalone, 120, 30);
+        let (x, y) = find(&buf, "Index not updated: storage error").unwrap();
+        assert_eq!(buf[(x, y)].fg, Palette::terminal().yellow);
+        assert!(find(&buf, "No matching conversations").is_some());
+        assert!(find(&buf, "The index was not fully updated").is_some());
+
+        state.indexing = Indexing::Settled;
+        let buf = render(&mut state, &Standalone, 120, 30);
+        assert!(find(&buf, "The index was not fully updated").is_none());
     }
 }
