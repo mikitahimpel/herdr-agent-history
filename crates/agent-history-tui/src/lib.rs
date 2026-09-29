@@ -6,6 +6,7 @@ use agent_history_core::{
     index::{index_all_with_progress, IndexProgress},
     preview::preview_source,
     CoreError, EventKind, Result, SearchResult, Session, SessionId, SourceRef, SqliteStore,
+    Widening,
 };
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -119,6 +120,9 @@ impl RoleFilter {
 pub struct BrowserState {
     pub query: String,
     pub results: Vec<SearchResult>,
+    /// Non-empty when nothing matched the query exactly and `results` are
+    /// near matches found by widening these words.
+    pub widened: Vec<Widening>,
     pub selected: usize,
     pub mode: Mode,
     /// Original conversation around the selected result.
@@ -154,14 +158,16 @@ pub struct BrowserState {
 }
 impl BrowserState {
     pub fn refresh(&mut self, store: &SqliteStore) {
-        match store.search_with_role(&self.query, RESULT_LIMIT, self.role_filter.kind()) {
-            Ok(items) => {
-                self.results = items;
+        match store.search_with_fallback(&self.query, RESULT_LIMIT, self.role_filter.kind()) {
+            Ok(outcome) => {
+                self.results = outcome.results;
+                self.widened = outcome.widened;
                 self.selected = self.selected.min(self.results.len().saturating_sub(1));
                 self.error = None;
             }
             Err(e) => {
                 self.results.clear();
+                self.widened.clear();
                 self.selected = 0;
                 self.error = Some(e.to_string());
             }

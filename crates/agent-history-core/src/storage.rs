@@ -1,7 +1,7 @@
 //! Disposable local SQLite index. Native transcript files are never written here.
 use crate::{
-    Agent, CoreError, GitOrigin, GitProvenance, IndexBatch, IndexedFile, Result, SearchResult,
-    Session, SessionId, SessionRecord, Store,
+    Agent, CoreError, GitOrigin, GitProvenance, IndexBatch, IndexedFile, Result, SearchOutcome,
+    SearchResult, Session, SessionId, SessionRecord, Store,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
@@ -308,6 +308,130 @@ impl SqliteStore {
     pub fn commit_batch(&mut self, batch: IndexBatch) -> Result<()> {
         <Self as Store>::commit_batch(self, batch)
     }
+
+    /// Searches exactly as [`Self::search_with_role`] does and, only when that
+    /// finds nothing, retries with each unindexed bare word widened to indexed
+    /// words a small edit distance away (see
+    /// [`crate::query::lenient_match_expression`]). The outcome names every
+    /// widened word, so callers can show that the results are approximate.
+    pub fn search_with_fallback(
+        &self,
+        query: &str,
+        limit: usize,
+        kind: Option<crate::EventKind>,
+    ) -> Result<SearchOutcome> {
+        let results = self.search_with_role(query, limit, kind)?;
+        if !results.is_empty() || query.trim().is_empty() || limit == 0 {
+            return Ok(SearchOutcome {
+                results,
+                widened: Vec::new(),
+            });
+        }
+        let Some((expression, widened)) =
+            crate::query::lenient_match_expression(query, |word| self.near_words(word))?
+        else {
+            return Ok(SearchOutcome::default());
+        };
+        let results = self.search_expression(&expression, limit, kind)?;
+        if results.is_empty() {
+            return Ok(SearchOutcome::default());
+        }
+        Ok(SearchOutcome { results, widened })
+    }
+
+    /// `None` when `word` is itself indexed; otherwise the indexed words near it.
+    ///
+    /// Reads FTS5's own term list through a temporary `fts5vocab` table, so the
+    /// fallback adds nothing to the database file. Only words sharing the first
+    /// character, or starting with the first two characters swapped, are
+    /// scanned: the whole vocabulary costs far more to read than a slice of it.
+    fn near_words(&self, word: &str) -> Result<Option<Vec<String>>> {
+        self.conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS temp.chunks_vocab USING fts5vocab(main, 'chunks_fts', 'row');",
+        )?;
+        let indexed: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM temp.chunks_vocab WHERE term=?)",
+            [word],
+            |r| r.get(0),
+        )?;
+        if indexed {
+            return Ok(None);
+        }
+        let mut chars = word.chars();
+        let (Some(first), second) = (chars.next(), chars.next()) else {
+            return Ok(Some(Vec::new()));
+        };
+        let mut prefixes = vec![first.to_string()];
+        if let Some(second) = second.filter(|&c| c != first) {
+            prefixes.push(format!("{second}{first}"));
+        }
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT term,doc FROM temp.chunks_vocab WHERE term>=? AND term<?")?;
+        let mut vocabulary = Vec::new();
+        for prefix in prefixes {
+            let rows = st.query_map(params![prefix, prefix_end(&prefix)], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+            })?;
+            for row in rows {
+                vocabulary.push(row?);
+            }
+        }
+        Ok(Some(crate::query::near_words(word, vocabulary)))
+    }
+
+    fn search_expression(
+        &self,
+        expression: &str,
+        limit: usize,
+        role: Option<crate::EventKind>,
+    ) -> Result<Vec<SearchResult>> {
+        let limit = limit.min(MAX_LIMIT);
+        let mut st=self.conn.prepare("SELECT c.agent,c.native_id,s.repository,s.branch,s.cwd,c.timestamp,c.kind,c.source_path,c.source_file_id,c.source_generation,c.source_start,c.source_end,snippet(chunks_fts,0,'','', ' … ', 24),s.repository_url,s.git_origin FROM chunks_fts JOIN search_chunks c ON c.rowid=chunks_fts.rowid JOIN sessions s ON s.agent=c.agent AND s.native_id=c.native_id WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?) ORDER BY bm25(chunks_fts),c.agent,c.native_id,c.ordinal LIMIT ?")?;
+        let rows = st
+            .query_map(
+                params![expression, role.map(kind_i), role.map(kind_i), limit as i64],
+                |r| {
+                    Ok(SearchResult {
+                        session_id: SessionId::new(agent_from(r.get(0)?)?, r.get::<_, String>(1)?),
+                        agent: agent_from(r.get(0)?)?,
+                        repository: r.get(2)?,
+                        repository_url: r.get(13)?,
+                        git_origin: r.get::<_, Option<i64>>(14)?.map(origin_from).transpose()?,
+                        branch: r.get(3)?,
+                        cwd: r.get::<_, Option<String>>(4)?.map(PathBuf::from),
+                        timestamp: from_ts(r.get(5)?),
+                        kind: kind_from(r.get(6)?)?,
+                        source: crate::SourceRef::new(
+                            PathBuf::from(r.get::<_, String>(7)?),
+                            r.get(8)?,
+                            r.get(9)?,
+                            r.get(10)?..r.get(11)?,
+                        )
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        snippet: r.get(12)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
+/// The smallest string greater than every string starting with `prefix`, in
+/// SQLite's byte order (which is code point order for UTF-8).
+fn prefix_end(prefix: &str) -> String {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let next = (last as u32 + 1..=char::MAX as u32).find_map(char::from_u32);
+        if let Some(next) = next {
+            chars.push(next);
+            return chars.into_iter().collect();
+        }
+    }
+    // A prefix of only `char::MAX` has no finite bound; this one covers every
+    // word at most one character longer.
+    char::MAX.to_string().repeat(prefix.chars().count() + 1)
 }
 
 impl Store for SqliteStore {
@@ -376,36 +500,8 @@ impl Store for SqliteStore {
         if query.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let limit = limit.min(MAX_LIMIT);
         let expression = crate::query::fts_match_expression(query);
-        let mut st=self.conn.prepare("SELECT c.agent,c.native_id,s.repository,s.branch,s.cwd,c.timestamp,c.kind,c.source_path,c.source_file_id,c.source_generation,c.source_start,c.source_end,snippet(chunks_fts,0,'','', ' … ', 24),s.repository_url,s.git_origin FROM chunks_fts JOIN search_chunks c ON c.rowid=chunks_fts.rowid JOIN sessions s ON s.agent=c.agent AND s.native_id=c.native_id WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?) ORDER BY bm25(chunks_fts),c.agent,c.native_id,c.ordinal LIMIT ?")?;
-        let rows = st
-            .query_map(
-                params![expression, role.map(kind_i), role.map(kind_i), limit as i64],
-                |r| {
-                    Ok(SearchResult {
-                        session_id: SessionId::new(agent_from(r.get(0)?)?, r.get::<_, String>(1)?),
-                        agent: agent_from(r.get(0)?)?,
-                        repository: r.get(2)?,
-                        repository_url: r.get(13)?,
-                        git_origin: r.get::<_, Option<i64>>(14)?.map(origin_from).transpose()?,
-                        branch: r.get(3)?,
-                        cwd: r.get::<_, Option<String>>(4)?.map(PathBuf::from),
-                        timestamp: from_ts(r.get(5)?),
-                        kind: kind_from(r.get(6)?)?,
-                        source: crate::SourceRef::new(
-                            PathBuf::from(r.get::<_, String>(7)?),
-                            r.get(8)?,
-                            r.get(9)?,
-                            r.get(10)?..r.get(11)?,
-                        )
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                        snippet: r.get(12)?,
-                    })
-                },
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        self.search_expression(&expression, limit, role)
     }
 }
 
@@ -598,6 +694,195 @@ mod tests {
             text: text.into(),
         }
     }
+    fn lenient_fixture(name: &str) -> (crate::test_support::TempDir, SqliteStore) {
+        let dir = crate::test_support::TempDir::new(name).unwrap();
+        let mut db = SqliteStore::open(dir.path().join("private/index.sqlite")).unwrap();
+        let texts = [
+            "the database migration failed on startup",
+            "we moved the database to a new worktree",
+            "portfolio visibility review",
+            "the cache layer is fine",
+            "typo reciept kept verbatim here",
+        ];
+        let s = session(Agent::Codex, "lenient", 4, 1);
+        let mut chunks: Vec<ConversationChunk> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| chunk(&s.id, 4, 1, i as u64, t))
+            .collect();
+        chunks[1].kind = crate::EventKind::Assistant;
+        db.commit_batch(IndexBatch {
+            sessions: vec![s.into()],
+            chunks,
+            ..Default::default()
+        })
+        .unwrap();
+        (dir, db)
+    }
+
+    fn lenient(db: &SqliteStore, query: &str) -> (Vec<String>, Option<String>) {
+        let outcome = db
+            .search_with_fallback(query, 50, None)
+            .unwrap_or_else(|e| panic!("query {query:?} failed: {e}"));
+        let mut snippets: Vec<String> = outcome.results.iter().map(|r| r.snippet.clone()).collect();
+        snippets.sort();
+        (snippets, outcome.approximation())
+    }
+
+    #[test]
+    fn fallback_finds_misspelled_and_transposed_words_and_says_so() {
+        let (_dir, db) = lenient_fixture("storage-lenient-typo");
+        let (hits, note) = lenient(&db, "datbase");
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits.iter().all(|h| h.contains("database")));
+        assert_eq!(note.as_deref(), Some("datbase → database, datbase*"));
+        let (hits, note) = lenient(&db, "receipt");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(note.as_deref(), Some("receipt → reciept, receipt*"));
+        // Adjacent swaps, including of the first two characters.
+        for query in ["databsae", "adtabase", "DATABSAE"] {
+            let (hits, note) = lenient(&db, query);
+            assert_eq!(hits.len(), 2, "{query:?} -> {hits:?}");
+            assert!(note.unwrap().contains("→ database"), "{query:?}");
+        }
+        // An unfinished word matches as a prefix.
+        let (hits, note) = lenient(&db, "worktre");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(note.as_deref(), Some("worktre → worktre*"));
+        // The role filter still applies to near matches.
+        let outcome = db
+            .search_with_fallback("databsae", 50, Some(crate::EventKind::Assistant))
+            .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        assert!(outcome.is_approximate());
+    }
+
+    #[test]
+    fn fallback_does_not_fire_when_the_exact_query_matches() {
+        let (_dir, db) = lenient_fixture("storage-lenient-exact");
+        for query in [
+            "database",
+            "reciept",
+            "cache",
+            "portfol*",
+            "\"database migration\"",
+        ] {
+            let outcome = db.search_with_fallback(query, 50, None).unwrap();
+            assert!(!outcome.results.is_empty(), "{query:?}");
+            assert!(!outcome.is_approximate(), "{query:?}");
+            assert_eq!(outcome.results, db.search(query, 50).unwrap(), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn fallback_skips_short_unmatched_and_punctuation_only_queries() {
+        let (_dir, db) = lenient_fixture("storage-lenient-none");
+        // `fne` is one edit from `fine` but too short to widen.
+        for query in [
+            "fne",
+            "teh",
+            "zzzzqqqq",
+            "?!",
+            "---",
+            "()",
+            "\"",
+            "*",
+            "   ",
+            "\"databsae migration\"",
+            "databsae*",
+        ] {
+            let outcome = db.search_with_fallback(query, 50, None).unwrap();
+            assert!(outcome.results.is_empty(), "{query:?}");
+            assert!(!outcome.is_approximate(), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn fallback_keeps_operators_phrases_and_prefixes_exact() {
+        let (_dir, db) = lenient_fixture("storage-lenient-ops");
+        let (hits, note) = lenient(&db, "\"migration failed\" AND databsae");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].contains("migration failed"));
+        assert_eq!(note.as_deref(), Some("databsae → database, databsae*"));
+        let (hits, _) = lenient(&db, "databsae NOT migration");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].contains("worktree"));
+        // One side of `OR` matched exactly, so nothing is widened.
+        let (hits, note) = lenient(&db, "databsae OR portfolio");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(note.is_none());
+        let (hits, note) = lenient(&db, "databsae OR portfolo");
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert_eq!(
+            note.as_deref(),
+            Some("databsae → database, databsae*; portfolo → portfolio, portfolo*")
+        );
+        let (hits, note) = lenient(&db, "migr* AND databsae");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(note.is_some());
+        // An indexed word is kept exact while its misspelled neighbour widens.
+        let (hits, note) = lenient(&db, "worktree databsae");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(note.as_deref(), Some("databsae → database, databsae*"));
+        // A negated word is never widened, so the exclusion does not grow.
+        let (hits, note) = lenient(&db, "startup NOT databsae");
+        assert_eq!(hits.len(), 1);
+        assert!(note.is_none());
+        // Nothing near every word: no results, and nothing claimed.
+        let (hits, note) = lenient(&db, "databsae AND zzzzqqqq");
+        assert!(hits.is_empty() && note.is_none());
+        // Every retry expression parses, wherever the widened word sits.
+        for query in [
+            "NOT databsae",
+            "databsae OR",
+            "databsae AND",
+            "AND databsae portfolo",
+            "(databsae)",
+            "\"databsae",
+            "databsae \"migration failed\" portfol*",
+            "databsae NOT zzzzqqqq worktre",
+            "databsae -- ?! wroktree",
+            &"databsae ".repeat(500),
+            &"qwertyuiop ".repeat(50),
+        ] {
+            lenient(&db, query);
+        }
+    }
+
+    #[test]
+    fn fallback_leaves_the_database_file_untouched() {
+        let (dir, db) = lenient_fixture("storage-lenient-size");
+        let path = dir.path().join("private/index.sqlite");
+        let before = (pragma(&db, "page_count"), pragma(&db, "schema_version"));
+        let size = fs::metadata(&path).unwrap().len();
+        assert!(db
+            .search_with_fallback("databsae", 10, None)
+            .unwrap()
+            .is_approximate());
+        assert_eq!(
+            (pragma(&db, "page_count"), pragma(&db, "schema_version")),
+            before
+        );
+        drop(db);
+        assert_eq!(fs::metadata(&path).unwrap().len(), size);
+        let reopened = SqliteStore::open(&path).unwrap();
+        assert!(reopened
+            .search_with_fallback("databsae", 10, None)
+            .unwrap()
+            .is_approximate());
+    }
+
+    #[test]
+    fn prefix_end_bounds_every_word_with_the_prefix() {
+        assert_eq!(prefix_end("d"), "e");
+        assert_eq!(prefix_end("ad"), "ae");
+        assert_eq!(prefix_end("\u{d7ff}"), "\u{e000}");
+        assert_eq!(prefix_end("a\u{10ffff}"), "b");
+        for word in ["d", "da", "dzzzz", "d\u{10ffff}"] {
+            assert!(word >= "d" && word < prefix_end("d").as_str(), "{word:?}");
+        }
+    }
+
     #[test]
     fn user_queries_with_punctuation_search_words_through_fts() {
         let dir = crate::test_support::TempDir::new("storage-query").unwrap();

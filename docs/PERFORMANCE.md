@@ -143,3 +143,67 @@ Not evidenced, or only partially evidenced, by this run:
 - **Search timing methodology differs between the synthetic and real-corpus sections of this document** (warm in-process vs. cold CLI invocation), as noted above; they are not directly comparable numbers.
 - **This does not cover Herdr overlay activation, native resume, or worktree recovery** against the real corpus — those require a Herdr-managed session and are out of scope for this task (see `docs/RELEASE_STATUS.md`'s own noted external blocker).
 - **This task does not author the storage fix.** The compaction logic (`crates/**`) is `claude/git-provenance`'s work, merged into this branch's base; this task only measured its effect before and after, on the real corpus and the real pre-fix database, and did not modify `crates/**` itself.
+
+## Near-match fallback (#28)
+
+Search retries leniently only when the exact query returns nothing (shape B in #28). The retry reads FTS5's existing term dictionary through a temporary `fts5vocab` table and compares spelling by edit distance. It adds no table, column, trigger or schema version, so the exact path runs the same SQL as before. See the README's "Near matches" paragraph for the behaviour.
+
+### Reproduce
+
+```sh
+# Synthetic, in process: exact p50/p95 as before, plus a misspelled-query set.
+cargo build --release --locked --example benchmark -p agent-history-core
+./target/release/examples/benchmark
+
+# Real index, in process. Opening can upgrade a schema, so pass a private copy.
+copy="$(mktemp -d)/index.sqlite"; chmod 700 "$(dirname "$copy")"
+cp "$HOME/Library/Application Support/Herdr Agent History/index.sqlite" "$copy"
+cargo run --release --locked -p agent-history-core --example search_latency -- "$copy"
+rm -rf "$(dirname "$copy")"
+
+# Storage against the real corpus, as in the section above.
+./scripts/measure-real-corpus --claude-config-dir "$HOME/.claude" --codex-home "$HOME/.codex"
+```
+
+"Before" is `main` at `7f8a3fd` and "after" is this change. Both were built with the same toolchain on the same Apple M1 (macOS 26.6.2) and run on 2026-09-29.
+
+### Exact-path latency: unchanged
+
+| Measurement | Before | After |
+| --- | --- | --- |
+| Synthetic benchmark, warm in process, 200 queries, three alternating runs: p50 | 27.72 / 28.06 / 27.62 ms | 27.98 / 27.59 / 27.49 ms |
+| Same runs: p95 | 29.77 / 33.38 / 29.72 ms | 33.29 / 30.18 / 31.23 ms |
+| Real index (21,146 chunks), warm in process, 8 queries × 20, three runs: p50 via `search_with_role` | — | 10.82 / 10.86 / 10.80 ms |
+| Same queries via `search_with_fallback` (they match, so no retry): p50 | — | 10.80 / 10.92 / 10.82 ms |
+| Real index, cold CLI (spawn + open + query), 8 queries × 10, before and after alternated per sample: p50 / p95 | 17.8 / 31.7 ms | 17.8 / 27.1 ms |
+
+On a hit, the only added work is a check that the result list is non-empty. The before and after figures agree within run-to-run noise, and exact ranking is untouched because the same expression and `ORDER BY bm25(...)` run.
+
+### Fallback latency: the new cost, paid only on a miss
+
+| Measurement | Result |
+| --- | --- |
+| Synthetic benchmark, warm in process, 10 misspellings × 20, three runs: p50 / p95 | 31.19 / 35.68, 30.89 / 36.04, 30.65 / 36.99 ms |
+| Real index, warm in process, 8 misspellings × 20, three runs: p50 / p95 / max | 37.4 / 52.2 / 116 ms; 37.4 / 50.7 / 121 ms; 37.2 / 51.0 / 190 ms |
+| Real index, cold CLI, 8 misspellings × 10: p50 / p95 | before (empty result) 6.4 / 6.9 ms; after (near matches) 44.1 / 57.5 ms |
+
+A miss therefore costs about 26–38 ms more than it did, which stays inside the RFC's 100 ms p95 search target. The cost is dominated by the vocabulary scan: `fts5vocab` counts documents for every term it returns, which means reading doclists. Scanning the whole dictionary (50,471 terms) took about 1.2 s. That is why the retry only reads terms that share the typed word's first letter, or that start with its first two letters swapped (about 1,700–2,600 terms per letter here). Seven of the eight real-corpus misspellings (`fucntion`, `tset`, `indx`, `serach`, `reveiw`, `confgi`, `instal`) returned near matches. The eighth, `eror`, occurs verbatim once in the corpus, so the exact query matched and no retry ran.
+
+### Index size: no growth
+
+| Measurement | Before | After |
+| --- | --- | --- |
+| Synthetic benchmark database + WAL/SHM | 30,930,664 bytes | 30,930,664 bytes (identical) |
+| Real corpus, fresh private index (`scripts/measure-real-corpus`) | 123,432,960 bytes for 21,231 chunks from 10,756,080,592 raw bytes (1.15%) | 123,531,264 bytes for 21,238 chunks from 10,761,604,391 raw bytes (1.15%) |
+
+The 98,304-byte real-corpus difference is corpus growth between the two runs (5.5 MB more raw history and 7 more chunks from sessions active during the measurement), not the fallback. The fixed synthetic corpus shows the same file byte for byte. The temporary `fts5vocab` table lives in SQLite's per-connection `temp` schema and is never written to the index file; a unit test checks the page count, schema version and file size.
+
+For comparison, shape A (a trigram FTS5 index over the same chunk text) was measured on a vacuumed private copy of the real index. It adds 139,866,112 bytes of index pages, 2.87 times the existing 48,783,360-byte `unicode61` index, and grew that database from 153,759,744 to 293,797,888 bytes (+91%). That, plus a schema migration and changed ranking for every query, is why shape B was chosen.
+
+### Limitations
+
+- A misspelled first letter is not corrected, except when the first two letters are swapped. The vocabulary is read one first-letter range at a time to keep the retry fast.
+- Words shorter than four characters are never widened, and at most eight distinct words per query are.
+- A typo that happens to occur verbatim somewhere in the history matches exactly, so no retry runs.
+- The browser searches on every keystroke, so an unfinished word that matches nothing now costs the fallback's ~40 ms on that keystroke, and shows prefix near matches rather than an empty list.
+- One machine and one real corpus; the fallback timings depend on how many terms share the typed word's first letter.

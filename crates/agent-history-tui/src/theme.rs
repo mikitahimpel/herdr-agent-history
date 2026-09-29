@@ -125,6 +125,10 @@ impl Palette {
             _ => Style::new().bg(self.surface_dim),
         }
     }
+    /// Marks results that are near matches rather than exact ones.
+    pub(crate) fn approximate(&self) -> Style {
+        Style::new().fg(self.peach).add_modifier(Modifier::BOLD)
+    }
     pub(crate) fn error(&self) -> Style {
         Style::new().fg(self.red).add_modifier(Modifier::BOLD)
     }

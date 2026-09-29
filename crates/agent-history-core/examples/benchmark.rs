@@ -165,6 +165,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert!(!results.is_empty());
     }
     timings.sort_unstable();
+    // Each misspelling is absent from the corpus, so every call pays for the
+    // exact miss plus the lenient retry.
+    let misspelled = [
+        "portfolo",
+        "visibilty",
+        "websockt",
+        "subscriptoins",
+        "relaese",
+        "indexnig",
+        "repostiory",
+        "restortion",
+        "transactinal",
+        "canonicl",
+    ];
+    let mut fallback_timings = Vec::with_capacity(200);
+    for n in 0..200 {
+        let start = Instant::now();
+        let outcome = store.search_with_fallback(misspelled[n % misspelled.len()], 20, None)?;
+        fallback_timings.push(start.elapsed().as_nanos() / 1_000);
+        assert!(outcome.is_approximate() && !outcome.results.is_empty());
+    }
+    fallback_timings.sort_unstable();
     let db_bytes: u64 = ["", "-wal", "-shm"]
         .iter()
         .map(|suffix| {
@@ -187,6 +209,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("discovery_ms={discovery_ms:.3} initial_index_ms={indexing_ms:.3} records={} chunks={} sessions={}", initial.records + incremental.records, final_status.chunks, final_status.sessions);
     println!("incremental_append_bytes={} incremental_bytes_read={} incremental_index_ms={incremental_ms:.3}", append_bytes, incremental.bytes_read);
     println!("search_queries=200 warm_p50_us={p50_us} warm_p95_us={p95_us}");
+    println!(
+        "fallback_queries=200 fallback_warm_p50_us={} fallback_warm_p95_us={}",
+        percentile(&fallback_timings, 50),
+        percentile(&fallback_timings, 95)
+    );
     println!(
         "sqlite_db_wal_shm_bytes={} sqlite_to_raw_ratio={:.3}",
         db_bytes,
