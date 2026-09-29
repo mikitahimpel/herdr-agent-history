@@ -21,7 +21,7 @@ Stable V1 is **not released** and GitHub issue #13 remains open. The 0.1.0-rc.2 
 | #6 Herdr | Functional terminal overlay, confirmed isolated Git recovery; live active/closed workspace resume, deleted-worktree recreation, unavailable-repository handling, the linked plugin overlay route, and Claude/Codex parity through a post-resume model turn | A Herdr-rendered native overlay is still outside plugin v1; overlay placement remains a terminal pane |
 | #11 Safeguards | Private index, safe open/sidecar rejection, rollback/corruption errors, confirmed recovery | Broader security review; see documented source-mutation limits |
 | #10 Packaging | Apple Silicon archive/checksum published as GitHub prereleases rc.1 and rc.2; extracted installer, durable plugin path, isolated smoke; the published rc.2 artifact installed, upgraded and uninstalled with no toolchain or checkout (see the clean-install simulation below); `scripts/package` signs with Developer ID and a hardened runtime, and submits for notarization, when given an identity and a notary profile (see signing and notarization below) | Installation on a second Mac or fresh user account; the notarization submit has never run because no notary profile exists yet, and published rc.1/rc.2 binaries are still blocked by Gatekeeper when browser-downloaded and Finder-extracted |
-| #12 Documentation | README, indexing/privacy/recovery notes, plugin guide, benchmark and troubleshooting; install and first-run path walked literally from the release page in a stripped environment, with gaps fixed | A new user following the documentation alone on a clean machine, through resume |
+| #12 Documentation | README, indexing/privacy/recovery notes, plugin guide, benchmark and troubleshooting; install and first-run path walked literally from the release page in a stripped environment, then the documented Herdr path through a live Claude resume from the rc.2 binaries (see the documented resume walkthrough below), with gaps fixed | A new user following the documentation alone on a clean machine, through resume |
 | #13 Release gate | Local quality gate, synthetic integration evidence, and scenarios 5-8 executed live against a running Herdr host for both agents | Scenarios 1-4 and 9-10 on a real installation, clean-user macOS installation, and remote CI/branch protection; no release tag |
 
 All GitHub issues were inspected as the source backlog. No issue is closed by this prerelease. GitHub CI passed on integration commit `3dc90cf`; branch protection has not been verified. The integration work is being promoted to `main` for prerelease distribution.
@@ -240,7 +240,145 @@ either criterion.**
 - A newcomer following the README without the author's knowledge. This run
   followed it literally, but by someone who knows the code.
 - A real history of useful size: fixtures here are two synthetic sessions.
-- Resume from Herdr, tracked by #9 and #13.
+- Resume from Herdr, tracked by #9 and #13. The documented resume path was walked on September 29 (below), still on this machine.
+
+## Documented resume walkthrough (September 29)
+
+The clean-install simulation stopped before resume. This run followed the
+README and the plugin guide from the published rc.2 through **search → preview →
+resume**, using the documentation rather than the code to get through each
+step. It ran from a Herdr-managed pane (`HERDR_ENV=1`) with Herdr 0.7.1 and
+Claude Code 2.1.285. **It does not close #12:** it is still this machine and
+someone who knows the code.
+
+### Conditions
+
+- The rc.2 assets were downloaded with `curl` exactly as the README prints
+  them and the checksum printed `OK`. Install, index, search, preview, browse
+  and uninstall ran under `env -i` with a scratch `HOME` that held only two
+  synthetic sessions, and `PATH=/usr/bin:/bin:/usr/sbin:/sbin` until the
+  README's `~/.zshrc` line added `~/.local/bin`. The fixture hashes were
+  unchanged at the end.
+- The plugin steps ran in a second, isolated Herdr server started with that
+  scratch `HOME`, so it had its own `config.toml`, no linked plugins and no
+  integrations. The user's Herdr configuration and plugin registration were not
+  touched.
+- Resume needs a real, signed-in agent, and Claude Code's credentials are not
+  reachable under a scratch `HOME`. The resume step therefore ran in the user's
+  Herdr against a new session recorded in a disposable repository
+  (`hah-docs-sandbox/repo`, commit `44f7c94`), with the rc.2
+  `agent-history-herdr` given a private `--db`, `--claude-root` limited to that
+  repository's Claude project folder and an empty `--codex-root`. The shared
+  index was not opened. Host commands were logged through `HERDR_BIN_PATH`.
+
+### Verified
+
+- **Plugin, as documented.** `herdr plugin link "$HOME/.local/share/agent-history/plugin"`
+  and `herdr plugin pane open --plugin agent-history --entrypoint search`
+  opened the overlay once the server's `PATH` contained the install directory
+  (see the first finding below). The `prefix+f` binding now in the plugin guide,
+  applied with `herdr server reload-config`, opened it from the keyboard
+  (Ctrl-b, f). Esc from the search box closed it.
+  `herdr plugin pane close <pane_id>` closed it by pane ID, and the
+  plugin/entrypoint form printed `usage: herdr plugin pane close <pane_id>`.
+  `herdr plugin unlink agent-history` removed the registration.
+- **Search and preview in the overlay.** Typing, Tab and Space showed both
+  speakers of the synthetic session. Enter on a session whose directory does not
+  exist showed `The recorded workspace is unavailable.` with only view and
+  cancel.
+- **Resume.** A Claude session was started in the sandbox with a beacon phrase
+  and allowed to exit. Its transcript was 208,946 bytes, SHA-256 `bd277112…`.
+  In the overlay it was listed as `resumable`. Enter issued
+  `workspace focus wCM`, `agent list`, and
+  `agent start agent-history-a797900d-7409-45fe-bf5c-3585dec963c2 --workspace wCM --cwd <repo> --focus -- claude --resume a797900d-7409-45fe-bf5c-3585dec963c2`.
+  The overlay then reported `✓ Resumed Claude session in repo`. Asked for the
+  phrase without being told it, the resumed Claude answered `amber-lynx-4417`.
+  After it exited, the same file was 233,100 bytes and its first 208,946 bytes
+  still hashed to `bd277112…`, so the change was a pure append. It was still the
+  only transcript in that project folder. Re-indexing read 12 new records, and
+  an assistant-only search found the answer under the original session ID.
+- **Gatekeeper remedies, as printed.** The archive was given a browser's
+  `com.apple.quarantine` attribute and extracted with Archive Utility. Every
+  extracted file carried the attribute, and so did every installed copy.
+  Running one exited with status 137. `xattr -d com.apple.quarantine ~/.local/bin/agent-history*`
+  fixed all three binaries in place. `cd ~/Downloads/agent-history`,
+  `xattr -dr com.apple.quarantine .` and `./install` fixed the two standalone
+  binaries, but not `agent-history-herdr` (second finding below).
+- **Every command in the docs.** The README, TROUBLESHOOTING, HERDR_PLUGIN,
+  MODULES, PERFORMANCE (synthetic parts), GITHUB_SETUP (read-only parts) and
+  HOST_COMPATIBILITY commands were run against rc.2 and against a release
+  build of `main` at `4a25bcc`. The synthetic `benchmark` example,
+  `scripts/measure-real-corpus` without arguments and `scripts/test-packaging`
+  completed. Not rerun: the real-corpus measurements and the `search_latency`
+  run against a copy of the shared index (both read private history), the
+  signing and notarization commands, and the one-time publication and
+  branch-protection writes in GITHUB_SETUP.
+
+### Found and fixed in the documentation
+
+- **The plugin runs with the Herdr server's `PATH`.** With the server started
+  before `~/.local/bin` was on `PATH`, the documented `plugin pane open` failed
+  with `No viable candidates found in PATH "…"` even though the calling shell
+  could run `agent-history-herdr`. A server started from a shell with the
+  README's `PATH` line opened it. Documented in the README, the plugin guide and
+  TROUBLESHOOTING.
+- **The Gatekeeper folder remedy said `./install`.** After a quarantined
+  `./install --with-herdr`, that left `agent-history-herdr` quarantined, and it
+  still exited with status 137. The remedy now says to repeat the original
+  install command. The in-place `xattr -d` also prints `No such xattr` for
+  copies that are already clear; that is now called harmless.
+- **The search syntax section described `main`, not rc.2.** On rc.2,
+  `rate-limit`, `foo:bar`, `what?`, `C++` and an email address fail with
+  `storage error: no such column: …` or `fts5: syntax error`, an unclosed
+  quote fails with `unterminated string`, misspellings find nothing, and
+  `search -- -v` fails with `unknown option '--'`. On `main` all of these
+  behave as documented. The README now marks what came after rc.2 and gives the
+  rc.2 workaround, a double-quoted phrase, which was checked for every example.
+- **No keybinding was documented.** The plugin guide and README now give the
+  `[[keys.command]]` block for `prefix+f`, explain why it must be `type =
+  "shell"`, and say that `plugin pane close` takes a pane ID.
+- **Nothing said how to check Herdr's agent integrations**, although the README
+  required them. The README now starts the resume section with `herdr
+  integration status` and `herdr integration install`.
+- **Nothing said what Enter does on screen.** It moves focus to the session's
+  workspace and starts the agent in a new pane there. The README now says so,
+  and TROUBLESHOOTING lists the Enter failures seen in this and earlier runs.
+- `--db /tmp/index.sqlite` fails with `index parent is not a directory`,
+  because `/tmp` is a symbolic link on macOS. This is now in TROUBLESHOOTING.
+- GITHUB_SETUP still said publication had been blocked, and the README said CI
+  and branch protection were unverified. Protection is live, but it is weaker
+  than `.github/branch-protection.json`. It requires `Quality gate` on an
+  up-to-date branch and blocks force pushes and deletion. It does not require a
+  pull request or resolved conversations, and it does not apply to
+  administrators. Both documents now say this; the policy was not applied.
+
+### Defects reported, not fixed here
+
+- `index parent is not a directory` is misleading for a parent that is a
+  symbolic link to a directory, such as `/tmp`.
+- `./install`'s closing hint prints the plugin path as
+  `~/.local/bin/../share/agent-history/plugin` rather than the resolved
+  `~/.local/share/agent-history/plugin` that the README uses.
+- Enter always passes `--focus`, so resuming always moves the user's focus, as
+  documented. There is no way to resume in the background.
+
+### Still requires a second Mac or a fresh user account
+
+- A newcomer who does not know the code, following the README alone from the
+  release page through resume. Every run so far, this one included, was done by
+  someone with the source at hand.
+- Resume under a user account whose Herdr, Claude Code and Codex were installed
+  fresh. Here the resume step used this machine's signed-in Claude and its
+  already-installed Herdr integrations. The isolated Herdr showed the plugin
+  steps without integrations, but no agent could sign in there.
+- A Codex resume through the documented path. Only Claude was resumed in this
+  run; Codex was resumed live on September 25 (above).
+- The Gatekeeper items listed under the clean-install simulation: a first
+  launch on a Mac that has never seen these binaries, **Open Anyway**, and
+  Safari's automatic extraction.
+- A real history of useful size, opened through the plugin with default roots.
+  That would have indexed this machine's 9 GiB private history into a new
+  index, so it was not done.
 
 ## Exact external blockers and next steps
 
@@ -474,7 +612,7 @@ Afterwards workspace `wCD`, which this run had created, was closed.
 * **A hyphenated query fails in core.** An unrelated defect outside this
   change: `agent-history search cobalt-heron` fails with `storage error: no such
   column: heron`. The raw query is passed to FTS5 `MATCH`, where `-` is query
-  syntax. A quoted phrase or a plain word works.
+  syntax. A quoted phrase or a plain word works. Fixed after rc.2 by #26.
 
 ## Next step
 

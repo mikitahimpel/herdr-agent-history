@@ -13,7 +13,7 @@ The installed commands report:
 | Component | Evidence |
 | --- | --- |
 | Herdr CLI | `herdr --version` → `herdr 0.7.1` |
-| Claude Code | `claude --version` → `2.1.278 (Claude Code)` on 2026-09-20 (`2.1.241` when first researched) |
+| Claude Code | `claude --version` → `2.1.285 (Claude Code)` on 2026-09-29 (`2.1.278` on 2026-09-20, `2.1.241` when first researched) |
 | Codex CLI | `codex --version` → `codex-cli 0.157.0` at the end of the 2026-09-25 run (`0.156.1` at its start, before Codex updated itself; `0.153.4` when first researched) |
 | Herdr Claude integration | `herdr integration status` → current, v7 |
 | Herdr Codex integration | `herdr integration status` → current, v6 |
