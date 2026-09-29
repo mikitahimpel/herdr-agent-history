@@ -12,10 +12,10 @@ with the buttons **Done** and a highlighted **Move to Trash** (**Move to Bin** i
 ```sh
 cd ~/Downloads/agent-history            # the extracted folder
 xattr -dr com.apple.quarantine .
-./install
+./install                               # or ./install --with-herdr, as you ran it first
 ```
 
-or clear the already installed copies in place:
+Reinstall with the same options as before: a plain `./install` does not replace `agent-history-herdr`, so a quarantined copy of it keeps being killed. Or clear the already installed copies in place (`No such xattr` for a copy that is already clear is harmless):
 
 ```sh
 xattr -d com.apple.quarantine ~/.local/bin/agent-history*
@@ -39,7 +39,7 @@ Open a new window afterwards. A plain `export PATH=...` lasts only for the curre
 
 ## The index cannot be opened
 
-The SQLite index and its parent directory are private by design. Use a path you own with `--db`, and ensure its parent directory is not group or world readable; otherwise commands stop with `storage error: index parent is not private`. The default path on macOS is `~/Library/Application Support/Herdr Agent History/index.sqlite`.
+The SQLite index and its parent directory are private by design. Use a path you own with `--db`, and ensure its parent directory is not group or world readable; otherwise commands stop with `storage error: index parent is not private`. A parent that is a symbolic link is refused as `index parent is not a directory`; on macOS `/tmp` is one, so `--db /tmp/index.sqlite` fails that way. A directory that does not exist yet, such as `/tmp/agent-history-private`, is created private. The default path on macOS is `~/Library/Application Support/Herdr Agent History/index.sqlite`.
 
 If `HOME` is unavailable, commands that need the default database fail with an actionable message. Pass `--db /path/to/index.sqlite` instead.
 
@@ -97,6 +97,18 @@ rm -f ~/.local/share/agent-history/plugin/herdr-plugin.toml
 ```
 
 Neither route touches the index or native history. To remove the index as well, close every Agent History window and run `rm -r ~/Library/Application\ Support/Herdr\ Agent\ History`.
+
+## `plugin pane open` fails with `No viable candidates found in PATH`
+
+Herdr starts the overlay with its server's environment. The `PATH` in the message is the one the Herdr server started with, and it does not contain the directory `./install` used. Adding `~/.local/bin` to `~/.zshrc` does not reach a server that is already running. Save your work, run `herdr server stop` (it closes every pane and agent in Herdr), open a new Terminal window, check `command -v agent-history-herdr`, and start `herdr` again. The plugin link is kept.
+
+## Enter does not resume
+
+- `The recorded workspace is unavailable`: the directory the session ran in is gone and no repository was recorded to recover from. Choose **v** to read the conversation; resuming needs that directory back.
+- A recovery menu offering to recreate a worktree: the repository still exists but the worktree was deleted. Nothing changes until you confirm with `y`; `n` or **Esc** cancels. See [the plugin guide](HERDR_PLUGIN.md).
+- `unsupported: source generation is stale; index again`: the transcript grew after the overlay opened, often because the session is still running. Close the overlay with **Esc** and open it again; opening re-indexes.
+- A second copy of an agent that was already running: Herdr's integration for that agent is missing or outdated. Check `herdr integration status` and run `herdr integration install claude` or `herdr integration install codex`.
+- The new pane exits at once or shows the agent's own error: the agent itself failed to start. Check that `claude` or `codex` runs in a plain Herdr pane. Codex can stop for a folder-trust prompt or update itself on launch; press Enter in the overlay again afterwards.
 
 ## The Herdr executable says it needs a managed pane
 

@@ -1,6 +1,32 @@
 # Agent History Herdr plugin contract (#6)
 
-The companion plugin in `plugin/agent-history/herdr-plugin.toml` opens the `agent-history-herdr` terminal pane through Herdr's public plugin surface. It targets the inspected Herdr 0.7.1 CLI. This is a terminal overlay, not an in-process native widget. The optional executable must be installed on the plugin process's PATH (`./install --with-herdr`). It requires a Herdr-managed pane (`HERDR_ENV=1`) before opening the index. `agent-history browse` and `agent-history-overlay` are standalone search/preview commands and never dispatch Herdr actions. Keybinding assignment remains a Herdr configuration step.
+The companion plugin in `plugin/agent-history/herdr-plugin.toml` opens the `agent-history-herdr` terminal pane through Herdr's public plugin surface. It targets the inspected Herdr 0.7.1 CLI. This is a terminal overlay, not an in-process native widget. The optional executable must be installed on the plugin process's PATH (`./install --with-herdr`). It requires a Herdr-managed pane (`HERDR_ENV=1`) before opening the index. `agent-history browse` and `agent-history-overlay` are standalone search/preview commands and never dispatch Herdr actions.
+
+## Opening and closing the overlay
+
+Link once, from a pane inside Herdr, then open:
+
+```sh
+herdr plugin link "$HOME/.local/share/agent-history/plugin"
+herdr plugin pane open --plugin agent-history --entrypoint search
+```
+
+The manifest also declares a global action, `open`, which runs that same command; `herdr plugin action list` shows it. Herdr's default configuration binds no key to it. To open the overlay with **prefix+f** (Ctrl-b, then f, with Herdr's default prefix), add a command binding to `~/.config/herdr/config.toml` and apply it with `herdr server reload-config`:
+
+```toml
+[[keys.command]]
+key = "prefix+f"
+type = "shell"
+command = "herdr plugin pane open --plugin agent-history --entrypoint search"
+```
+
+`type = "shell"` runs the command in the background. The command opens the overlay pane itself, so `type = "pane"` would wrap it in a second, temporary pane. Choose another key if `prefix+f` is already bound in your configuration.
+
+Herdr starts `agent-history-herdr` with the Herdr server's environment. The server's `PATH`, not the calling shell's, must contain the install directory; otherwise `open` fails with `plugin_pane_open_failed` and `No viable candidates found in PATH "…"`. Start the Herdr server from a shell where `command -v agent-history-herdr` succeeds. Restarting it with `herdr server stop` closes every pane and agent, so save work first.
+
+**Esc** from the search box closes the overlay pane. From a script, close it by pane ID: `herdr plugin pane close <pane_id>`, where the ID is the pane labelled `Agent History` in `herdr pane list`. `close` accepts only the pane ID; `herdr plugin pane close --plugin agent-history --entrypoint search` prints a usage error. `herdr plugin unlink agent-history` removes the registration; `./uninstall` does not.
+
+## Behavior
 
 The integration uses the shared `agent-history-tui` module for rendering, progress, filters, and preview. Host commands and recovery remain in `agent-history-herdr`.
 
@@ -16,7 +42,7 @@ A missing cwd opens explicit choices: resume in the available recorded repositor
 
 Recreation validates commit availability, rejects existing targets and symlinks, rejects symlink traversal, and recreates a detached checkout at the captured commit. A missing but still registered target uses a single `--force` solely to replace that exact unlocked registration; locked registrations are refused. It never forces a branch, resets or prunes a repository, deletes paths, or overwrites an existing checkout. The repository's existing branch and checkout remain intact. The target parent must already exist. Missing commits, unavailable parents, locked registrations, or other Git failures remain visible errors with repository/view/cancel fallbacks. If the original cwd was a deleted untracked subdirectory not present in the saved commit, creation can succeed while resume still requires fallback; no directory content is invented.
 
-Isolated tests exercise real database indexing/search/original preview, query focus and space behavior, stale-source refusal, mock exact-session dispatch, cancellation, existing-repository fallback, and a manually deleted registered worktree recreated only after confirmation. Temporary Git tests also check locked registrations, unavailable commits, symlink/target collisions, and preservation of the other checkout. Tests never read private histories or launch real agents/Herdr. Actual plugin keyboard presentation, native launches, packaging, and clean-machine operation still require runtime acceptance evidence.
+Isolated tests exercise real database indexing/search/original preview, query focus and space behavior, stale-source refusal, mock exact-session dispatch, cancellation, existing-repository fallback, and a manually deleted registered worktree recreated only after confirmation. Temporary Git tests also check locked registrations, unavailable commits, symlink/target collisions, and preservation of the other checkout. Tests never read private histories or launch real agents/Herdr. Plugin keyboard presentation and native launches have since been exercised live (see [release status](RELEASE_STATUS.md)); clean-machine operation still requires acceptance evidence.
 
 A release-binary PTY smoke check using an isolated synthetic history verified activation counts, multiword query typing, result focus, normalized original preview, Esc returning with selection retained, and Ctrl-C restoring the alternate screen/cursor. It intentionally did not press Enter or launch any native agent.
 
