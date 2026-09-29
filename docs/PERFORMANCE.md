@@ -207,3 +207,86 @@ For comparison, shape A (a trigram FTS5 index over the same chunk text) was meas
 - A typo that happens to occur verbatim somewhere in the history matches exactly, so no retry runs.
 - The browser searches on every keystroke, so an unfinished word that matches nothing now costs the fallback's ~40 ms on that keystroke, and shows prefix near matches rather than an empty list.
 - One machine and one real corpus; the fallback timings depend on how many terms share the typed word's first letter.
+
+## Background activation scan (#34)
+
+The browser (standalone and the Herdr overlay) used to run the whole activation scan before its first frame, so a query typed at launch waited for discovery and indexing. It now opens the existing index, draws at once, and runs the same scan (`index_all_until`, unchanged in what it commits) on a thread with its own SQLite connection. See `docs/INDEXING.md` for the concurrency and cancellation guarantees.
+
+"Before" is `main` at `1033fcb` and "after" is this change. Both are release builds with rustc 1.98.1 on the same Apple M1 (macOS 26.6.2), run on 2026-09-30. Another workload (a `cargo` build and tests in a different checkout) shared the machine during some runs, which widens the ranges below. Treat them as ranges, not a benchmark.
+
+### Method
+
+Every trial starts from its own copy of one snapshot of the real installed index (150,036,480 bytes, schema 4), placed in a fresh private directory. The shared installed index is only read to take that snapshot and is never opened. History comes from the real `~/.claude` and `~/.codex`, which are only read. The snapshot was taken while sessions were writing, so each trial found about 4,600–6,500 new records (37–54 MB) across 2,518–2,519 files. That delta grew during the measurement because live sessions kept appending. This is more work per activation than the 125 records in #34's 3.3 s example, so "before" here is slower than that example.
+
+- **Real binary.** A PTY harness (Python `pty`, 140×40) launches `agent-history browse --db <copy>` and types `error` at t=0. It records when the browser first appears (the role tabs are drawn) and when the first frame shows a nonzero result count. Then it sends Ctrl-C and records the exit time and code. After exit it runs `PRAGMA integrity_check` on the copy and a follow-up `agent-history index --db <copy>`, and checks with `pgrep` that no process remains. "Cold" copies are fresh APFS clones, whose pages are not in the OS cache, like an index not used since boot. "Warm" copies are read once first, like an index used recently.
+- **In process.** The following runs the three variants on separate copies per trial: `idle` (open and search, no scan), `sync` (open, full scan, search, which is what activation did before) and `background` (open, spawn the scan, search). After both scans settle, it compares the ranked top 50 of eight queries between the `sync` and `background` copies and times settled search on each:
+
+  ```sh
+  cargo build --release --locked -p agent-history-core --example cold_start
+  copy="$(mktemp -d)/index.sqlite"; chmod 700 "$(dirname "$copy")"
+  cp "$HOME/Library/Application Support/Herdr Agent History/index.sqlite" "$copy"
+  ./target/release/examples/cold_start "$copy" 3        # cold copies
+  ./target/release/examples/cold_start "$copy" 3 warm   # warm copies
+  rm -rf "$(dirname "$copy")"
+  ```
+
+### Perceived cold start: real binary, five trials each
+
+| Page cache | Before: browser visible = first result | After: browser visible | After: first result for `error` |
+| --- | --- | --- | --- |
+| Cold copy | 4,828 / 4,892 / 5,022 / 6,704 / 10,669 ms (median 5,022) | 7 / 7 / 12 / 13 / 21 ms (median 12) | 22 / 25 / 38 / 44 / 61 ms (median 38) |
+| Warm copy | 3,776 / 5,363 / 7,967 / 9,202 / 13,001 ms (median 7,967) | 7 / 7 / 10 / 11 / 25 ms (median 10) | 21 / 23 / 27 / 44 / 88 ms (median 27) |
+
+In every "after" trial, the frame with the first result also showed `Indexing … results may be incomplete` in the header, because the scan was still running. Before, the browser did not exist until the scan ended, and keys typed meanwhile were replayed afterwards, so "visible" and "first result" coincide.
+
+The in-process harness agrees. Warm: `sync` first result 2,282 / 2,732 / 5,370 ms, `background` 17 / 18 / 30 ms, `idle` baseline 23 / 25 / 29 ms. Cold: `sync` 6,954 / 8,167 / 12,522 ms, `background` 507 / 544 / 587 ms, `idle` baseline 405 / 526 / 2,305 ms. In a cold copy, the first FTS query reads its pages from disk whether or not a scan runs. That is the few hundred milliseconds in both `idle` and `background`, and it is not contention. The PTY harness's cold first results are lower than the in-process ones. Its first nonzero count can come from a prefix of `error`, and its Python copy may not leave the file fully uncached; I did not isolate which.
+
+### Search while the scan runs, and after it settles
+
+| Measurement | Result |
+| --- | --- |
+| Settled ranked top 50, eight queries, `sync` vs `background` copy | identical in all 14 trials run (the example exits with an error otherwise) |
+| Settled search p50, `sync` / `background` copy, warm (20 reps × 8 queries) | 17.7 / 19.1, 27.9 / 26.5, 20.8 / 12.9 ms |
+| Settled search p50, cold copies | 33.4 / 21.9, 36.5 / 29.7, 34.0 / 33.5 ms |
+| Search p50 while the scan runs, warm | 16.0, 20.1, 31.1 ms (max 74, 91, 289 ms) |
+
+The search code, SQL and schema are unchanged (`storage.rs` and `query.rs` are untouched), so settled ranking cannot differ. The identical result lists confirm that a scan settled in the background leaves the same index as one run up front. The settled latency pairs differ in both directions by run-to-run noise on the shared machine. While a scan is writing, search is only somewhat slower. A search is one FTS statement, which reads one committed WAL snapshot and does not wait for the writer. The in-scan maxima (74–289 ms) were not investigated further; in WAL mode they can only come from sharing CPU and I/O with the scan, not from locking.
+
+### Ctrl-C during the scan
+
+| Moment of Ctrl-C (warm copies, five trials) | Before | After |
+| --- | --- | --- |
+| Key, 150 ms after launch, no query typed | 1 / 1 / 5 / 22 / 32 ms, exit 130 (process aborted) | 23 / 38 / 41 / 94 / 213 ms, exit 0 (scan stopped and joined) |
+| `SIGINT`, 150 ms after launch, `error` typed | 82–100 ms, exit 130 | 3 / 4 / 4 / 9 / 171 ms, exit 0 |
+| Key, 150 ms after launch, `error` typed | 1–6 ms (keys were only buffered) | 177–518 ms |
+| Key, right after the first result (cold / warm) | — | 117–344 / 95–194 ms |
+
+Every run, before and after, left a database that passed `PRAGMA integrity_check`. The follow-up `index` run completed with 0 failed files, and no process remained. The stop flag is checked while directories are walked, between records, before Git is consulted and before commit. A commit already under way finishes first, which accounts for the tail. The "`error` typed" key row is not the scan: each typed character runs a search on the UI thread, a one-letter prefix misses and takes the near-match fallback (#28), and the Ctrl-C key waits behind them. `SIGINT` bypasses the key queue, and there the stop usually took 3–9 ms. Before discovery was made cancellable, an early Ctrl-C waited for the whole file walk (up to 1,936 ms measured), so this change includes that.
+
+### Synthetic benchmark: indexing guarantees unchanged
+
+The existing `benchmark` example was run three times per build, alternating old and new, on the same shared machine:
+
+| | Before | After |
+| --- | --- | --- |
+| Initial indexing (200 files) | 3,058 / 1,759 / 2,788 ms | 2,820 / 4,055 / 1,779 ms |
+| 449-byte append: bytes read | 449 / 449 / 449 | 449 / 449 / 449 |
+| 449-byte append: time | 61.5 / 85.2 / 67.4 ms | 67.9 / 241.6 / 57.6 ms |
+| Chunks after append | 40,001 each run | 40,001 each run |
+
+Append accounting is identical: an append still reads exactly the appended bytes. The timings overlap and scatter in both directions. The slow "after" run (4,055 ms, 241.6 ms) overlapped a `cargo test` build of this change, so these timings show no measurable cost from the per-record stop check, not a precise comparison.
+
+### Idle cost
+
+No thread or process outlives the browser. Closing it stops and joins the scan thread, and `pgrep` found no leftover process after any trial. There is still no daemon, so resource use between invocations remains zero.
+
+### Directory pruning: not built
+
+#34 suggested skipping directories whose mtime has not advanced. It was not built. After this change the scan is off the interactive path: the browser is usable in about 10 ms, and the scan's only visible effect is the header's `Indexing N/M files` line. The directory walk it would shorten is also small: the PTY header shows the file total 39–119 ms after launch (up to 359 ms in process under load). Most scan time goes to per-file checks and to indexing the new records themselves, which pruning would not remove. It would save a fraction of a scan nobody waits for, at the risk of silently missing sessions, which is worse than a slow scan.
+
+### Limitations
+
+- One machine, one real corpus, five PTY trials and three in-process trials per variant, on a machine that was sometimes shared with other work.
+- The live corpus grew during measurement, so "before" and "after" trials had slightly different amounts of new history (about 4,600–6,500 records). Before/after PTY runs of the same kind were run back to back to keep this small. The difference is far smaller than the effect.
+- The header shows only checked/total files during the scan. The byte, record and chunk counts of the old full-screen progress box are no longer displayed, although the core still reports them.
+- A file whose source changes while it is read (an active session appending) fails that attempt with `source changed during indexing; retry` and is retried next launch. This existing behaviour occurred in both modes during these runs and is reported in the status line.

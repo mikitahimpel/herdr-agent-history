@@ -325,6 +325,10 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
         if pending_bytes != 0 || pending_records != 0 || new_chunks != 0 {
             progress(pending_bytes, pending_records, new_chunks);
         }
+        // Before Git is consulted, which can take a while.
+        if stop.load(Ordering::Relaxed) {
+            return Err(CoreError::Unsupported("indexing cancelled".into()));
+        }
         let mut file = reader.into_inner().into_inner();
         if !same(&meta, &file.metadata()?) || !same(&meta, &fs::metadata(path)?) {
             return Err(CoreError::Unsupported(
@@ -439,8 +443,9 @@ pub fn index_all_with_progress<S: IndexStore, C: FnMut(IndexProgress)>(
 }
 
 /// Like [`index_all_with_progress`], but returns early once `stop` is set, with
-/// [`IndexReport::cancelled`]. `stop` is checked between records, so it takes effect
-/// within one record of work. Every file committed before that stays committed; the
+/// [`IndexReport::cancelled`]. `stop` is checked while walking directories, between
+/// records, and before Git is consulted and before commit, so only a commit already
+/// under way delays it. Every file committed before that stays committed; the
 /// interrupted file commits nothing, so its byte offset and generation are unchanged
 /// and the next call resumes it as if this one had never started it.
 pub fn index_all_until<S: IndexStore, C: FnMut(IndexProgress)>(
@@ -455,7 +460,7 @@ pub fn index_all_until<S: IndexStore, C: FnMut(IndexProgress)>(
     let mut total_files = 0u64;
     let mut completed_files = 0u64;
     for adapter in adapters {
-        match adapter.discover() {
+        match adapter.discover_until(stop) {
             Ok(files) => {
                 total_files += files.len() as u64;
                 discovered.push((adapter, files));
@@ -468,6 +473,11 @@ pub fn index_all_until<S: IndexStore, C: FnMut(IndexProgress)>(
                 discovered.push((adapter, Vec::new()));
             }
         }
+    }
+    // A list cut short by the stop is incomplete; indexing from it would be too.
+    if stop.load(Ordering::Relaxed) {
+        total.cancelled = true;
+        return Ok(total);
     }
     'agents: for (adapter, files) in discovered {
         let mut agent_completed_files = 0u64;
@@ -912,6 +922,32 @@ mod tests {
         assert_eq!(final_progress.bytes_read, report.bytes_read);
         assert_eq!(final_progress.chunks, report.chunks);
         assert!(snapshots.iter().all(|p| p.failed_files == 0));
+    }
+
+    #[test]
+    fn a_stop_before_indexing_starts_touches_nothing_and_is_not_a_failure() {
+        let d = TempDir::new("stop-early").unwrap();
+        let root = d.path().join("history");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("s.jsonl"), line("user", "earlyword")).unwrap();
+        let mut store = db(&d);
+        let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(ClaudeAdapter::with_root(root))];
+        let mut progress = 0;
+        let report = index_all_until(&mut store, &adapters, &AtomicBool::new(true), |_| {
+            progress += 1
+        })
+        .unwrap();
+        assert!(report.cancelled);
+        assert_eq!((report.files, report.failed_files), (0, 0));
+        assert_eq!(
+            progress, 0,
+            "an incomplete discovery is never reported as the total"
+        );
+        assert_eq!(store.status().unwrap().files, 0);
+
+        let report = index_all(&mut store, &adapters).unwrap();
+        assert!(!report.cancelled);
+        assert_eq!(store.search("earlyword", 10).unwrap().len(), 1);
     }
 
     #[test]

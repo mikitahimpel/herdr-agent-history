@@ -1,15 +1,23 @@
 use crate::{CoreError, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) fn discover_jsonl(roots: &[PathBuf]) -> Result<Vec<crate::SessionFile>> {
+    discover_jsonl_until(roots, &AtomicBool::new(false))
+}
+/// Stops walking, returning what it found so far, once `stop` is set.
+pub(crate) fn discover_jsonl_until(
+    roots: &[PathBuf],
+    stop: &AtomicBool,
+) -> Result<Vec<crate::SessionFile>> {
     let mut paths = Vec::new();
     for root in roots {
         if !root.exists() {
             continue;
         }
         // A single inaccessible directory must not hide sessions below other roots.
-        let _ = walk(root, &mut paths);
+        let _ = walk(root, &mut paths, stop);
     }
     paths.sort();
     paths.dedup();
@@ -24,7 +32,10 @@ pub(crate) fn discover_jsonl(roots: &[PathBuf]) -> Result<Vec<crate::SessionFile
         })
         .collect()
 }
-fn walk(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn walk(path: &Path, out: &mut Vec<PathBuf>, stop: &AtomicBool) -> Result<()> {
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() {
         return Ok(());
@@ -37,7 +48,7 @@ fn walk(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     }
     if meta.is_dir() {
         for entry in fs::read_dir(path)?.flatten() {
-            let _ = walk(&entry.path(), out);
+            let _ = walk(&entry.path(), out, stop);
         }
     }
     Ok(())
@@ -137,6 +148,16 @@ mod tests {
         let found = discover_jsonl(&[dir.path().to_owned(), a]).unwrap();
         assert_eq!(found.len(), 2);
         assert!(found[0].path < found[1].path);
+    }
+
+    #[test]
+    fn a_stopped_discovery_walks_nothing_more() {
+        let dir = crate::test_support::TempDir::new("discovery-stop").unwrap();
+        dir.jsonl("a.jsonl", &["{}"]).unwrap();
+        let stopped = AtomicBool::new(true);
+        assert!(discover_jsonl_until(&[dir.path().to_owned()], &stopped)
+            .unwrap()
+            .is_empty());
     }
     #[test]
     fn repository_labels_come_only_from_recorded_urls() {

@@ -178,10 +178,15 @@ impl BrowserState {
     }
 
     /// Re-runs the query after the index changed underneath it. The selected
-    /// conversation stays selected while it is still among the results.
+    /// conversation stays selected while it is still among the results, and
+    /// an error the reader has not dismissed stays shown.
     pub fn refresh_in_place(&mut self, store: &SqliteStore) {
         let selected = self.selected_result().map(|r| r.source.clone());
+        let error = self.error.take();
         self.search(store);
+        if self.error.is_none() {
+            self.error = error;
+        }
         if let Some(i) = selected.and_then(|s| self.results.iter().position(|r| r.source == s)) {
             self.selected = i;
         }
@@ -963,6 +968,7 @@ mod tests {
         assert_eq!(state.results.len(), 1, "served from the existing index");
         state.handle(Key::Down, &t.store).unwrap();
         let selected = state.selected_result().unwrap().source.clone();
+        state.error = Some("resume failed".into());
 
         t.release.send(()).unwrap();
         let report = follower
@@ -977,6 +983,7 @@ mod tests {
             selected,
             "the reader's selection survives the refresh"
         );
+        assert_eq!(state.error.as_deref(), Some("resume failed"));
         assert_eq!(state.mode, Mode::Results);
         assert!(follower
             .apply(&t.scan.snapshot(), &mut state, &t.store)
