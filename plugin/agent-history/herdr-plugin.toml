@@ -1,7 +1,7 @@
 id = "agent-history"
 name = "Agent History"
 version = "0.1.0"
-min_herdr_version = "0.7.1"
+min_herdr_version = "0.9.3"
 description = "Search and resume local Claude Code and Codex sessions"
 platforms = ["macos"]
 

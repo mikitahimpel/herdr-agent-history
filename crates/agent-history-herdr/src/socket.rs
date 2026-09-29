@@ -266,7 +266,7 @@ impl<R: CommandRunner> HerdrCli<R> {
                     .run(&words(["herdr", "agent", "rename", pane, &plan.agent_name]))
                     .is_ok();
                 let hint = if renamed {
-                    "Check that pane; Enter focuses it once it is running."
+                    "Check that pane; Enter focuses it instead of starting another."
                 } else {
                     "Check that pane before pressing Enter again."
                 };
@@ -754,7 +754,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("Codex was not ready in pane w1:p2"));
-        assert!(error.contains("Enter focuses it"));
+        assert!(error.contains("Enter focuses it instead of starting another"));
         let commands = cli.into_inner().commands;
         assert_eq!(
             commands[3],
