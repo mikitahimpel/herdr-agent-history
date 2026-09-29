@@ -1,32 +1,5 @@
 # Troubleshooting
 
-## “agent-history” Not Opened, or `Killed: 9`
-
-The v0.1.0-rc.1 and rc.2 release binaries are ad-hoc signed and not notarized by Apple. If the archive was downloaded with a browser and extracted by double-clicking it in Finder, every extracted file carries the `com.apple.quarantine` attribute, and `./install` copies it into the install directory. Running any of the programs then prints only `Killed: 9` (exit status 137) in Terminal, and macOS shows:
-
-> **“agent-history” Not Opened**
-> Apple could not verify “agent-history” is free of malware that may harm your Mac or compromise your privacy.
-
-with the buttons **Done** and a highlighted **Move to Trash** (**Move to Bin** in some regions). Choose **Done**; the other button deletes the program. After verifying the archive's checksum, clear the attribute and reinstall:
-
-```sh
-cd ~/Downloads/agent-history            # the extracted folder
-xattr -dr com.apple.quarantine .
-./install                               # or ./install --with-herdr, as you ran it first
-```
-
-Reinstall with the same options as before: a plain `./install` does not replace `agent-history-herdr`, so a quarantined copy of it keeps being killed. Or clear the already installed copies in place (`No such xattr` for a copy that is already clear is harmless):
-
-```sh
-xattr -d com.apple.quarantine ~/.local/bin/agent-history*
-```
-
-`xattr -l ~/.local/bin/agent-history` shows whether the attribute is present. Downloading with `curl` and extracting with `tar`, as the README shows, never sets it. The `./install` script itself is not blocked, which is why installation appears to succeed. Approving the program through **System Settings → Privacy & Security → Open Anyway** has not been tested with these command-line binaries; clearing the attribute has.
-
-Signing is not enough on its own. A binary signed with a Developer ID certificate but not notarized is killed the same way when quarantined; only notarization avoids it. To see what a binary carries, run `codesign -dvv <binary>` (a notarizable build lists `Authority=Developer ID Application: …` and `flags=0x10000(runtime)`) and `spctl --assess --type execute --verbose=4 <binary>`, which prints `source=Notarized Developer ID` only for a notarized one. It prints `rejected` for everything else, including a local build that runs normally, because it does not consider whether the file is quarantined.
-
-If `Killed: 9` appears on a binary with no quarantine attribute, it was most likely overwritten in place by something other than `./install`. Rerun the release's `./install`, which replaces files by rename.
-
 ## `zsh: command not found: agent-history`
 
 The installer puts the programs in `~/.local/bin`, which is not on the default macOS `PATH`. Check with `ls ~/.local/bin/agent-history`, then add the directory to `PATH` for new Terminal windows:
@@ -36,6 +9,17 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 ```
 
 Open a new window afterwards. A plain `export PATH=...` lasts only for the current window.
+
+## The install command stops
+
+`install.sh` changes nothing until the download is verified, and it says why it stopped:
+
+- `CHECKSUM MISMATCH for agent-history-macos-arm64.tar.gz`, followed by the expected and actual hashes: the archive is not the one the release published. It may be truncated, altered by a proxy, or substituted. Nothing was installed and any existing install is untouched. Retry once; if it persists, do not work around it. Compare with the `.sha256` on the [release page](https://github.com/mikitahimpel/herdr-agent-history/releases) and report it.
+- `download failed: …`: the URL is printed. With `--tag`, check that the tag exists and has both assets.
+- `Agent History is built only for macOS on Apple Silicon` or `only for Apple Silicon Macs`: there is no build for this machine.
+- `--tag must be a release tag` or `--prefix must be an absolute path`: fix the option; `--dry-run` shows the plan without downloading.
+
+A file in `~/.local/bin` that is still `agent-history*.install.<number>` after an interrupted run is a partial copy and can be deleted.
 
 ## The index cannot be opened
 
@@ -98,9 +82,38 @@ rm -f ~/.local/share/agent-history/plugin/herdr-plugin.toml
 
 Neither route touches the index or native history. To remove the index as well, close every Agent History window and run `rm -r ~/Library/Application\ Support/Herdr\ Agent\ History`.
 
+## “agent-history” Not Opened, or `Killed: 9`
+
+This affects rc.1 and rc.2 downloaded **with a browser**. The install command and the README's Terminal route download with `curl`, which never quarantines, and later releases are to be notarized.
+
+The v0.1.0-rc.1 and rc.2 release binaries are ad-hoc signed and not notarized by Apple. If the archive was downloaded with a browser and extracted by double-clicking it in Finder, every extracted file carries the `com.apple.quarantine` attribute, and `./install` copies it into the install directory. Running any of the programs then prints only `Killed: 9` (exit status 137) in Terminal, and macOS shows:
+
+> **“agent-history” Not Opened**
+> Apple could not verify “agent-history” is free of malware that may harm your Mac or compromise your privacy.
+
+with the buttons **Done** and a highlighted **Move to Trash** (**Move to Bin** in some regions). Choose **Done**; the other button deletes the program. After verifying the archive's checksum, clear the attribute and reinstall:
+
+```sh
+cd ~/Downloads/agent-history            # the extracted folder
+xattr -dr com.apple.quarantine .
+./install                               # or ./install --with-herdr, as you ran it first
+```
+
+Reinstall with the same options as before: a plain `./install` does not replace `agent-history-herdr`, so a quarantined copy of it keeps being killed. Or clear the already installed copies in place (`No such xattr` for a copy that is already clear is harmless):
+
+```sh
+xattr -d com.apple.quarantine ~/.local/bin/agent-history*
+```
+
+`xattr -l ~/.local/bin/agent-history` shows whether the attribute is present. Downloading with `curl` and extracting with `tar`, as the README shows, never sets it. The `./install` script itself is not blocked, which is why installation appears to succeed. Approving the program through **System Settings → Privacy & Security → Open Anyway** has not been tested with these command-line binaries; clearing the attribute has.
+
+Signing is not enough on its own. A binary signed with a Developer ID certificate but not notarized is killed the same way when quarantined; only notarization avoids it. To see what a binary carries, run `codesign -dvv <binary>` (a notarizable build lists `Authority=Developer ID Application: …` and `flags=0x10000(runtime)`) and `spctl --assess --type execute --verbose=4 <binary>`, which prints `source=Notarized Developer ID` only for a notarized one. It prints `rejected` for everything else, including a local build that runs normally, because it does not consider whether the file is quarantined.
+
+If `Killed: 9` appears on a binary with no quarantine attribute, it was most likely overwritten in place by something other than `./install`. Rerun the release's `./install`, which replaces files by rename.
+
 ## `plugin pane open` fails with `No viable candidates found in PATH`
 
-Herdr starts the overlay with its server's environment. The `PATH` in the message is the one the Herdr server started with, and it does not contain the directory `./install` used. Adding `~/.local/bin` to `~/.zshrc` does not reach a server that is already running. Save your work, run `herdr server stop` (it closes every pane and agent in Herdr), open a new Terminal window, check `command -v agent-history-herdr`, and start `herdr` again. The plugin link is kept.
+Herdr starts the overlay with its server's environment. The `PATH` in the message is the one the Herdr server started with, and it does not contain the directory the installer used. Adding `~/.local/bin` to `~/.zshrc` does not reach a server that is already running. Save your work, run `herdr server stop` (it closes every pane and agent in Herdr), open a new Terminal window, check `command -v agent-history-herdr`, and start `herdr` again. The plugin registration, from `plugin install` or `plugin link`, is kept.
 
 ## Enter does not resume
 

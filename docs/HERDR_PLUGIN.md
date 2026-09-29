@@ -1,15 +1,19 @@
 # Agent History Herdr plugin contract (#6)
 
-The companion plugin in `plugin/agent-history/herdr-plugin.toml` opens the `agent-history-herdr` terminal pane through Herdr's public plugin surface. It targets the inspected Herdr 0.7.1 CLI. This is a terminal overlay, not an in-process native widget. The optional executable must be installed on the plugin process's PATH (`./install --with-herdr`). It requires a Herdr-managed pane (`HERDR_ENV=1`) before opening the index. `agent-history browse` and `agent-history-overlay` are standalone search/preview commands and never dispatch Herdr actions.
+The companion plugin in `plugin/agent-history/herdr-plugin.toml` opens the `agent-history-herdr` terminal pane through Herdr's public plugin surface. It targets the inspected Herdr 0.7.1 CLI. This is a terminal overlay, not an in-process native widget. The optional executable must be installed on the plugin process's PATH (the README's install command, or `./install --with-herdr`). It requires a Herdr-managed pane (`HERDR_ENV=1`) before opening the index. `agent-history browse` and `agent-history-overlay` are standalone search/preview commands and never dispatch Herdr actions.
 
 ## Opening and closing the overlay
 
-Link once, from a pane inside Herdr, then open:
+Register the plugin once, from a pane inside Herdr, then open:
 
 ```sh
-herdr plugin link "$HOME/.local/share/agent-history/plugin"
+herdr plugin install mikitahimpel/herdr-agent-history/plugin/agent-history --ref v0.1.0-rc.2
 herdr plugin pane open --plugin agent-history --entrypoint search
 ```
+
+`herdr plugin install OWNER/REPO/SUBDIR` (checked against Herdr 0.9.3) clones the repository at `--ref` into `~/.config/herdr/plugins/github/` and reads `herdr-plugin.toml` from `SUBDIR`, so the path must end in `plugin/agent-history`; `…/plugin` fails with `No such file or directory`. It prints the actions and pane command the manifest declares and asks before registering, unless given `--yes`. It needs no running server. Pin `--ref` to the release tag of the installed programs, so the manifest matches them. `herdr plugin uninstall agent-history` removes it.
+
+A Herdr without `plugin install`, such as 0.7.1, links the copy that `./install --with-herdr` places in `~/.local/share/agent-history/plugin` instead: `herdr plugin link "$HOME/.local/share/agent-history/plugin"`, removed with `herdr plugin unlink agent-history`.
 
 The manifest also declares a global action, `open`, which runs that same command; `herdr plugin action list` shows it. Herdr's default configuration binds no key to it. To open the overlay with **prefix+f** (Ctrl-b, then f, with Herdr's default prefix), add a command binding to `~/.config/herdr/config.toml` and apply it with `herdr server reload-config`:
 
@@ -24,7 +28,7 @@ command = "herdr plugin pane open --plugin agent-history --entrypoint search"
 
 Herdr starts `agent-history-herdr` with the Herdr server's environment. The server's `PATH`, not the calling shell's, must contain the install directory; otherwise `open` fails with `plugin_pane_open_failed` and `No viable candidates found in PATH "…"`. Start the Herdr server from a shell where `command -v agent-history-herdr` succeeds. Restarting it with `herdr server stop` closes every pane and agent, so save work first.
 
-**Esc** from the search box closes the overlay pane. From a script, close it by pane ID: `herdr plugin pane close <pane_id>`, where the ID is the pane labelled `Agent History` in `herdr pane list`. `close` accepts only the pane ID; `herdr plugin pane close --plugin agent-history --entrypoint search` prints a usage error. `herdr plugin unlink agent-history` removes the registration; `./uninstall` does not.
+**Esc** from the search box closes the overlay pane. From a script, close it by pane ID: `herdr plugin pane close <pane_id>`, where the ID is the pane labelled `Agent History` in `herdr pane list`. `close` accepts only the pane ID; `herdr plugin pane close --plugin agent-history --entrypoint search` prints a usage error. Neither `./uninstall` nor deleting the programs removes the registration.
 
 ## Behavior
 
