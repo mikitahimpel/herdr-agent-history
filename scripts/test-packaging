@@ -63,7 +63,111 @@ test -z "$(find "$reinstall_prefix" -name '*.install.*' -print -quit)"
 # Packaging refuses to overwrite an existing archive and preserves neighbors.
 printf marker > "$tmp/out/keep"
 printf old > "$tmp/out/agent-history-macos-arm64.tar.gz"
-if PATH="$tmp/bin:$PATH" sh scripts/package "$tmp/out" >/dev/null 2>&1; then exit 1; fi
+if PATH="$tmp/bin:$PATH" env -u AGENT_HISTORY_SIGN_IDENTITY -u AGENT_HISTORY_NOTARY_PROFILE sh scripts/package "$tmp/out" >/dev/null 2>&1; then exit 1; fi
 test "$(cat "$tmp/out/keep")" = marker
 test "$(cat "$tmp/out/agent-history-macos-arm64.tar.gz")" = old
+
+# Signing and notarization run against a synthetic source tree whose build,
+# quality gate and Apple tools are stubs that record their arguments. Nothing
+# here touches a keychain or contacts Apple.
+repo=$(pwd)
+src="$tmp/src"
+stubs="$tmp/stubs"
+calls="$tmp/calls"
+mkdir -p "$src/scripts" "$src/docs" "$src/plugin/agent-history" "$stubs"
+cp scripts/install scripts/uninstall "$src/scripts/"
+printf readme > "$src/README.md"
+printf agents > "$src/AGENTS.md"
+printf doc > "$src/docs/NOTE.md"
+printf 'id = "agent-history"\n' > "$src/plugin/agent-history/herdr-plugin.toml"
+cp "$tmp/bin/uname" "$stubs/uname"
+stub() {
+  printf '#!/bin/sh\necho "%s $*" >> "%s"\n%s\n' "$1" "$calls" "$2" > "$stubs/$1"
+  chmod 755 "$stubs/$1"
+}
+printf '#!/bin/sh\necho "check" >> "%s"\n' "$calls" > "$src/scripts/check"
+chmod 755 "$src/scripts/check"
+stub cargo 'mkdir -p target/release; for n in agent-history agent-history-overlay agent-history-herdr; do printf "#!/bin/sh\\n" > target/release/$n; chmod 755 target/release/$n; done'
+stub security 'echo "  1) 0000 \"${STUB_IDENTITY:-Developer ID Application: Test (TEAMID0000)}\""'
+stub codesign 'case "$1" in -dvv) echo "Authority=${STUB_AUTHORITY:-Developer ID Application: Test (TEAMID0000)}" >&2 ;; -dv) echo "CodeDirectory v=20500 flags=0x10000(runtime)" >&2 ;; esac'
+stub xcrun 'case "$2" in
+  history) exit "${STUB_HISTORY_EXIT:-0}" ;;
+  submit) printf "{\"id\":\"sub-1\",\"status\":\"%s\"}\n" "${STUB_NOTARY_STATUS:-Accepted}"; exit "${STUB_SUBMIT_EXIT:-0}" ;;
+  log) echo "synthetic notary log" ;;
+esac'
+stub spctl 'echo "$4: ${STUB_SPCTL:-accepted}" >&2; echo "source=Notarized Developer ID" >&2'
+# Arguments are environment assignments for this run only.
+package_run() {
+  rm -rf "$src/target" "$tmp/dist" "$calls"
+  : > "$calls"
+  (cd "$src" && env -u AGENT_HISTORY_SIGN_IDENTITY -u AGENT_HISTORY_NOTARY_PROFILE PATH="$stubs:$PATH" "$@" \
+    sh "$repo/scripts/package" "$tmp/dist" > "$tmp/stdout" 2> "$tmp/stderr")
+}
+calls_to() { grep -c -E "^$1( |\$)" "$calls" || true; }
+
+# Without an identity the archive is built ad-hoc and says so loudly; no Apple
+# tool is invoked.
+package_run
+test -f "$tmp/dist/agent-history-macos-arm64.tar.gz"
+(cd "$tmp/dist" && shasum -a 256 -c agent-history-macos-arm64.tar.gz.sha256 >/dev/null)
+grep -q 'ad-hoc signed and NOT notarized' "$tmp/stderr"
+test "$(tail -n 1 "$tmp/stdout")" = "signing: ad-hoc only, NOT notarized"
+test "$(calls_to codesign)" = 0
+test "$(calls_to xcrun)" = 0
+test "$(calls_to check)" = 1
+test "$(tar -tzf "$tmp/dist/agent-history-macos-arm64.tar.gz" | grep -c -E '^agent-history/agent-history(-overlay|-herdr)?$')" = 3
+
+# A notary profile without an identity is refused before any build.
+if package_run AGENT_HISTORY_NOTARY_PROFILE=release; then exit 1; fi
+grep -q 'needs AGENT_HISTORY_SIGN_IDENTITY' "$tmp/stderr"
+test "$(calls_to check)" = 0
+test ! -e "$tmp/dist/agent-history-macos-arm64.tar.gz"
+
+# An identity that is missing, or not a Developer ID Application, is refused.
+if package_run AGENT_HISTORY_SIGN_IDENTITY="Developer ID Application: Other"; then exit 1; fi
+if package_run STUB_IDENTITY="Apple Development: Test (TEAMID0000)" AGENT_HISTORY_SIGN_IDENTITY=TEAMID0000; then exit 1; fi
+test "$(calls_to check)" = 0
+
+# An unusable notary profile is refused before any build.
+if package_run STUB_HISTORY_EXIT=1 AGENT_HISTORY_SIGN_IDENTITY=TEAMID0000 AGENT_HISTORY_NOTARY_PROFILE=missing; then exit 1; fi
+grep -q 'cannot use keychain profile "missing"' "$tmp/stderr"
+test "$(calls_to check)" = 0
+
+# Identity alone signs every binary with a hardened runtime and a timestamp,
+# but warns that the result is still quarantined.
+package_run AGENT_HISTORY_SIGN_IDENTITY=TEAMID0000
+test "$(grep -c '^codesign --force --sign TEAMID0000 --options runtime --timestamp ' "$calls")" = 3
+test "$(grep -c '^codesign --verify --strict ' "$calls")" = 3
+grep -q 'signed with Developer ID but NOT notarized' "$tmp/stderr"
+test "$(tail -n 1 "$tmp/stdout")" = "signing: Developer ID signed, NOT notarized"
+test "$(grep -c '^xcrun notarytool submit' "$calls")" = 0
+
+# A signature from another certificate type is rejected after signing.
+if package_run STUB_AUTHORITY="Apple Distribution: Test (TEAMID0000)" AGENT_HISTORY_SIGN_IDENTITY=TEAMID0000; then exit 1; fi
+grep -q 'not signed by a Developer ID Application certificate' "$tmp/stderr"
+test ! -e "$tmp/dist/agent-history-macos-arm64.tar.gz"
+
+# Identity and profile submit a zip by profile name, then require Gatekeeper
+# to accept every binary as notarized.
+package_run AGENT_HISTORY_SIGN_IDENTITY=TEAMID0000 AGENT_HISTORY_NOTARY_PROFILE=release
+grep -q '^xcrun notarytool submit .*/notarize.zip --keychain-profile release --wait --output-format json$' "$calls"
+test "$(calls_to spctl)" = 3
+test "$(tail -n 1 "$tmp/stdout")" = "signing: Developer ID signed and notarized by Apple; Gatekeeper allows a quarantined copy after an online check"
+test ! -s "$tmp/stderr"
+test -f "$tmp/dist/agent-history-macos-arm64.tar.gz"
+
+# A rejected submission prints Apple's log and leaves no archive, whether
+# notarytool reports it through its status or its exit code.
+if package_run STUB_NOTARY_STATUS=Invalid AGENT_HISTORY_SIGN_IDENTITY=TEAMID0000 AGENT_HISTORY_NOTARY_PROFILE=release; then exit 1; fi
+grep -q 'notarization failed (status: Invalid' "$tmp/stderr"
+grep -q 'synthetic notary log' "$tmp/stderr"
+test ! -e "$tmp/dist/agent-history-macos-arm64.tar.gz"
+if package_run STUB_NOTARY_STATUS=Accepted STUB_SUBMIT_EXIT=1 AGENT_HISTORY_SIGN_IDENTITY=TEAMID0000 AGENT_HISTORY_NOTARY_PROFILE=release; then exit 1; fi
+grep -q 'notarytool exit 1' "$tmp/stderr"
+test ! -e "$tmp/dist/agent-history-macos-arm64.tar.gz"
+
+# So does a Gatekeeper rejection after an accepted submission.
+if package_run STUB_SPCTL=rejected AGENT_HISTORY_SIGN_IDENTITY=TEAMID0000 AGENT_HISTORY_NOTARY_PROFILE=release; then exit 1; fi
+grep -q 'Gatekeeper does not accept notarized agent-history' "$tmp/stderr"
+test ! -e "$tmp/dist/agent-history-macos-arm64.tar.gz"
 echo "packaging smoke passed"

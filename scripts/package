@@ -1,4 +1,9 @@
 #!/bin/sh
+# Build the release archive. Signing and notarization are opt-in:
+#   AGENT_HISTORY_SIGN_IDENTITY   Developer ID Application identity (name or SHA-1)
+#   AGENT_HISTORY_NOTARY_PROFILE  notarytool keychain profile name (needs the identity)
+# Without them the archive is ad-hoc signed, and says so, because Gatekeeper
+# kills a quarantined copy of anything that is not notarized.
 set -eu
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64) ;;
@@ -6,22 +11,91 @@ case "$(uname -s):$(uname -m)" in
 esac
 out=${1:-dist}
 case "$out" in -*|'') echo "package: output directory must not start with -" >&2; exit 2 ;; esac
+identity=${AGENT_HISTORY_SIGN_IDENTITY:-}
+profile=${AGENT_HISTORY_NOTARY_PROFILE:-}
+binaries="agent-history agent-history-overlay agent-history-herdr"
+if [ -n "$profile" ] && [ -z "$identity" ]; then
+  echo "package: AGENT_HISTORY_NOTARY_PROFILE needs AGENT_HISTORY_SIGN_IDENTITY; Apple does not notarize ad-hoc signatures" >&2; exit 2
+fi
+if [ -n "$identity" ]; then
+  if ! security find-identity -v -p codesigning | grep -F -- "$identity" | grep -q 'Developer ID Application'; then
+    echo "package: no valid Developer ID Application identity matches AGENT_HISTORY_SIGN_IDENTITY" >&2; exit 2
+  fi
+fi
+if [ -n "$profile" ]; then
+  if ! xcrun notarytool history --keychain-profile "$profile" >/dev/null; then
+    echo "package: notarytool cannot use keychain profile \"$profile\"; create it with xcrun notarytool store-credentials" >&2; exit 2
+  fi
+fi
 mkdir -p "$out"
 archive="$out/agent-history-macos-arm64.tar.gz"
 if [ -e "$archive" ]; then echo "package: refusing to overwrite $archive" >&2; exit 2; fi
 ./scripts/check
 cargo build --release --locked -p agent-history-cli -p agent-history-herdr
-for name in agent-history agent-history-overlay agent-history-herdr; do
+for name in $binaries; do
   if [ ! -x "target/release/$name" ]; then echo "package: required binary target/release/$name is missing" >&2; exit 2; fi
 done
 if [ ! -f plugin/agent-history/herdr-plugin.toml ]; then echo "package: Herdr plugin manifest is missing" >&2; exit 2; fi
 stage=$(mktemp -d "${TMPDIR:-/tmp}/agent-history-package.XXXXXX")
 trap 'rm -rf "$stage"' EXIT INT TERM
 mkdir -p "$stage/agent-history/plugin/agent-history" "$stage/agent-history/docs"
-for name in agent-history agent-history-overlay agent-history-herdr; do cp "target/release/$name" "$stage/agent-history/"; done
+for name in $binaries; do cp "target/release/$name" "$stage/agent-history/"; done
+
+if [ -n "$identity" ]; then
+  for name in $binaries; do
+    bin="$stage/agent-history/$name"
+    codesign --force --sign "$identity" --options runtime --timestamp --identifier "io.github.mikitahimpel.$name" "$bin"
+    codesign --verify --strict --verbose=2 "$bin"
+    if ! codesign -dvv "$bin" 2>&1 | grep -q '^Authority=Developer ID Application:'; then
+      echo "package: $name is not signed by a Developer ID Application certificate" >&2; exit 1
+    fi
+    if ! codesign -dv "$bin" 2>&1 | grep -q 'flags=.*(runtime)'; then
+      echo "package: $name is missing the hardened runtime" >&2; exit 1
+    fi
+  done
+fi
+
+if [ -n "$profile" ]; then
+  # notarytool accepts zip, pkg and dmg but not tar.gz. Tickets are issued per
+  # code-directory hash, so the same binaries in the tar.gz are covered.
+  submission="$stage/notarize.zip"
+  result="$stage/notarize.json"
+  (cd "$stage" && ditto -c -k --keepParent agent-history "$submission")
+  echo "package: submitting to Apple notarization with keychain profile \"$profile\""
+  submit_status=0
+  xcrun notarytool submit "$submission" --keychain-profile "$profile" --wait --output-format json > "$result" || submit_status=$?
+  status=$(plutil -extract status raw -o - "$result" 2>/dev/null || true)
+  submission_id=$(plutil -extract id raw -o - "$result" 2>/dev/null || true)
+  if [ "$submit_status" -ne 0 ] || [ "$status" != Accepted ]; then
+    echo "package: notarization failed (status: ${status:-unknown}, notarytool exit $submit_status)" >&2
+    if [ -n "$submission_id" ]; then xcrun notarytool log "$submission_id" --keychain-profile "$profile" >&2 || true; fi
+    exit 1
+  fi
+  echo "package: notarization accepted (submission $submission_id)"
+  rm -f "$submission" "$result"
+  # A bare Mach-O cannot hold a stapled ticket, so Gatekeeper confirms it
+  # online on first launch. spctl performs that same lookup.
+  for name in $binaries; do
+    assessment=$(spctl --assess --type execute --verbose=4 "$stage/agent-history/$name" 2>&1 || true)
+    case "$assessment" in
+      *accepted*'source=Notarized Developer ID'*) ;;
+      *) printf 'package: Gatekeeper does not accept notarized %s:\n%s\n' "$name" "$assessment" >&2; exit 1 ;;
+    esac
+  done
+fi
+
 cp plugin/agent-history/herdr-plugin.toml "$stage/agent-history/plugin/agent-history/"
 cp README.md AGENTS.md scripts/install scripts/uninstall "$stage/agent-history/"
 cp -R docs/. "$stage/agent-history/docs/"
 tar -C "$stage" -czf "$archive" agent-history
 (cd "$out" && shasum -a 256 agent-history-macos-arm64.tar.gz) > "$archive.sha256"
 echo "created $archive"
+if [ -n "$profile" ]; then
+  echo "signing: Developer ID signed and notarized by Apple; Gatekeeper allows a quarantined copy after an online check"
+elif [ -n "$identity" ]; then
+  echo "WARNING: signed with Developer ID but NOT notarized. Gatekeeper still kills a quarantined (browser-downloaded) copy. Do not publish this archive." >&2
+  echo "signing: Developer ID signed, NOT notarized"
+else
+  echo "WARNING: ad-hoc signed and NOT notarized. Gatekeeper kills a quarantined (browser-downloaded) copy. Do not publish this archive; set AGENT_HISTORY_SIGN_IDENTITY and AGENT_HISTORY_NOTARY_PROFILE for a release." >&2
+  echo "signing: ad-hoc only, NOT notarized"
+fi
