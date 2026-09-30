@@ -228,7 +228,7 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
                 .as_ref()
                 .is_some_and(|(f, _)| f.committed_offset == meta.len())
         {
-            if !same(&meta, &fs::metadata(path)?) {
+            if !same(meta, &fs::metadata(path)?) {
                 return Err(CoreError::SourceChanged);
             }
             return Ok(IndexReport {
@@ -355,7 +355,7 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
             return Err(CoreError::Unsupported("indexing cancelled".into()));
         }
         let mut file = reader.into_inner().into_inner();
-        if !same(&meta, &file.metadata()?) || !same(&meta, &fs::metadata(path)?) {
+        if !same(meta, &file.metadata()?) || !same(meta, &fs::metadata(path)?) {
             return Err(CoreError::SourceChanged);
         }
         let observed = match &session.cwd {
@@ -394,7 +394,7 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
         }
         session.source = SourceRef::new(path, fid, generation, 0..cursor).unwrap();
         let (head, tail) = sample(&mut file, meta.len())?;
-        if !same(&meta, &file.metadata()?) || !same(&meta, &fs::metadata(path)?) {
+        if !same(meta, &file.metadata()?) || !same(meta, &fs::metadata(path)?) {
             return Err(CoreError::SourceChanged);
         }
         let state = serde_json::to_vec(&Checkpoint {
