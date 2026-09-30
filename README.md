@@ -57,7 +57,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 Then `agent-history browse` searches your history. To resume sessions from Herdr as well, add the plugin; see [resume from Herdr](#optional-resume-from-herdr):
 
 ```sh
-herdr plugin install mikitahimpel/herdr-agent-history/plugin/agent-history --ref v0.1.0-rc.2
+herdr plugin install mikitahimpel/herdr-agent-history/plugin/agent-history --ref v0.1.0-rc.3
 ```
 
 ### Install manually from a release
@@ -127,7 +127,7 @@ If `claude` or `codex` shows `not installed`, run `herdr integration install cla
 **3. Add the plugin and open it.** Herdr starts the overlay itself, using the `PATH` its server started with, not your shell's. So before this step, check that `command -v agent-history-herdr` prints a path in a **new** Terminal window, and if Herdr was already running before `~/.local/bin` was on your `PATH`, save your work, run `herdr server stop` (this closes every pane and agent in Herdr) and start `herdr` again from that window. Otherwise `plugin pane open` fails with `No viable candidates found in PATH`. Then, from a pane inside Herdr:
 
 ```sh
-herdr plugin install mikitahimpel/herdr-agent-history/plugin/agent-history --ref v0.1.0-rc.2
+herdr plugin install mikitahimpel/herdr-agent-history/plugin/agent-history --ref v0.1.0-rc.3
 herdr plugin pane open --plugin agent-history --entrypoint search
 ```
 

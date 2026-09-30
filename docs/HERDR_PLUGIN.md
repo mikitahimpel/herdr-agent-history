@@ -7,7 +7,7 @@ The companion plugin in `plugin/agent-history/herdr-plugin.toml` opens the `agen
 Register the plugin once, from a pane inside Herdr, then open:
 
 ```sh
-herdr plugin install mikitahimpel/herdr-agent-history/plugin/agent-history --ref v0.1.0-rc.2
+herdr plugin install mikitahimpel/herdr-agent-history/plugin/agent-history --ref v0.1.0-rc.3
 herdr plugin pane open --plugin agent-history --entrypoint search
 ```
 
