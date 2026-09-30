@@ -44,6 +44,12 @@ agent-history index \
 
 The database is disposable. Removing it never removes or edits native Claude or Codex history; rerun `index` to rebuild it. Do not place native transcript files at the database path.
 
+## `index` reports failed or deferred files
+
+`indexed 2297 files (0 failed, 222 deferred)` is a healthy run. A *deferred* file was written to while it was being read, usually a session an agent is still appending to. Nothing from it was stored on that pass, and the next `index` run, or the next time the browser opens, reads it again from where its last complete record ended. Deferred files are one count on stderr, never a line each, and do not make the command fail.
+
+A *failed* file will fail again on the next run: it could not be opened, read or stored. Each one is printed on its own `indexing error:` line, and `index` exits non-zero while any remain. Fix the cause the line names, such as a file's permissions, and rerun `index`.
+
 ## `preview` says session not found
 
 `preview` takes the agent and the session ID exactly as `search` printed them: the second column (`Claude` or `Codex`) and the fifth, a long identifier such as `11111111-2222-4333-8444-555555555555`. If you indexed with `--db`, pass the same `--db` to `preview`.

@@ -10,6 +10,10 @@ pub enum CoreError {
     Io(std::io::Error),
     Unsupported(String),
     Storage(String),
+    /// The source was written to while it was being read. Nothing from the attempt
+    /// was committed, and the next scan reads the file again from its last
+    /// committed offset.
+    SourceChanged,
 }
 impl fmt::Display for CoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -18,6 +22,7 @@ impl fmt::Display for CoreError {
             Self::Io(e) => e.fmt(f),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
             Self::Storage(s) => write!(f, "storage error: {s}"),
+            Self::SourceChanged => write!(f, "source changed during indexing; retry"),
         }
     }
 }

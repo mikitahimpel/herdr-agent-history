@@ -296,9 +296,8 @@ impl BrowserState {
         let in_preview = hits.preview.is_some_and(|r| r.contains(at));
         match event {
             Mouse::Click { .. } => {
-                if hits.search.contains(at) {
-                    self.mode = Mode::Query;
-                } else if let Some(&(_, filter)) = hits.tabs.iter().find(|(r, _)| r.contains(at)) {
+                // The tabs sit on the Search box's border, so they are tested first.
+                if let Some(&(_, filter)) = hits.tabs.iter().find(|(r, _)| r.contains(at)) {
                     if filter != self.role_filter {
                         self.role_filter = filter;
                         self.requery(store);
@@ -306,6 +305,8 @@ impl BrowserState {
                     if self.mode == Mode::Preview {
                         self.mode = Mode::Results;
                     }
+                } else if hits.search.contains(at) {
+                    self.mode = Mode::Query;
                 } else if in_results {
                     self.mode = Mode::Results;
                     if let Some(&(_, index)) = hits.rows.iter().find(|(r, _)| r.contains(at)) {
@@ -518,6 +519,12 @@ impl ScanFollower {
                             r.malformed_records,
                             self.started.elapsed().as_secs_f32()
                         );
+                        if r.deferred_files > 0 {
+                            state.status.push_str(&format!(
+                                " · {} changed while read, left for the next scan",
+                                r.deferred_files
+                            ));
+                        }
                         if !r.errors.is_empty() {
                             state.status.push_str(" — ");
                             state.status.push_str(&r.errors.join("; "));

@@ -50,23 +50,16 @@ pub fn draw(frame: &mut Frame, state: &mut BrowserState, integration: &impl Inte
         return;
     }
     let message_height = u16::from(state.error.is_some() || state.notice.is_some());
-    let [header, search, filters, body, message, keys] = Layout::vertical([
-        Constraint::Length(1),
+    let [search, body, message, keys] = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(message_height),
         Constraint::Length(1),
     ])
     .areas(area);
 
-    if integration.host_draws_title() {
-        draw_status_strip(frame, header, state, &p);
-    } else {
-        draw_header(frame, header, state, integration.title(), &p);
-    }
-    draw_search(frame, search, state, &p);
-    draw_filters(frame, filters, state, &p);
+    let title = (!integration.host_draws_title()).then(|| integration.title());
+    draw_search(frame, search, state, title, &p);
 
     let (results_area, preview_area) = split_body(body, state.mode);
     if let Some(r) = results_area {
@@ -167,72 +160,178 @@ fn width_of(s: &str) -> usize {
     width(s)
 }
 
-/// The index status for the header. Anything short of a finished scan is
-/// drawn in a warning color, because results may then be missing.
-fn index_status(state: &BrowserState, p: &Palette) -> (String, Style) {
+/// The index status, longest wording first. Anything short of a finished scan
+/// is drawn in a warning color, because results may then be missing, and every
+/// wording of a running scan still says so.
+fn index_status(state: &BrowserState, p: &Palette) -> (Vec<String>, Style) {
     let warning = Style::new().fg(p.yellow).add_modifier(Modifier::BOLD);
     match state.indexing {
-        Indexing::Running { total: 0, .. } => {
-            ("Indexing… results may be incomplete".into(), warning)
-        }
-        Indexing::Running { checked, total } => (
-            format!("Indexing {checked}/{total} files… results may be incomplete"),
+        Indexing::Running { total: 0, .. } => (
+            vec![
+                "Indexing… results may be incomplete".into(),
+                "Indexing… may be incomplete".into(),
+                "Indexing… partial".into(),
+            ],
             warning,
         ),
-        Indexing::Incomplete => (state.status.clone(), warning),
-        Indexing::Settled => (state.status.clone(), p.muted()),
+        Indexing::Running { checked, total } => (
+            vec![
+                format!("Indexing {checked}/{total} files… results may be incomplete"),
+                format!("Indexing {checked}/{total}… may be incomplete"),
+                format!("{checked}/{total} indexed · partial"),
+                "Indexing… partial".into(),
+            ],
+            warning,
+        ),
+        Indexing::Incomplete => (vec![state.status.clone()], warning),
+        Indexing::Settled => (vec![state.status.clone()], p.muted()),
     }
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, state: &BrowserState, title: &str, p: &Palette) {
-    let title = safe(title, area.width.saturating_sub(2).into());
-    let room = usize::from(area.width).saturating_sub(width_of(&title) + 4);
-    let (status, style) = index_status(state, p);
-    let status = safe(&status, room);
-    let gap = usize::from(area.width).saturating_sub(width_of(&title) + width_of(&status) + 2);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" {title}"),
-                Style::new().fg(p.accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" ".repeat(gap)),
-            Span::styled(status, style),
-            Span::raw(" "),
-        ])),
-        area,
-    );
+/// The first of `options` that fits in `room` columns, else the last cut to fit.
+fn longest_fitting(options: &[String], room: usize) -> String {
+    options
+        .iter()
+        .find(|o| width_of(o) <= room)
+        .cloned()
+        .unwrap_or_else(|| safe(options.last().map_or("", String::as_str), room))
 }
 
-/// The header row when the host already titles the pane: the index status
-/// gets the whole width instead of repeating the host's title.
-fn draw_status_strip(frame: &mut Frame, area: Rect, state: &BrowserState, p: &Palette) {
-    let label = "Index ";
-    let (status, style) = index_status(state, p);
-    let status = safe(
-        &status,
-        usize::from(area.width).saturating_sub(width_of(label) + 2),
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(label, p.key()),
-            Span::styled(status, style),
-        ])),
-        area,
-    );
+/// The role tabs for the Search border. All three when they fit, otherwise
+/// only the active one, which a click then advances like F2 does.
+fn role_tabs(
+    state: &BrowserState,
+    room: usize,
+    p: &Palette,
+) -> Vec<(Span<'static>, Option<RoleFilter>)> {
+    let tab = |filter: RoleFilter| {
+        let style = if filter == state.role_filter {
+            p.active_tab()
+        } else {
+            p.inactive_tab()
+        };
+        Span::styled(format!(" {} ", filter.label()), style)
+    };
+    let gap = || (Span::styled(" ", p.base()), None);
+    let mut full = vec![gap()];
+    for filter in RoleFilter::ALL {
+        full.push((tab(filter), Some(filter)));
+        full.push(gap());
+    }
+    full.push((Span::styled("F2", p.key()), None));
+    full.push(gap());
+    let used: usize = full.iter().map(|(s, _)| width_of(&s.content)).sum();
+    if used <= room {
+        return full;
+    }
+    vec![
+        gap(),
+        (tab(state.role_filter), Some(state.role_filter.next())),
+        gap(),
+        (Span::styled("F2", p.key()), None),
+        gap(),
+    ]
 }
 
-fn draw_search(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Palette) {
+/// Draws spans left to right from `x` on row `y`, clipped at `right`, and
+/// returns where each one landed.
+fn put(frame: &mut Frame, mut x: u16, y: u16, right: u16, spans: &[Span<'static>]) -> Vec<Rect> {
+    let mut placed = Vec::with_capacity(spans.len());
+    for span in spans {
+        let room = usize::from(right.saturating_sub(x));
+        let content = safe(&span.content, room);
+        let w = width_of(&content) as u16;
+        frame
+            .buffer_mut()
+            .set_stringn(x, y, &content, room, span.style);
+        placed.push(Rect::new(x, y, w, 1));
+        x = x.saturating_add(w);
+    }
+    placed
+}
+
+/// The Search box carries everything that sits above the results: the title
+/// (or `Search` where the host already titles the pane) and role tabs on its
+/// top border, the query and result count inside, and the index status on its
+/// bottom border. Only a running or unfinished scan draws attention there.
+fn draw_search(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut BrowserState,
+    title: Option<&str>,
+    p: &Palette,
+) {
     state.hits.search = area;
     let focused = state.mode == Mode::Query;
-    let block = pane("Search", focused, p);
+    let block = Block::bordered()
+        .border_type(if focused {
+            BorderType::Thick
+        } else {
+            BorderType::Rounded
+        })
+        .border_style(p.border(focused));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    // Between the corners, like the other panes' border titles.
+    let (left, right) = (area.x + 1, area.right().saturating_sub(1));
+    let room = usize::from(right.saturating_sub(left));
+
+    let title = format!(" {} ", title.unwrap_or("Search"));
+    let min_title = width_of(" Search ").min(width_of(&title));
+    let tabs = role_tabs(state, room.saturating_sub(min_title + 1), p);
+    let tabs_width: usize = tabs.iter().map(|(s, _)| width_of(&s.content)).sum();
+    let title = safe(&title, room.saturating_sub(tabs_width + 1));
+    let title_style = p.pane_title(focused);
+    put(
+        frame,
+        left,
+        area.y,
+        right,
+        &[Span::styled(title, title_style)],
+    );
+    let spans: Vec<Span<'static>> = tabs.iter().map(|(s, _)| s.clone()).collect();
+    let tabs_x = right.saturating_sub(tabs_width as u16);
+    for (rect, (_, filter)) in put(frame, tabs_x, area.y, right, &spans)
+        .into_iter()
+        .zip(&tabs)
+    {
+        if let Some(filter) = filter {
+            state.hits.tabs.push((rect, *filter));
+        }
+    }
+
+    let (options, style) = index_status(state, p);
+    let status = longest_fitting(&options, room.saturating_sub(2));
+    if !status.is_empty() {
+        let status = format!(" {status} ");
+        let x = right.saturating_sub(width_of(&status) as u16);
+        put(
+            frame,
+            x,
+            area.bottom() - 1,
+            right,
+            &[Span::styled(status, style)],
+        );
+    }
+
+    let count = match state.results.len() {
+        0 if state.query.trim().is_empty() => String::new(),
+        n if n >= RESULT_LIMIT => format!("top {n} results "),
+        1 => "1 result ".into(),
+        n => format!("{n} results "),
+    };
     let prompt = Span::styled(" › ", p.key());
-    let room = usize::from(inner.width).saturating_sub(4);
+    let full = usize::from(inner.width).saturating_sub(4);
+    // The count yields to the query when the box is too narrow for both.
+    let query_width = width_of(&state.query.chars().map(text::clean).collect::<String>());
+    let count = if query_width + width_of(&count) < full {
+        count
+    } else {
+        String::new()
+    };
+    let room = full.saturating_sub(width_of(&count));
     let line = if state.query.is_empty() {
-        let hint = safe("Type words you remember · \"exact phrase\" · prefix*", room);
+        let hint = safe("Type words you remember", room);
         Line::from(vec![prompt, Span::styled(hint, p.muted())])
     } else {
         // Keep the end of a long query, where the cursor is, in view.
@@ -252,6 +351,16 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Pale
         width_of(&line.spans[1].content)
     };
     frame.render_widget(Paragraph::new(line), inner);
+    if !count.is_empty() {
+        let x = inner.right().saturating_sub(width_of(&count) as u16);
+        put(
+            frame,
+            x,
+            inner.y,
+            inner.right(),
+            &[Span::styled(count, p.muted())],
+        );
+    }
     if focused {
         let x = inner.x.saturating_add(3 + typed as u16);
         frame.set_cursor_position(Position::new(
@@ -259,37 +368,6 @@ fn draw_search(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Pale
             inner.y,
         ));
     }
-}
-
-fn draw_filters(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Palette) {
-    let mut spans = vec![Span::raw(" ")];
-    let mut x = area.x + 1;
-    for filter in RoleFilter::ALL {
-        let style = if filter == state.role_filter {
-            p.active_tab()
-        } else {
-            p.inactive_tab()
-        };
-        let tab = format!(" {} ", filter.label());
-        let w = width_of(&tab) as u16;
-        let tab_area = Rect::new(x, area.y, w, 1).intersection(area);
-        state.hits.tabs.push((tab_area, filter));
-        x = x.saturating_add(w + 1);
-        spans.push(Span::styled(tab, style));
-        spans.push(Span::raw(" "));
-    }
-    spans.push(Span::styled("F2", p.key()));
-    let count = match state.results.len() {
-        0 if state.query.trim().is_empty() => String::new(),
-        n if n >= RESULT_LIMIT => format!("top {n} results "),
-        1 => "1 result ".into(),
-        n => format!("{n} results "),
-    };
-    let used: usize = spans.iter().map(|s| width_of(&s.content)).sum();
-    let gap = usize::from(area.width).saturating_sub(used + width_of(&count));
-    spans.push(Span::raw(" ".repeat(gap)));
-    spans.push(Span::styled(count, p.muted()));
-    frame.render_widget(Paragraph::new(fit(spans, area.width.into())), area);
 }
 
 fn agent_span(agent: Agent, p: &Palette) -> Span<'static> {
@@ -551,6 +629,12 @@ fn draw_empty(frame: &mut Frame, area: Rect, state: &BrowserState, p: &Palette) 
         push(
             &mut lines,
             "Type words you remember from a Claude Code or Codex session.",
+            p.muted(),
+        );
+        push(&mut lines, "", p.muted());
+        push(
+            &mut lines,
+            "\"exact phrase\" keeps words together · prefix* matches word starts · F2 filters by role",
             p.muted(),
         );
     } else if let Indexing::Running { checked, total } = state.indexing {
@@ -1019,10 +1103,7 @@ mod tests {
             accent,
             ..Palette::terminal()
         });
-        let corner = |buf: &Buffer, title: &str| {
-            let (x, y) = find(buf, &format!(" {title} ")).unwrap();
-            buf[(x - 1, y)].clone()
-        };
+        let corner = |buf: &Buffer, title: &str| buf[pane_corner(buf, title)].clone();
         for (mode, focused) in [
             (Mode::Query, "Search"),
             (Mode::Results, "Results"),
@@ -1568,6 +1649,16 @@ mod tests {
         state.mouse(Mouse::Click { column, row }, store);
     }
 
+    /// The top-left corner of a pane. The Search box is always at the top, and
+    /// is titled with the integration's title unless the host draws one.
+    fn pane_corner(buf: &Buffer, title: &str) -> (u16, u16) {
+        if title == "Search" {
+            return (0, 0);
+        }
+        let (x, y) = find(buf, &format!(" {title} ")).unwrap();
+        (x - 1, y)
+    }
+
     /// The status bar's text.
     fn status_bar(buf: &Buffer) -> String {
         row(buf, buf.area.height - 1)
@@ -1578,8 +1669,7 @@ mod tests {
     fn assert_focus(buf: &Buffer, state: &BrowserState, focused: &str) {
         let p = Palette::terminal();
         for title in ["Search", "Results", "Preview"] {
-            let (x, y) = find(buf, &format!(" {title} ")).unwrap();
-            let corner = &buf[(x - 1, y)];
+            let corner = &buf[pane_corner(buf, title)];
             if title == focused {
                 assert_eq!(corner.symbol(), "┏", "{title} should be focused");
                 assert_eq!(corner.fg, p.accent);
@@ -1605,7 +1695,7 @@ mod tests {
         state.mouse_capture = true;
         let buf = render(&mut state, &Standalone, 120, 36);
         let inner = results_inner(&buf);
-        let (sx, sy) = find(&buf, " Search ").unwrap();
+        let (sx, sy) = (1, 0);
         let (px, py) = find(&buf, " Preview ").unwrap();
         // Empty space, borders and titles, not only content.
         let targets = [
@@ -1782,24 +1872,82 @@ mod tests {
         }
     }
 
+    /// The row the Results pane's top border is drawn on.
+    fn results_top(buf: &Buffer) -> u16 {
+        find(buf, " Results ").expect("results pane").1
+    }
+
     #[test]
-    fn a_host_titled_pane_shows_status_instead_of_a_second_title() {
-        let temp = TempDir::new("ui-host-title").unwrap();
+    fn results_start_three_rows_down_with_title_tabs_and_status_on_the_search_box() {
+        let temp = TempDir::new("ui-compact").unwrap();
         let (_store, mut state) = searched(&temp);
         state.status = "412 files · 9120 chunks · 0 failed · 0 malformed · 0.4s".into();
-        let buf = render(&mut state, &HostTitled, 100, 30);
-        let all: String = (0..30).map(|y| row(&buf, y)).collect();
-        assert!(
-            !all.contains("Agent History"),
-            "the host already shows the title"
-        );
-        let top = row(&buf, 0);
-        assert!(top.starts_with(" Index 412 files · 9120 chunks"), "{top:?}");
-        // Standalone keeps its title with the status on the right.
+        for (w, h) in [(120, 30), (100, 20), (60, 40), (40, 30)] {
+            for host in [false, true] {
+                let buf = if host {
+                    render(&mut state, &HostTitled, w, h)
+                } else {
+                    render(&mut state, &Standalone, w, h)
+                };
+                assert_eq!(results_top(&buf), 3, "{w}x{h} host={host}");
+                let top = row(&buf, 0);
+                assert!(top.contains("F2"), "{w}x{h}: {top:?}");
+                if host {
+                    let all: String = (0..h).map(|y| row(&buf, y)).collect();
+                    assert!(!all.contains("Agent History"), "the host shows the title");
+                    assert!(top.starts_with("┏ Search "), "{top:?}");
+                }
+            }
+        }
+
         let buf = render(&mut state, &Standalone, 100, 30);
         let top = row(&buf, 0);
-        assert!(top.starts_with(" Agent History (Standalone)"), "{top:?}");
-        assert!(top.trim_end().ends_with("0.4s"), "{top:?}");
+        assert!(top.starts_with("┏ Agent History (Standalone) ━"), "{top:?}");
+        assert!(top.ends_with(" All   User   Assistant  F2 ┓"), "{top:?}");
+        assert!(row(&buf, 1).trim_end().ends_with("2 results ┃"));
+        let bottom = row(&buf, 2);
+        assert!(bottom.ends_with(" 412 files · 9120 chunks · 0 failed · 0 malformed · 0.4s ┛"));
+        let (x, y) = find(&buf, "412 files").unwrap();
+        assert_eq!(
+            buf[(x, y)].fg,
+            Palette::terminal().overlay1,
+            "settled is quiet"
+        );
+
+        // The syntax hints moved out of the placeholder into the empty state.
+        state.query.clear();
+        state.results.clear();
+        let buf = render(&mut state, &Standalone, 100, 30);
+        assert!(row(&buf, 1).contains("› Type words you remember "));
+        assert!(!row(&buf, 1).contains("prefix*"));
+        assert!(find(&buf, "\"exact phrase\" keeps words together").is_some());
+        assert!(find(&buf, "prefix* matches word starts").is_some());
+    }
+
+    #[test]
+    fn role_tabs_on_the_border_are_clickable_and_stay_discoverable_when_narrow() {
+        let temp = TempDir::new("ui-border-tabs").unwrap();
+        let (store, mut state) = searched(&temp);
+        state.mouse_capture = true;
+        let buf = render(&mut state, &Standalone, 100, 30);
+        let (x, y) = find(&buf, " Assistant ").unwrap();
+        assert_eq!(y, 0);
+        click(&mut state, &store, (x + 2, y));
+        assert_eq!(state.role_filter, RoleFilter::Assistant);
+        assert_eq!(state.results.len(), 1, "requeried with the filter");
+
+        // Too narrow for all three: the active tab and F2 remain, and a click
+        // on the tab advances the filter as F2 does.
+        let buf = render(&mut state, &HostTitled, 30, 30);
+        let top = row(&buf, 0);
+        assert!(top.contains(" Assistant  F2 ┓"), "{top:?}");
+        assert!(!top.contains(" User "), "{top:?}");
+        let (x, y) = find(&buf, " Assistant ").unwrap();
+        assert_eq!(buf[(x + 1, y)].bg, Color::Blue, "the active tab is marked");
+        click(&mut state, &store, (x + 2, y));
+        assert_eq!(state.role_filter, RoleFilter::All);
+        let top = row(&render(&mut state, &HostTitled, 30, 30), 0);
+        assert!(top.contains(" All  F2 ┓"), "{top:?}");
     }
 
     #[test]
@@ -1810,15 +1958,35 @@ mod tests {
             checked: 812,
             total: 2510,
         };
-        let buf = render(&mut state, &Standalone, 120, 30);
-        let (x, y) = find(&buf, "Indexing 812/2510 files… results may be incomplete")
-            .expect("progress replaces the settled status");
-        assert_eq!(buf[(x, y)].fg, Palette::terminal().yellow);
-        let top = row(&render(&mut state, &HostTitled, 120, 30), 0);
-        assert!(
-            top.contains("Index Indexing 812/2510 files… results may be incomplete"),
-            "{top:?}"
-        );
+        let yellow = Palette::terminal().yellow;
+        for integration in [true, false] {
+            let buf = if integration {
+                render(&mut state, &HostTitled, 120, 30)
+            } else {
+                render(&mut state, &Standalone, 120, 30)
+            };
+            let (x, y) = find(&buf, "Indexing 812/2510 files… results may be incomplete")
+                .expect("progress replaces the settled status");
+            assert_eq!(y, 2, "on the Search box's bottom border");
+            assert_eq!(buf[(x, y)].fg, yellow);
+            assert_eq!(results_top(&buf), 3);
+        }
+        // Narrower, the wording shortens but always says results are partial.
+        for w in (24..=100).step_by(4) {
+            let buf = render(&mut state, &HostTitled, w, 30);
+            let bottom = row(&buf, 2);
+            assert!(
+                bottom.contains("incomplete") || bottom.contains("partial"),
+                "{w}: {bottom:?}"
+            );
+            let (x, y) = find(&buf, "Indexing")
+                .or_else(|| find(&buf, "812/2510"))
+                .unwrap_or_else(|| panic!("{w}: {bottom:?}"));
+            assert_eq!((y, buf[(x, y)].fg), (2, yellow), "{w}");
+            assert_eq!(results_top(&buf), 3, "{w}");
+        }
+        assert!(row(&render(&mut state, &HostTitled, 50, 30), 2)
+            .contains(" Indexing 812/2510… may be incomplete ┛"));
 
         state.query = "nonexistent".into();
         state.refresh(&store);
@@ -1834,6 +2002,8 @@ mod tests {
         };
         let buf = render(&mut state, &Standalone, 120, 30);
         assert!(find(&buf, "Indexing… results may be incomplete").is_some());
+        let bottom = row(&render(&mut state, &Standalone, 24, 30), 2);
+        assert!(bottom.contains("Indexing… partial"), "{bottom:?}");
     }
 
     #[test]

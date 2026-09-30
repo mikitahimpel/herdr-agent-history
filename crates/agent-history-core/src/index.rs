@@ -28,6 +28,10 @@ pub struct IndexReport {
     pub skipped: bool,
     pub files: u64,
     pub failed_files: u64,
+    /// Files written to while they were read, such as a live session appending. Not a
+    /// failure: nothing from the attempt was committed, and the next scan reads them
+    /// again from their last committed offset. They are never listed in `errors`.
+    pub deferred_files: u64,
     pub errors: Vec<String>,
     /// The call stopped before visiting every discovered file because it was asked to.
     /// Files it did not finish keep their previously committed state.
@@ -37,8 +41,9 @@ pub struct IndexReport {
 ///
 /// Counts are cumulative for the complete call: `total_files` is the number of discovered files,
 /// while the `agent_*` fields apply to the agent named by `agent`. Completed files include failed
-/// attempts; `failed_files` counts failed discovery or file attempts. `records`, `bytes_read`, and
-/// `chunks` count work observed so far, including work in the current file.
+/// and deferred attempts; `failed_files` counts failed discovery or file attempts, and
+/// `deferred_files` those left for the next scan because they changed while read. `records`,
+/// `bytes_read`, and `chunks` count work observed so far, including work in the current file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexProgress {
     pub agent: crate::Agent,
@@ -50,6 +55,7 @@ pub struct IndexProgress {
     pub records: u64,
     pub chunks: u64,
     pub failed_files: u64,
+    pub deferred_files: u64,
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Checkpoint {
@@ -158,6 +164,9 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
         )
     }
     /// Setting `stop` abandons the file before its commit, leaving its previous state intact.
+    ///
+    /// A file written to while it is read yields [`CoreError::SourceChanged`], including
+    /// when the write surfaces first as a read error, such as a rewrite that shortened it.
     fn index_with_cache_progress(
         &mut self,
         discovered: &SessionFile,
@@ -166,13 +175,29 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
         progress: &mut dyn FnMut(u64, u64, u64),
     ) -> Result<IndexReport> {
         let path = &discovered.path;
-        let mut file = File::open(path)?;
+        let file = File::open(path)?;
         let meta = file.metadata()?;
         if !meta.is_file() {
             return Err(CoreError::Unsupported(
                 "source is not a regular file".into(),
             ));
         }
+        match self.index_opened(path, file, &meta, cache, stop, progress) {
+            Err(CoreError::Io(_)) if fs::metadata(path).map_or(true, |now| !same(&meta, &now)) => {
+                Err(CoreError::SourceChanged)
+            }
+            result => result,
+        }
+    }
+    fn index_opened(
+        &mut self,
+        path: &std::path::PathBuf,
+        mut file: File,
+        meta: &Metadata,
+        cache: &mut HashMap<std::path::PathBuf, crate::GitContext>,
+        stop: &AtomicBool,
+        progress: &mut dyn FnMut(u64, u64, u64),
+    ) -> Result<IndexReport> {
         let prior = self.store.indexed_file_state(path)?;
         let expected = prior.as_ref().map(|(f, _)| f.clone());
         let checkpoint = prior
@@ -203,8 +228,8 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
                 .as_ref()
                 .is_some_and(|(f, _)| f.committed_offset == meta.len())
         {
-            if !same(&meta, &fs::metadata(path)?) {
-                return Err(CoreError::Unsupported("source changed; retry".into()));
+            if !same(meta, &fs::metadata(path)?) {
+                return Err(CoreError::SourceChanged);
             }
             return Ok(IndexReport {
                 skipped: true,
@@ -330,10 +355,8 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
             return Err(CoreError::Unsupported("indexing cancelled".into()));
         }
         let mut file = reader.into_inner().into_inner();
-        if !same(&meta, &file.metadata()?) || !same(&meta, &fs::metadata(path)?) {
-            return Err(CoreError::Unsupported(
-                "source changed during indexing; retry".into(),
-            ));
+        if !same(meta, &file.metadata()?) || !same(meta, &fs::metadata(path)?) {
+            return Err(CoreError::SourceChanged);
         }
         let observed = match &session.cwd {
             Some(cwd) => match cache.get(cwd) {
@@ -371,10 +394,8 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
         }
         session.source = SourceRef::new(path, fid, generation, 0..cursor).unwrap();
         let (head, tail) = sample(&mut file, meta.len())?;
-        if !same(&meta, &file.metadata()?) || !same(&meta, &fs::metadata(path)?) {
-            return Err(CoreError::Unsupported(
-                "source changed during indexing; retry".into(),
-            ));
+        if !same(meta, &file.metadata()?) || !same(meta, &fs::metadata(path)?) {
+            return Err(CoreError::SourceChanged);
         }
         let state = serde_json::to_vec(&Checkpoint {
             format_version: CHECKPOINT_FORMAT_VERSION,
@@ -492,6 +513,7 @@ pub fn index_all_until<S: IndexStore, C: FnMut(IndexProgress)>(
             records: total.records,
             chunks: total.chunks,
             failed_files: total.failed_files,
+            deferred_files: total.deferred_files,
         });
         for file in files {
             if stop.load(Ordering::Relaxed) {
@@ -515,6 +537,7 @@ pub fn index_all_until<S: IndexStore, C: FnMut(IndexProgress)>(
                     records: total.records + file_records,
                     chunks: total.chunks + file_chunks,
                     failed_files: total.failed_files,
+                    deferred_files: total.deferred_files,
                 });
             };
             match Indexer::new(adapter.as_ref(), &mut *store)
@@ -538,6 +561,7 @@ pub fn index_all_until<S: IndexStore, C: FnMut(IndexProgress)>(
                         records: total.records,
                         chunks: total.chunks,
                         failed_files: total.failed_files,
+                        deferred_files: total.deferred_files,
                     });
                 }
                 Err(_) if stop.load(Ordering::Relaxed) => {
@@ -545,9 +569,13 @@ pub fn index_all_until<S: IndexStore, C: FnMut(IndexProgress)>(
                     break 'agents;
                 }
                 Err(e) => {
-                    total.failed_files += 1;
-                    if total.errors.len() < 32 {
-                        total.errors.push(format!("{}: {e}", file.path.display()))
+                    if matches!(e, CoreError::SourceChanged) {
+                        total.deferred_files += 1;
+                    } else {
+                        total.failed_files += 1;
+                        if total.errors.len() < 32 {
+                            total.errors.push(format!("{}: {e}", file.path.display()))
+                        }
                     }
                     completed_files += 1;
                     agent_completed_files += 1;
@@ -561,6 +589,7 @@ pub fn index_all_until<S: IndexStore, C: FnMut(IndexProgress)>(
                         records: total.records,
                         chunks: total.chunks,
                         failed_files: total.failed_files,
+                        deferred_files: total.deferred_files,
                     });
                 }
             }
@@ -831,11 +860,104 @@ mod tests {
         let p = d.path().join("f.jsonl");
         fs::write(&p, line("user", "raceword")).unwrap();
         let mut store = db(&d);
-        assert!(Indexer::new(Mutating { path: p.clone() }, &mut store)
-            .index_file(&discovered(&p))
-            .is_err());
+        assert!(matches!(
+            Indexer::new(Mutating { path: p.clone() }, &mut store).index_file(&discovered(&p)),
+            Err(CoreError::SourceChanged)
+        ));
         assert_eq!(store.status().unwrap().chunks, 0);
         assert!(store.indexed_file(&p).unwrap().is_none());
+    }
+    /// Stands in for a live agent: while its record is parsed, `live` is written to,
+    /// either appended to or cut short, as long as `writing` is set.
+    struct LiveWriter {
+        paths: Vec<SessionFile>,
+        live: std::path::PathBuf,
+        truncate: bool,
+        writing: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+    impl AgentAdapter for LiveWriter {
+        fn agent(&self) -> crate::Agent {
+            crate::Agent::Claude
+        }
+        fn discover(&self) -> Result<Vec<SessionFile>> {
+            Ok(self.paths.clone())
+        }
+        fn parse_record(
+            &self,
+            s: &Session,
+            r: &[u8],
+            src: SourceRef,
+        ) -> Result<crate::ParsedRecord> {
+            if self.writing.get() && src.path == self.live {
+                if self.truncate {
+                    fs::write(&self.live, line("user", "short")).unwrap();
+                } else {
+                    append(&self.live, line("assistant", "appendedword").as_bytes());
+                }
+            }
+            ClaudeAdapter::new([]).parse_record(s, r, src)
+        }
+    }
+    fn live_scan(truncate: bool) {
+        let d = TempDir::new("live").unwrap();
+        let live = d.path().join("live.jsonl");
+        let broken = d.path().join("broken.jsonl");
+        let good = d.path().join("good.jsonl");
+        fs::write(&live, line("user", "liveword")).unwrap();
+        fs::write(&broken, line("user", "brokenword")).unwrap();
+        fs::write(&good, line("user", "goodword")).unwrap();
+        // A permission problem is a failure the next run meets again.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&broken, fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&broken).is_ok() {
+            // Privileged users read through the mode bits; a directory is unreadable
+            // as a transcript for anyone.
+            fs::set_permissions(&broken, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::remove_file(&broken).unwrap();
+            fs::create_dir(&broken).unwrap();
+        }
+        let writing = std::rc::Rc::new(std::cell::Cell::new(true));
+        let adapter = LiveWriter {
+            paths: [&live, &broken, &good].map(|p| discovered(p)).into(),
+            live: live.clone(),
+            truncate,
+            writing: writing.clone(),
+        };
+        let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(adapter)];
+        let mut store = db(&d);
+        let mut snapshots = Vec::new();
+        let r = index_all_with_progress(&mut store, &adapters, |p| snapshots.push(p)).unwrap();
+        assert_eq!(r.files, 1, "only the settled file commits");
+        assert_eq!(r.failed_files, 1);
+        assert_eq!(r.deferred_files, 1);
+        assert_eq!(
+            r.errors.len(),
+            1,
+            "a deferred file is not listed as an error"
+        );
+        assert!(r.errors[0].contains("broken.jsonl"), "{:?}", r.errors);
+        let last = snapshots.last().unwrap();
+        assert_eq!((last.completed_files, last.total_files), (3, 3));
+        assert_eq!((last.failed_files, last.deferred_files), (1, 1));
+        assert!(store.indexed_file(&live).unwrap().is_none());
+        assert!(store.search("liveword", 10).unwrap().is_empty());
+        assert_eq!(store.search("goodword", 10).unwrap().len(), 1);
+
+        // Once the writer pauses, the next pass picks the file up; the broken one
+        // still fails, exactly as before.
+        writing.set(false);
+        let r = index_all(&mut store, &adapters).unwrap();
+        assert_eq!((r.failed_files, r.deferred_files), (1, 0));
+        let expected = if truncate { "short" } else { "appendedword" };
+        assert_eq!(store.search(expected, 10).unwrap().len(), 1);
+    }
+    #[test]
+    fn a_file_appended_to_mid_scan_is_deferred_and_a_broken_one_fails() {
+        live_scan(false)
+    }
+    #[test]
+    fn a_file_rewritten_shorter_mid_scan_is_deferred_not_failed() {
+        live_scan(true)
     }
     struct Mixed {
         paths: Vec<SessionFile>,
