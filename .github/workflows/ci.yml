@@ -16,3 +16,5 @@ jobs:
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - name: Formatting, lint, tests, and release build
         run: ./scripts/check
+      - name: Installer and packaging tests
+        run: ./scripts/test-packaging

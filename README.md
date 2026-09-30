@@ -19,12 +19,7 @@ Agent History runs **with or without Herdr**. Searching, previewing and indexing
 | Colors | your terminal's own palette | the theme from Herdr's `config.toml` |
 | Requires | nothing but the binary | Herdr, plus the matching agent executable to resume |
 
-The standalone build has no dependency on the Herdr crate and does not read Herdr's configuration; the two entry points simply share the same index. Install the integration only if you want it:
-
-```sh
-./install                # standalone only
-./install --with-herdr   # also installs the integration and plugin
-```
+The standalone build has no dependency on the Herdr crate and does not read Herdr's configuration; the two entry points simply share the same index. The [installer](#install) puts both programs in place; the Herdr side does nothing until you add the Herdr plugin.
 
 ## Status
 
@@ -32,15 +27,44 @@ The 0.1.0-rc.2 prerelease implements the CLI, terminal overlay, SQLite indexing,
 
 These docs describe the current source. The published rc.2 predates a few changes, each marked **(after rc.2)** where it matters: searching punctuation such as `rate-limit`, near matches for misspelled words, `--` before a query, the release tag in `--version`, one-line error messages from the overlay binaries, and `./uninstall` removing its empty directories.
 
-## Install from a release
+## Install
 
-Apple Silicon macOS only — there are no Intel, Windows or Linux binaries. You need no Rust toolchain, no repository checkout, and no Herdr for search and preview.
+Apple Silicon macOS only — there are no Intel, Windows or Linux binaries. You need no Rust toolchain, no repository checkout, and no Herdr for search and preview. Run this in Terminal:
 
-The current build is the prerelease **[v0.1.0-rc.2](https://github.com/mikitahimpel/herdr-agent-history/releases/tag/v0.1.0-rc.2)**. GitHub never marks a prerelease as "latest", so use that tag link rather than the repository's *Latest release* shortcut. It has two assets: `agent-history-macos-arm64.tar.gz` and its checksum, `agent-history-macos-arm64.tar.gz.sha256`.
+```sh
+curl -fsSL https://raw.githubusercontent.com/mikitahimpel/herdr-agent-history/main/install.sh | sh
+```
 
-### Download with Terminal (recommended)
+The [installer](install.sh) is one short script you can read first. It installs the release it names, currently the prerelease **[v0.1.0-rc.2](https://github.com/mikitahimpel/herdr-agent-history/releases/tag/v0.1.0-rc.2)**, and:
 
-Run these in Terminal from any empty directory. They download both files, verify the checksum *before* anything is extracted, then install:
+- prints the URL it downloads and every file it will create or replace before it starts;
+- checks the archive against the SHA-256 written into the script and installs nothing if it differs (`CHECKSUM MISMATCH`);
+- puts `agent-history`, `agent-history-overlay` and `agent-history-herdr` in `~/.local/bin`, without `sudo`, replacing an existing install by rename so running copies keep working;
+- never edits your shell profile or Herdr configuration.
+
+Options go after `sh -s --`: `--dry-run` prints the plan and stops before downloading anything, `--prefix DIR` installs into another absolute directory, and `--tag TAG` installs another release, checked against the checksum published with that release rather than one pinned in the script:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mikitahimpel/herdr-agent-history/main/install.sh | sh -s -- --dry-run
+```
+
+To read the script before running it, download it with `curl -fsSLO …/install.sh`, then run `sh install.sh`.
+
+If the installer reports that its directory `is not on your PATH`, add it for new Terminal windows and open one. macOS's default shell is zsh:
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+```
+
+Then `agent-history browse` searches your history. To resume sessions from Herdr as well, add the plugin; see [resume from Herdr](#optional-resume-from-herdr):
+
+```sh
+herdr plugin install mikitahimpel/herdr-agent-history/plugin/agent-history --ref v0.1.0-rc.2
+```
+
+### Install manually from a release
+
+The same release can be installed by hand. It has two assets: `agent-history-macos-arm64.tar.gz` and its checksum, `agent-history-macos-arm64.tar.gz.sha256`. GitHub never marks a prerelease as "latest", so use the tag link above rather than the repository's *Latest release* shortcut. Run these in Terminal from any empty directory. They download both files, verify the checksum *before* anything is extracted, then install:
 
 ```sh
 base=https://github.com/mikitahimpel/herdr-agent-history/releases/download/v0.1.0-rc.2
@@ -53,34 +77,9 @@ cd agent-history
 ./install --with-herdr   # instead, to also install the Herdr integration and plugin
 ```
 
-### Downloaded with a browser? Clear the quarantine first
+`./install` uses the same `~/.local/bin`; pass an absolute directory, for example `./install /opt/agent-history/bin`, to choose another. Keep the extracted folder if you want its `./uninstall` later.
 
-The rc.2 binaries are ad-hoc signed and **not notarized by Apple**. A browser marks what it downloads as quarantined, and double-clicking the archive in Finder passes that mark on to every extracted file — including through `./install` into `~/.local/bin`. macOS then refuses to run the program: Terminal prints only `Killed: 9`, and a dialog says:
-
-> **“agent-history” Not Opened**
-> Apple could not verify “agent-history” is free of malware that may harm your Mac or compromise your privacy.
-
-Click **Done**. The highlighted button is **Move to Trash** (**Move to Bin** in some regions), which deletes the program. Then clear the mark from the extracted folder and install again:
-
-```sh
-cd ~/Downloads/agent-history            # wherever the archive was extracted
-xattr -dr com.apple.quarantine .
-./install                               # or ./install --with-herdr, if that is what you ran before
-```
-
-Repeat the install exactly as you first ran it. A plain `./install` replaces only the two standalone programs, so after an earlier `./install --with-herdr` the quarantined `agent-history-herdr` stays behind and is still killed.
-
-If you already installed quarantined copies, clear them in place instead: `xattr -d com.apple.quarantine ~/.local/bin/agent-history*`. It prints `No such xattr: com.apple.quarantine` for any copy that was already clear; that is harmless. The Terminal commands above avoid this entirely: `curl` does not quarantine, and neither does extracting with `tar`. Only clear the quarantine on an archive whose checksum you verified.
-
-### Put it on your PATH
-
-The installer places `agent-history` and `agent-history-overlay` in `~/.local/bin` (pass an absolute directory, for example `./install /opt/agent-history/bin`, to choose another). If `command -v agent-history` prints nothing, that directory is not on your `PATH`. macOS's default shell is zsh; add it permanently and open a new Terminal window:
-
-```sh
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-```
-
-The extracted folder is only needed again to uninstall. You can delete the downloaded archive.
+rc.1 and rc.2 are not notarized by Apple. Downloading them with `curl` as above is fine, but if you download the archive **with a browser** and open it in Finder, macOS kills the installed programs (`Killed: 9`, “agent-history” Not Opened). [Troubleshooting](docs/TROUBLESHOOTING.md#agent-history-not-opened-or-killed-9) shows how to clear the quarantine. Releases are to be notarized from the next one on, which removes this step.
 
 ## First run: index, search, preview
 
@@ -107,9 +106,9 @@ A search with no matches prints nothing. In `browse`, type to search, press **Do
 
 ### Upgrading and removing
 
-To upgrade, download and verify the new release the same way and run its `./install` over the existing one; there is no need to uninstall first. Close any running `agent-history browse` first. The index is kept and migrated automatically when needed. An older build refuses an index created by a newer one (`database schema version … is newer than supported`) rather than altering it.
+To upgrade, close any running `agent-history browse` and run the install command again; it installs the release the script currently names, replacing the programs in place. After a manual install, download and verify the new release the same way and run its `./install` over the existing one. There is no need to uninstall first, and if you installed the Herdr plugin, update it to the same tag with `herdr plugin install … --ref <tag>` again. The index is kept and migrated automatically when needed. An older build refuses an index created by a newer one (`database schema version … is newer than supported`) rather than altering it.
 
-To remove the programs, run `./uninstall` from the extracted folder, passing the same directory if you installed somewhere other than `~/.local/bin`. It removes the binaries, the Herdr plugin manifest, and the `share/agent-history` directories once they are empty (rc.2 leaves those empty directories behind; remove them with `rmdir`), and deliberately keeps both your native Claude/Codex history and the search index. If you no longer have the folder, delete the files yourself: `rm -f ~/.local/bin/agent-history ~/.local/bin/agent-history-overlay ~/.local/bin/agent-history-herdr ~/.local/share/agent-history/plugin/herdr-plugin.toml`. See [privacy and removal](#privacy-and-removal) for deleting the index.
+To remove programs installed by the install command, delete them: `rm -f ~/.local/bin/agent-history ~/.local/bin/agent-history-overlay ~/.local/bin/agent-history-herdr`, and in Herdr run `herdr plugin uninstall agent-history`. After a manual install, run `./uninstall` from the extracted folder, passing the same directory if you installed somewhere other than `~/.local/bin`. It removes the binaries, the Herdr plugin manifest, and the `share/agent-history` directories once they are empty (rc.2 leaves those empty directories behind; remove them with `rmdir`), and deliberately keeps both your native Claude/Codex history and the search index. If you no longer have the folder, delete the files yourself: `rm -f ~/.local/bin/agent-history ~/.local/bin/agent-history-overlay ~/.local/bin/agent-history-herdr ~/.local/share/agent-history/plugin/herdr-plugin.toml`. See [privacy and removal](#privacy-and-removal) for deleting the index.
 
 ## Optional: resume from Herdr
 
@@ -125,16 +124,16 @@ herdr integration status        # claude and codex should say "current"
 
 If `claude` or `codex` shows `not installed`, run `herdr integration install claude` (or `codex`). The integration lets Herdr report which session a running agent has open, so Agent History can switch to a session that is already running instead of starting it a second time.
 
-**2. Install the integration.** Run `./install --with-herdr` from the extracted folder, as above. It adds `agent-history-herdr` next to `agent-history` and copies the plugin to `~/.local/share/agent-history/plugin`.
+**2. Install the programs.** The [install command](#install) already put `agent-history-herdr` in `~/.local/bin`; a manual install needs `./install --with-herdr`.
 
-**3. Link the plugin and open it.** From a pane inside Herdr:
+**3. Add the plugin and open it.** Herdr starts the overlay itself, using the `PATH` its server started with, not your shell's. So before this step, check that `command -v agent-history-herdr` prints a path in a **new** Terminal window, and if Herdr was already running before `~/.local/bin` was on your `PATH`, save your work, run `herdr server stop` (this closes every pane and agent in Herdr) and start `herdr` again from that window. Otherwise `plugin pane open` fails with `No viable candidates found in PATH`. Then, from a pane inside Herdr:
 
 ```sh
-herdr plugin link "$HOME/.local/share/agent-history/plugin"
+herdr plugin install mikitahimpel/herdr-agent-history/plugin/agent-history --ref v0.1.0-rc.2
 herdr plugin pane open --plugin agent-history --entrypoint search
 ```
 
-The overlay is started by the Herdr server, using the `PATH` the server started with, not your shell's. If `plugin pane open` fails with `No viable candidates found in PATH`, the server was started before `~/.local/bin` was on your `PATH`. Save your work, run `herdr server stop` (this closes every pane and agent in Herdr), and start `herdr` again from a new Terminal window.
+`plugin install` fetches the plugin manifest from this repository at the release tag, shows what it declares, and asks before registering it. Keep `--ref` at the tag of the programs you installed. The path must end in `plugin/agent-history`, where the manifest is; `…/plugin` alone fails with `No such file or directory`. A Herdr without `plugin install` can link the copy that `./install --with-herdr` places instead: `herdr plugin link "$HOME/.local/share/agent-history/plugin"` — but resume needs Herdr 0.9.3 or newer regardless, and refuses an older host outright.
 
 **4. Give it a key.** Add this to `~/.config/herdr/config.toml`, then run `herdr server reload-config`:
 
@@ -203,8 +202,8 @@ Removal has three separate parts, and nothing removes your native Claude Code or
 
 | What | Where | Removed by |
 | --- | --- | --- |
-| Programs and Herdr plugin manifest | `~/.local/bin`, `~/.local/share/agent-history/plugin` | `./uninstall` from the extracted folder |
-| Herdr plugin registration | Herdr | `herdr plugin unlink agent-history`, from Herdr |
+| Programs and Herdr plugin manifest | `~/.local/bin`, `~/.local/share/agent-history/plugin` | `rm -f` the three programs (see [upgrading and removing](#upgrading-and-removing)), or `./uninstall` from the extracted folder |
+| Herdr plugin registration | Herdr | `herdr plugin uninstall agent-history` after `plugin install`, or `herdr plugin unlink agent-history` after `plugin link`, from Herdr |
 | Search index (disposable, sensitive) | `~/Library/Application Support/Herdr Agent History/` | you, after closing all clients: `rm -r ~/Library/Application\ Support/Herdr\ Agent\ History` |
 | Native history (canonical) | `~/.claude/projects`, `~/.codex/sessions` | never touched by Agent History |
 
