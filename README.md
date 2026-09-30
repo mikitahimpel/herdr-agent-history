@@ -112,12 +112,12 @@ To remove programs installed by the install command, delete them: `rm -f ~/.loca
 
 ## Optional: resume from Herdr
 
-Searching existing native history files requires no Herdr installation or running coding agent. Resuming through the optional integration requires Herdr and the corresponding Claude Code or Codex executable; these are not bundled. The adapter targets the installed Herdr 0.7.1 CLI. Native compatibility evidence and remaining checks are in [host compatibility](docs/HOST_COMPATIBILITY.md).
+Searching existing native history files requires no Herdr installation or running coding agent. Resuming through the optional integration requires Herdr and the corresponding Claude Code or Codex executable; these are not bundled. It requires **Herdr 0.9.3 or newer**; on an older Herdr, Enter reports the version it found and asks you to run `herdr update`. Native compatibility evidence and remaining checks are in [host compatibility](docs/HOST_COMPATIBILITY.md).
 
 **1. Check what Herdr needs.** Run these in a pane inside Herdr:
 
 ```sh
-herdr --version                 # herdr 0.7.1
+herdr --version                 # herdr 0.9.3 or newer
 command -v claude codex         # the agents you want to resume
 herdr integration status        # claude and codex should say "current"
 ```

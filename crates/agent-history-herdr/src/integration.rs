@@ -293,6 +293,7 @@ mod tests {
                 cwd: cwd.into(),
                 root_pane_id: None,
                 root_pane_occupied: false,
+                created: false,
             })
         }
         fn start_agent(

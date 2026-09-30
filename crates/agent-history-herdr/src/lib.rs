@@ -78,10 +78,11 @@ pub fn matching_agents<'a>(
                 && agent.agent == session.id.agent
                 && match &agent.session_id {
                     Some(reported) => reported == &session.id,
-                    // Herdr's Codex integration reports a native session ID only
-                    // when Codex creates a session, not when it resumes one. A pane
-                    // this integration started carries the session ID in its agent
-                    // name, so that name identifies the exact session instead.
+                    // Herdr reports no session ID for a pane until the agent's
+                    // integration does: seconds after `claude --resume`, never for
+                    // an agent stopped at a startup prompt, and on older Codex not
+                    // before the first turn. A pane this integration started
+                    // carries the session ID in its agent name instead.
                     None => agent.name.as_deref() == Some(plan.agent_name.as_str()),
                 }
         })
@@ -171,12 +172,14 @@ mod tests {
                 cwd: "/w/a".into(),
                 root_pane_id: None,
                 root_pane_occupied: false,
+                created: false,
             },
             WorkspaceRecord {
                 id: "wb".into(),
                 cwd: "/w/b".into(),
                 root_pane_id: None,
                 root_pane_occupied: false,
+                created: false,
             },
         ];
         let plan = |s: &Session| resume::NativeResumePlan::for_session(s).unwrap().agent_name;
