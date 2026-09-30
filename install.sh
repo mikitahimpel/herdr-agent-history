@@ -12,8 +12,8 @@
 set -eu
 
 # Updated with every release. The hash is of the published archive.
-pinned_tag=v0.1.0-rc.2
-pinned_sha256=3050d9cbb13d1f3a13cb1bc6d50108a0d78606fd78a32507817b6d7cd403f04c
+pinned_tag=v0.1.0-rc.3
+pinned_sha256=92291ff3d7ecb32b0d1ee38544eb17a51d246c35152f228d3f428647f2f1f8c3
 
 repo=mikitahimpel/herdr-agent-history
 asset=agent-history-macos-arm64.tar.gz
