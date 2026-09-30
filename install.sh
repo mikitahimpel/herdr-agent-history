@@ -12,7 +12,7 @@
 set -eu
 
 # Updated with every release. The hash is of the published archive.
-pinned_tag=v0.1.0-rc.2
+pinned_tag=v0.1.0-rc.3
 pinned_sha256=3050d9cbb13d1f3a13cb1bc6d50108a0d78606fd78a32507817b6d7cd403f04c
 
 repo=mikitahimpel/herdr-agent-history

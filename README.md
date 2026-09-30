@@ -23,9 +23,7 @@ The standalone build has no dependency on the Herdr crate and does not read Herd
 
 ## Status
 
-The 0.1.0-rc.2 prerelease implements the CLI, terminal overlay, SQLite indexing, Herdr resume, and confirmed worktree recovery. **V1 is not released:** resume has been exercised live only on the development machine, and installation by a new user on a clean Mac remains pending. See [release status](docs/RELEASE_STATUS.md), [indexing limitations](docs/INDEXING.md), and [synthetic performance measurements](docs/PERFORMANCE.md).
-
-These docs describe the current source. The published rc.2 predates a few changes, each marked **(after rc.2)** where it matters: searching punctuation such as `rate-limit`, near matches for misspelled words, `--` before a query, the release tag in `--version`, one-line error messages from the overlay binaries, and `./uninstall` removing its empty directories.
+The 0.1.0-rc.3 prerelease implements the CLI, terminal overlay, SQLite indexing, Herdr resume, and confirmed worktree recovery. It is signed with a Developer ID and notarized by Apple, so a downloaded copy runs without a quarantine workaround. **V1 is not released:** resume has been exercised live only on the development machine, and installation by a new user on a clean Mac remains pending. See [release status](docs/RELEASE_STATUS.md), [indexing limitations](docs/INDEXING.md), and [synthetic performance measurements](docs/PERFORMANCE.md).
 
 ## Install
 
@@ -35,7 +33,7 @@ Apple Silicon macOS only — there are no Intel, Windows or Linux binaries. You 
 curl -fsSL https://raw.githubusercontent.com/mikitahimpel/herdr-agent-history/main/install.sh | sh
 ```
 
-The [installer](install.sh) is one short script you can read first. It installs the release it names, currently the prerelease **[v0.1.0-rc.2](https://github.com/mikitahimpel/herdr-agent-history/releases/tag/v0.1.0-rc.2)**, and:
+The [installer](install.sh) is one short script you can read first. It installs the release it names, currently the prerelease **[v0.1.0-rc.3](https://github.com/mikitahimpel/herdr-agent-history/releases/tag/v0.1.0-rc.3)**, and:
 
 - prints the URL it downloads and every file it will create or replace before it starts;
 - checks the archive against the SHA-256 written into the script and installs nothing if it differs (`CHECKSUM MISMATCH`);
@@ -172,17 +170,17 @@ agent-history preview codex <session-id>
 
 Search includes user messages and assistant replies, excluding tool calls/results, loaded files, reasoning, and system/developer messages. Code deliberately included in a message remains searchable. Use `--role user`, `--role assistant`, or `--role all` (the default); in the overlay, **F2** cycles the same filters.
 
-Search uses SQLite FTS5. Type ordinary text: **(after rc.2)** punctuation is never query syntax, so `rate-limit`, `foo:bar`, `what?`, `C++` or an email address search for the words they contain (`rate-limit` finds "rate limit"). Words are split on punctuation, so `C++` matches the word `C`. Three things keep a special meaning:
+Search uses SQLite FTS5. Type ordinary text: punctuation is never query syntax, so `rate-limit`, `foo:bar`, `what?`, `C++` or an email address search for the words they contain (`rate-limit` finds "rate limit"). Words are split on punctuation, so `C++` matches the word `C`. Three things keep a special meaning:
 
 - a double-quoted phrase, `"portfolio visibility"` (an unclosed quote runs to the end of the query);
 - a trailing `*` for a prefix, `portfol*`;
 - the uppercase operators `AND`, `OR` and `NOT` between two terms, as in `portfolio NOT draft`. Lowercase `and`/`or`/`not`, or an operator with nothing on one side, is searched as a word.
 
-`-` does not exclude a word; use `NOT`. Parentheses and FTS column filters are not supported and are searched as text. Shell quoting must preserve phrase quotes, for example `agent-history search '"portfolio visibility"'`; **(after rc.2)** put `--` before a query that starts with `-`, for example `agent-history search -- -v`.
+`-` does not exclude a word; use `NOT`. Parentheses and FTS column filters are not supported and are searched as text. Shell quoting must preserve phrase quotes, for example `agent-history search '"portfolio visibility"'`; put `--` before a query that starts with `-`, for example `agent-history search -- -v`.
 
 In rc.2, punctuation outside double quotes is still query syntax: `agent-history search rate-limit` fails with `storage error: no such column: limit`, and `C++`, `what?` or an email address fail with `fts5: syntax error`. Put such a query in double quotes, `agent-history search '"rate-limit"'`, and it works there too. An unclosed quote fails with `unterminated string`.
 
-**Near matches (after rc.2).** When a query matches nothing exactly, search retries once, widening each plain word that is not in the index to indexed words one edit away (two for words of eight or more letters; an edit is an added, missing, changed, or swapped pair of adjacent letters) and to words that start with it. `databse` finds "database" and `worktre` finds "worktree". The results are then near matches, and both apps say so: `search` prints `agent-history: no exact matches; showing near matches for databse → database, databse*` on stderr (stdout keeps its format), and the browser's results pane is labelled `≈ no exact match · near: …` and highlights the words that matched. Only plain words of four or more characters, with at least one letter, are widened. Phrases, `prefix*` terms, operators, words after `NOT`, punctuated words and words already in the index are always searched exactly as typed. The retry happens only after zero exact results, so it never changes a query that already matches. It compares spelling only, with no semantic matching, and it corrects only words whose first letter is right or whose first two letters are swapped.
+**Near matches.** When a query matches nothing exactly, search retries once, widening each plain word that is not in the index to indexed words one edit away (two for words of eight or more letters; an edit is an added, missing, changed, or swapped pair of adjacent letters) and to words that start with it. `databse` finds "database" and `worktre` finds "worktree". The results are then near matches, and both apps say so: `search` prints `agent-history: no exact matches; showing near matches for databse → database, databse*` on stderr (stdout keeps its format), and the browser's results pane is labelled `≈ no exact match · near: …` and highlights the words that matched. Only plain words of four or more characters, with at least one letter, are widened. Phrases, `prefix*` terms, operators, words after `NOT`, punctuated words and words already in the index are always searched exactly as typed. The retry happens only after zero exact results, so it never changes a query that already matches. It compares spelling only, with no semantic matching, and it corrects only words whose first letter is right or whose first two letters are swapped.
 
 Both apps share the index at `~/Library/Application Support/Herdr Agent History/index.sqlite`; `agent-history status` prints its location and counts. The historical directory name is retained to reuse existing data; it does not imply a Herdr dependency. Use a dedicated private directory for `--db`; existing shared directories are refused. Custom histories are supported without changing native files:
 
