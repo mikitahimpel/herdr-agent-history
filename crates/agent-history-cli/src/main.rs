@@ -118,20 +118,48 @@ fn index(db: PathBuf, o: Options) -> Result<(), String> {
     let mut store = open(&db)?;
     let r = agent_history_core::index::index_all(&mut store, &adapters(&o))
         .map_err(|e| sanitize(&e.to_string()))?;
-    println!(
-        "indexed {} files ({} failed), {} records ({} bytes, {} chunks; {} malformed)",
+    let (summary, notes, outcome) = index_outcome(&r);
+    println!("{summary}");
+    for note in notes {
+        eprintln!("agent-history: {note}");
+    }
+    outcome
+}
+/// Only failures that another run would meet again make the command fail. A file
+/// deferred because it was written to mid-read is picked up by the next run, so it
+/// is one count rather than a line per file.
+fn index_outcome(
+    r: &agent_history_core::index::IndexReport,
+) -> (String, Vec<String>, Result<(), String>) {
+    let deferred = if r.deferred_files > 0 {
+        format!(", {} deferred", r.deferred_files)
+    } else {
+        String::new()
+    };
+    let summary = format!(
+        "indexed {} files ({} failed{deferred}), {} records ({} bytes, {} chunks; {} malformed)",
         r.files, r.failed_files, r.records, r.bytes_read, r.chunks, r.malformed_records
     );
-    for error in &r.errors {
-        eprintln!("agent-history: indexing error: {}", sanitize(error));
-    }
-    if r.failed_files > 0 {
-        return Err(format!(
-            "index completed with {} failed file(s)",
-            r.failed_files
+    let mut notes: Vec<String> = r
+        .errors
+        .iter()
+        .map(|error| format!("indexing error: {}", sanitize(error)))
+        .collect();
+    if r.deferred_files > 0 {
+        notes.push(format!(
+            "{} file(s) changed while being read and were left for the next run",
+            r.deferred_files
         ));
     }
-    Ok(())
+    let outcome = if r.failed_files > 0 {
+        Err(format!(
+            "index completed with {} failed file(s)",
+            r.failed_files
+        ))
+    } else {
+        Ok(())
+    };
+    (summary, notes, outcome)
 }
 fn search(db: PathBuf, o: Options) -> Result<(), String> {
     if o.query.is_empty() {
@@ -234,6 +262,55 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_history_core::index::IndexReport;
+
+    #[test]
+    fn deferred_files_are_one_quiet_count_and_do_not_fail_the_command() {
+        let r = IndexReport {
+            files: 2297,
+            deferred_files: 222,
+            ..Default::default()
+        };
+        let (summary, notes, outcome) = index_outcome(&r);
+        assert!(summary.starts_with("indexed 2297 files (0 failed, 222 deferred)"));
+        assert_eq!(
+            notes,
+            ["222 file(s) changed while being read and were left for the next run"]
+        );
+        assert!(outcome.is_ok());
+    }
+
+    #[test]
+    fn failures_stay_per_file_and_fail_the_command_alongside_deferred_ones() {
+        let r = IndexReport {
+            files: 10,
+            failed_files: 1,
+            deferred_files: 3,
+            errors: vec!["/h/broken.jsonl: Permission denied".into()],
+            ..Default::default()
+        };
+        let (summary, notes, outcome) = index_outcome(&r);
+        assert!(summary.starts_with("indexed 10 files (1 failed, 3 deferred)"));
+        assert_eq!(notes.len(), 2);
+        assert!(notes[0].starts_with("indexing error: "));
+        assert!(notes[0].contains("broken.jsonl"));
+        assert!(notes[1].starts_with("3 file(s) changed"));
+        assert_eq!(
+            outcome.unwrap_err(),
+            "index completed with 1 failed file(s)"
+        );
+    }
+
+    #[test]
+    fn a_clean_run_keeps_the_existing_summary() {
+        let (summary, notes, outcome) = index_outcome(&IndexReport {
+            files: 3,
+            ..Default::default()
+        });
+        assert!(summary.starts_with("indexed 3 files (0 failed), "));
+        assert!(notes.is_empty());
+        assert!(outcome.is_ok());
+    }
 
     #[test]
     fn parses_role_filter_without_consuming_query() {

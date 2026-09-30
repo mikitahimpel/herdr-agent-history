@@ -518,6 +518,12 @@ impl ScanFollower {
                             r.malformed_records,
                             self.started.elapsed().as_secs_f32()
                         );
+                        if r.deferred_files > 0 {
+                            state.status.push_str(&format!(
+                                " · {} changed while read, left for the next scan",
+                                r.deferred_files
+                            ));
+                        }
                         if !r.errors.is_empty() {
                             state.status.push_str(" — ");
                             state.status.push_str(&r.errors.join("; "));
