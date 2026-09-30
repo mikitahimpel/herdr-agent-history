@@ -17,8 +17,8 @@ Stable V1 is **not released** and GitHub issue #13 remains open. The 0.1.0-rc.2 
 | #4 Git context | Main/linked/bare/separate Git directory tests; preserved observations | Index-time metadata is not proof of historical branch state |
 | #5 CLI | Cross-process index/search/status/preview/append tests | Real-history user validation |
 | #8 Core integration | Both agents through discovery → index → search → original preview; synthetic benchmark | Representative private-history validation without committing data |
-| #9 Native resume | UUID-only argv, source validation, official session provenance, no plain-session fallback; live macOS resume of both agents after process exit, each answering from the earlier turn with the new turns appended to the original transcript under the original session ID (Codex on 2026-09-25) | Historical sessions with absent or non-UUID native IDs remain unexercised; the product reports them as unavailable to resume rather than resuming them |
-| #6 Herdr | Functional terminal overlay, confirmed isolated Git recovery; live active/closed workspace resume, deleted-worktree recreation, unavailable-repository handling, the linked plugin overlay route, and Claude/Codex parity through a post-resume model turn | A Herdr-rendered native overlay is still outside plugin v1; overlay placement remains a terminal pane |
+| #9 Native resume | UUID-only argv, source validation, official session provenance, no plain-session fallback; live macOS resume of both agents after process exit, each answering from the earlier turn with the new turns appended to the original transcript under the original session ID (Codex on 2026-09-25); both re-run through Herdr 0.9.3 on 2026-09-30 | Historical sessions with absent or non-UUID native IDs remain unexercised; the product reports them as unavailable to resume rather than resuming them |
+| #6 Herdr | Functional terminal overlay, confirmed isolated Git recovery; live active/closed workspace resume, deleted-worktree recreation, unavailable-repository handling, the linked plugin overlay route, and Claude/Codex parity through a post-resume model turn; all four workspace states re-run for both agents against Herdr 0.9.3 on 2026-09-30 (see below) | A Herdr-rendered native overlay is still outside plugin v1; overlay placement remains a terminal pane. On 0.9.3 the focus commands' visual effect and a full plugin-pane session were not exercised |
 | #11 Safeguards | Private index, safe open/sidecar rejection, rollback/corruption errors, confirmed recovery | Broader security review; see documented source-mutation limits |
 | #10 Packaging | Apple Silicon archive/checksum published as GitHub prereleases rc.1 and rc.2; extracted installer, durable plugin path, isolated smoke; the published rc.2 artifact installed, upgraded and uninstalled with no toolchain or checkout (see the clean-install simulation below); `scripts/package` signs with Developer ID and a hardened runtime, and submits for notarization, when given an identity and a notary profile (see signing and notarization below) | Installation on a second Mac or fresh user account; the notarization submit has never run because no notary profile exists yet, and published rc.1/rc.2 binaries are still blocked by Gatekeeper when browser-downloaded and Finder-extracted |
 | #12 Documentation | README, indexing/privacy/recovery notes, plugin guide, benchmark and troubleshooting; install and first-run path walked literally from the release page in a stripped environment, then the documented Herdr path through a live Claude resume from the rc.2 binaries (see the documented resume walkthrough below), with gaps fixed | A new user following the documentation alone on a clean machine, through resume |
@@ -380,10 +380,108 @@ someone who knows the code.
   That would have indexed this machine's 9 GiB private history into a new
   index, so it was not done.
 
+## Live Herdr 0.9.3 run (September 30)
+
+Herdr was upgraded from 0.7.1 to 0.9.3 on this machine, and its `agent start`
+no longer accepts `--workspace` (issue #35). The evidence of September 20–29
+above was gathered on 0.7.1 and no longer describes this host. This run fixed
+the adapter and repeated scenarios 5–8 for both agents against the running
+0.9.3 server, from a Herdr-managed pane (`HERDR_ENV=1`, workspace `wBY`, pane
+`wBY:p1`). The contract it relies on is in
+[host compatibility](HOST_COMPATIBILITY.md#herdr-093-contract).
+
+### Conditions
+
+- Herdr 0.9.3 (client and server, protocol 22), Claude Code 2.1.285, and Codex
+  0.157.0, which upgraded itself to 0.159.0 through `brew upgrade --cask codex`
+  the first time a resumed pane launched. Herdr's Claude v7 and Codex v6
+  integrations, which 0.9.3 reports as outdated, were left as installed.
+- A disposable repository at `/Users/mikitahimpel/Developer/hah-093-sandbox`
+  (main checkout `repo`, detached linked worktrees `wt-claude` and `wt-codex`,
+  commit `aafb25d`). One Claude session (`8f0f2724-…`, beacon
+  `violet-heron-9312`) and one Codex session (`01a0ef3e-2f02-…`, beacon
+  `copper-otter-5174`, model `gpt-5.6-luna` because the account rejects the
+  configured default) were recorded there and allowed to exit.
+- The release `agent-history-herdr` ran with a private `--db` and roots that
+  held copies of only those two transcripts; the shared index was not opened.
+  The native files stayed the ones resumed and appended to.
+- Host commands went through a `HERDR_BIN_PATH` wrapper that logged each
+  argv exactly as the adapter issued it. To keep the user's focus, the wrapper
+  ran `--focus` as `--no-focus`, and `workspace focus`/`agent focus` as
+  `workspace get`/`agent get` on the same target. Every other command ran
+  unchanged. Only workspaces created by the run were closed.
+- Claude's folder-trust prompt for the sandbox was accepted once (recorded in
+  `~/.claude.json`). Nothing under `~/.claude` or `~/.codex` was edited or
+  deleted by hand, and Codex's folder trust was not needed.
+
+### Results
+
+- **Scenario 5, active workspace.** Claude: Enter issued `workspace focus wB0`,
+  `agent list`, `agent focus wB0:p2` and no `agent start`; PID 10343 was the only
+  `claude --resume 8f0f2724-…` process before and after. Codex: a first Enter in
+  the open but agent-less workspace issued `pane split wC1:p1 --direction right
+  --cwd … --focus` and `agent start ah-03gyknzurn25ndhfuld9c5ejk --kind codex
+  --pane wC1:p2 -- resume 01a0ef3e-…`. The second Enter issued `agent focus
+  wC1:p2` and no start, and PID 72269 remained the only Codex process for that
+  session. The resumed Codex answered `copper-otter-5174`.
+- **Scenario 6, closed workspace, worktree present.** After closing the
+  workspaces and confirming both processes had exited, Enter issued
+  `workspace create --cwd <worktree> --focus`, `agent list`, and `agent start …
+  --pane <root pane> -- --resume <id>` (Claude) or `-- resume <id>` (Codex),
+  with no split. Asked for the phrase from the first message, Claude answered
+  `violet-heron-9312` and Codex `copper-otter-5174`. The Claude transcript went
+  from 232,504 to 242,256 bytes and the Codex rollout from 131,733 to 148,693
+  bytes. In both, the original bytes hashed the same afterwards, and each was
+  still the only file for its session.
+- **Scenario 7, deleted worktree.** With both worktrees deleted, Enter showed
+  the recovery menu and issued no host command. Declining (`w`, then `n`)
+  issued none either: the checkout stayed absent and `repo` stayed on `main` at
+  `aafb25d` with a clean status. Confirming (`w`, then `y`) recreated each
+  worktree detached at `aafb25d` and then created a workspace and resumed. The
+  resumed Claude answered `violet-heron-9312`. The Codex launch stopped at
+  Codex's own "Cannot use the background server" prompt and `agent start` timed
+  out. The adapter then issued `agent rename wC6:p1 ah-03gyk…` and reported
+  `Codex was not ready in pane wC6:p1 within Herdr's startup timeout`. The next
+  Enter issued `agent focus wC6:p1` and no start, while Herdr reported no
+  session ID for that pane: the resume name alone prevented a duplicate.
+  Choosing "Run without daemon this time" let Codex continue, and it answered
+  `copper-otter-5174`.
+- **Scenario 8, repository unavailable.** With the whole sandbox deleted, both
+  sessions stayed searchable and previewable. Enter showed `The recorded
+  workspace is unavailable.` with only view and cancel, and issued no host
+  command.
+- **Unsupported host.** With `HERDR_BIN_PATH` pointing at a stub that reports
+  `herdr 0.7.1`, Enter showed "Herdr 0.7.1 is not supported; resume needs Herdr
+  0.9.3 or newer. Run `herdr update`.", and `--version` was the only command
+  the stub received.
+
+### Defects found and fixed
+
+- `agent start --workspace` fails on 0.9.3 (`unknown option: --workspace`). The
+  adapter now obtains a pane first and uses `--kind`/`--pane`.
+- The resume name `agent-history-<uuid>` is 50 characters; 0.9.3 allows 32 and
+  fails with `invalid_agent_name`. It is now `ah-` plus the UUID in base 36.
+- When `agent start` times out, Herdr drops the agent's name although the agent
+  keeps running. The adapter restores it with `agent rename`.
+
+### Not established by this run
+
+- The visual effect of `workspace focus`, `agent focus`, `workspace create
+  --focus` and `pane split --focus`: those were run as `get`/`--no-focus`.
+  Their syntax comes from the 0.9.3 help and the targets were resolved live.
+- A full overlay session opened through the plugin on 0.9.3. `plugin pane open`
+  was accepted and started the pane, but it was given an index path that
+  cannot exist so that it would not index real history.
+- The `agent_not_ready` path through the adapter. It was seen live from Claude's
+  trust prompt with a direct `agent start`, but not through Enter.
+- Herdr's current Claude v10 and Codex v8 integrations, and Herdr 0.9.0–0.9.2.
+- The published rc.1/rc.2 binaries contain the 0.7.1 adapter, so resume from
+  them fails on 0.9.3 until a new release is cut.
+
 ## Exact external blockers and next steps
 
 The September 20 blocker is resolved: Codex produced a post-resume model turn on
-September 25, recorded below. Three blockers remain, and two of them need a
+September 25, recorded below. Four blockers remain, and two of them need a
 machine other than this one.
 
 1. **Gatekeeper refuses browser-downloaded binaries.** The published rc.1 and
@@ -401,6 +499,10 @@ machine other than this one.
    plugin v1, which has no non-terminal UI extension point. The surface is a
    terminal pane instead; accepting that deviation, or funding a companion Herdr
    change, is a product decision (#6).
+4. **The published binaries predate Herdr 0.9.3.** rc.1 and rc.2 build the
+   0.7.1 `agent start --workspace` call, which 0.9.3 rejects, so resume from a
+   published release fails on a current Herdr until a new release is cut from
+   a commit that includes the September 30 fix.
 
 ## Signing and notarization (September 26)
 
@@ -626,7 +728,7 @@ those results before tagging stable V1; mocked tests are not substitutes.
 - Only sampled boundaries verify prior content during append; arbitrary interior rewrite followed by regrowth can evade detection. Same-size changes and ordinary replacements/truncations are covered.
 - Renamed sources retain unavailable old-path search rows alongside the new path.
 - Activation indexing runs on a background thread while the existing index serves search (#34). Until the scan finishes, the header says results may be incomplete and results refresh as files commit; on a first run the index starts empty and fills in. Only file counts are shown during the scan, not bytes or records. Ctrl-C and Esc stop the scan before its next record, but a commit already under way finishes first. Derived chunks are retained per file until commit, so memory grows with that file's extracted text.
-- The overlay is a terminal plugin, not an in-process native Herdr widget. Herdr 0.7.1 is the target; later CLI changes require compatibility work.
+- The overlay is a terminal plugin, not an in-process native Herdr widget. Herdr 0.9.3 or newer is required and older hosts are refused (see the September 30 run); later CLI changes require compatibility work.
 - Safe worktree recreation uses the captured commit in detached HEAD state; it does not recreate uncommitted changes or reconstruct unavailable commits.
 - The package is a testing prerelease; clean-user installation acceptance remains pending.
 - The published binaries are not notarized. A browser download extracted in Finder is blocked by Gatekeeper until the quarantine attribute is cleared; see TROUBLESHOOTING.md. Packaging can notarize, but that path has not yet run against Apple, and notarized bare executables cannot be stapled, so a quarantined first launch needs network access.

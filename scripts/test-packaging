@@ -134,6 +134,16 @@ stub() {
 }
 printf '#!/bin/sh\necho "check" >> "%s"\n' "$calls" > "$src/scripts/check"
 chmod 755 "$src/scripts/check"
+# Built binaries notice the marker the xattr stub leaves beside a quarantined
+# copy, record that they ran, and die the way Gatekeeper kills an
+# un-notarized binary when STUB_GATEKEEPER_KILL is set.
+cat > "$stubs/built-binary" <<EOF
+#!/bin/sh
+if [ -e "\$0.quarantined" ]; then
+  echo "ran-quarantined \${0##*/}" >> "$calls"
+  if [ -n "\${STUB_GATEKEEPER_KILL-}" ]; then kill -9 \$\$; fi
+fi
+EOF
 # The cargo stub bakes the identifier it was given into agent-history
 # --version, unless STUB_VERSION_ID stands in for a build that ignored it.
 cat > "$stubs/cargo" <<EOF
@@ -141,9 +151,8 @@ cat > "$stubs/cargo" <<EOF
 echo "cargo \$*" >> "$calls"
 echo "build-id \${AGENT_HISTORY_BUILD_ID-unset}" >> "$calls"
 mkdir -p target/release
-for n in agent-history-overlay agent-history-herdr; do printf '#!/bin/sh\n' > target/release/\$n; chmod 755 target/release/\$n; done
-printf '#!/bin/sh\necho "agent-history 0.1.0 (%s)"\n' "\${STUB_VERSION_ID-\$AGENT_HISTORY_BUILD_ID}" > target/release/agent-history
-chmod 755 target/release/agent-history
+for n in agent-history agent-history-overlay agent-history-herdr; do cp "$stubs/built-binary" target/release/\$n; chmod 755 target/release/\$n; done
+printf 'echo "agent-history 0.1.0 (%s)"\n' "\${STUB_VERSION_ID-\$AGENT_HISTORY_BUILD_ID}" >> target/release/agent-history
 EOF
 chmod 755 "$stubs/cargo"
 stub security 'echo "  1) 0000 \"${STUB_IDENTITY:-Developer ID Application: Test (TEAMID0000)}\""'
@@ -153,7 +162,7 @@ stub xcrun 'case "$2" in
   submit) printf "{\"id\":\"sub-1\",\"status\":\"%s\"}\n" "${STUB_NOTARY_STATUS:-Accepted}"; exit "${STUB_SUBMIT_EXIT:-0}" ;;
   log) echo "synthetic notary log" ;;
 esac'
-stub spctl 'echo "$4: ${STUB_SPCTL:-accepted}" >&2; echo "source=Notarized Developer ID" >&2'
+stub xattr 'touch "$4.quarantined"'
 # Arguments are environment assignments for this run only.
 package_run() {
   rm -rf "$src/target" "$tmp/dist" "$calls"
@@ -238,11 +247,12 @@ if package_run STUB_AUTHORITY="Apple Distribution: Test (TEAMID0000)" AGENT_HIST
 grep -q 'not signed by a Developer ID Application certificate' "$tmp/stderr"
 test ! -e "$tmp/dist/agent-history-macos-arm64.tar.gz"
 
-# Identity and profile submit a zip by profile name, then require Gatekeeper
-# to accept every binary as notarized.
+# Identity and profile submit a zip by profile name, then quarantine a copy of
+# every binary and run it, as Gatekeeper meets a browser download.
 package_run AGENT_HISTORY_SIGN_IDENTITY=TEAMID0000 AGENT_HISTORY_NOTARY_PROFILE=release
 grep -q '^xcrun notarytool submit .*/notarize.zip --keychain-profile release --wait --output-format json$' "$calls"
-test "$(calls_to spctl)" = 3
+test "$(calls_to xattr)" = 3
+test "$(calls_to ran-quarantined)" = 3
 test "$(tail -n 1 "$tmp/stdout")" = "signing: Developer ID signed and notarized by Apple; Gatekeeper allows a quarantined copy after an online check"
 test ! -s "$tmp/stderr"
 test -f "$tmp/dist/agent-history-macos-arm64.tar.gz"
@@ -257,8 +267,136 @@ if package_run STUB_NOTARY_STATUS=Accepted STUB_SUBMIT_EXIT=1 AGENT_HISTORY_SIGN
 grep -q 'notarytool exit 1' "$tmp/stderr"
 test ! -e "$tmp/dist/agent-history-macos-arm64.tar.gz"
 
-# So does a Gatekeeper rejection after an accepted submission.
-if package_run STUB_SPCTL=rejected AGENT_HISTORY_SIGN_IDENTITY=TEAMID0000 AGENT_HISTORY_NOTARY_PROFILE=release; then exit 1; fi
-grep -q 'Gatekeeper does not accept notarized agent-history' "$tmp/stderr"
+# So does Gatekeeper killing a quarantined copy after an accepted submission.
+if package_run STUB_GATEKEEPER_KILL=1 AGENT_HISTORY_SIGN_IDENTITY=TEAMID0000 AGENT_HISTORY_NOTARY_PROFILE=release; then exit 1; fi
+grep -q 'Gatekeeper killed quarantined agent-history (SIGKILL)' "$tmp/stderr"
 test ! -e "$tmp/dist/agent-history-macos-arm64.tar.gz"
+test ! -e "$tmp/dist/agent-history-macos-arm64.tar.gz"
+# The bootstrap installer runs against a stub curl that serves releases from a
+# local directory, so nothing here touches the network.
+boot="$tmp/boot"
+boot_bin="$tmp/boot-bin"
+releases="$tmp/releases"
+boot_home="$tmp/boot-home"
+mkdir -p "$boot_bin" "$releases" "$boot_home"
+cp "$tmp/bin/uname" "$boot_bin/uname"
+cat > "$boot_bin/curl" <<EOF
+#!/bin/sh
+out=; url=
+while [ "\$#" -gt 0 ]; do
+  case "\$1" in -o) out=\$2; shift ;; --proto) shift ;; -*) ;; *) url=\$1 ;; esac
+  shift
+done
+echo "curl \$url" >> "$calls"
+tag_dir=\${url%/*}
+src="$releases/\${tag_dir##*/}/\${url##*/}"
+[ -f "\$src" ] || exit 22
+cp "\$src" "\$out"
+EOF
+chmod 755 "$boot_bin/curl"
+# Builds a synthetic release archive for TAG, with the named binaries.
+make_release() {
+  rel_tag=$1; shift
+  rm -rf "$tmp/rel-stage" "$releases/$rel_tag"
+  mkdir -p "$tmp/rel-stage/agent-history" "$releases/$rel_tag"
+  for n in "$@"; do
+    printf '#!/bin/sh\necho "%s 0.1.0 (%s)"\n' "$n" "$rel_tag" > "$tmp/rel-stage/agent-history/$n"
+    chmod 755 "$tmp/rel-stage/agent-history/$n"
+  done
+  tar -C "$tmp/rel-stage" -czf "$releases/$rel_tag/agent-history-macos-arm64.tar.gz" agent-history
+  (cd "$releases/$rel_tag" && shasum -a 256 agent-history-macos-arm64.tar.gz > agent-history-macos-arm64.tar.gz.sha256)
+}
+all_bins="agent-history agent-history-overlay agent-history-herdr"
+boot_run() {
+  : > "$calls"
+  env -i HOME="$boot_home" TMPDIR="$tmp" PATH="$boot_bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    sh "$repo/install.sh" "$@" > "$tmp/stdout" 2> "$tmp/stderr"
+}
+pinned_tag=$(sed -n 's/^pinned_tag=//p' install.sh)
+test -n "$pinned_tag"
+
+# The dry run states every download and destination, and does neither.
+boot_run --dry-run --prefix "$boot"
+grep -q "download  https://github.com/mikitahimpel/herdr-agent-history/releases/download/$pinned_tag/agent-history-macos-arm64.tar.gz" "$tmp/stdout"
+grep -q 'verify    against the SHA-256 pinned in this script' "$tmp/stdout"
+test "$(grep -c "^  create    $boot/agent-history" "$tmp/stdout")" = 3
+test "$(calls_to curl)" = 0
+test ! -e "$boot"
+
+# The pinned release is checked against the hash in the script, never the one
+# served beside it: a substituted archive with a matching .sha256 is refused.
+make_release "$pinned_tag" $all_bins
+if boot_run --prefix "$boot"; then exit 1; fi
+grep -q 'CHECKSUM MISMATCH' "$tmp/stderr"
+grep -q 'nothing was installed' "$tmp/stderr"
+test "$(grep -c 'sha256$' "$calls")" = 0
+test ! -e "$boot"
+
+# Another tag is checked against the checksum published with it.
+make_release v9.9.9 $all_bins
+boot_run --tag v9.9.9 --prefix "$boot"
+grep -q 'verify    against the SHA-256 published with v9.9.9' "$tmp/stdout"
+grep -q '^Checksum verified: ' "$tmp/stdout"
+for n in $all_bins; do test "$("$boot/$n")" = "$n 0.1.0 (v9.9.9)"; done
+grep -q "^agent-history 0.1.0 (v9.9.9)$" "$tmp/stdout"
+grep -q "herdr plugin install mikitahimpel/herdr-agent-history/plugin/agent-history --ref v9.9.9" "$tmp/stdout"
+grep -q "$boot is not on your PATH" "$tmp/stdout"
+grep -q 'No viable candidates found' "$tmp/stdout"
+test -z "$(find "$boot_home" -mindepth 1 -print -quit)"
+
+# Installing over that announces the replacement and swaps every inode.
+make_release v9.9.10 $all_bins
+before=$(ls -i "$boot/agent-history" | awk '{print $1}')
+boot_run --tag v9.9.10 --prefix "$boot"
+test "$(grep -c "^  replace   $boot/agent-history.* (existing install, swapped by rename)$" "$tmp/stdout")" = 3
+test "$(ls -i "$boot/agent-history" | awk '{print $1}')" != "$before"
+for n in $all_bins; do test "$("$boot/$n")" = "$n 0.1.0 (v9.9.10)"; done
+test -z "$(find "$boot" -name '*.install.*' -print -quit)"
+
+# A corrupted download fails loudly and leaves the existing install working.
+make_release v9.9.11 $all_bins
+printf corrupt >> "$releases/v9.9.11/agent-history-macos-arm64.tar.gz"
+if boot_run --tag v9.9.11 --prefix "$boot"; then exit 1; fi
+grep -q 'CHECKSUM MISMATCH' "$tmp/stderr"
+for n in $all_bins; do test "$("$boot/$n")" = "$n 0.1.0 (v9.9.10)"; done
+# So do a missing checksum, a missing archive and an incomplete archive.
+rm "$releases/v9.9.11/agent-history-macos-arm64.tar.gz.sha256"
+if boot_run --tag v9.9.11 --prefix "$boot"; then exit 1; fi
+grep -q 'download failed: .*/v9.9.11/agent-history-macos-arm64.tar.gz.sha256' "$tmp/stderr"
+if boot_run --tag v9.9.12 --prefix "$boot"; then exit 1; fi
+grep -q 'download failed' "$tmp/stderr"
+make_release v9.9.13 agent-history agent-history-overlay
+if boot_run --tag v9.9.13 --prefix "$boot"; then exit 1; fi
+grep -q 'the archive has no agent-history/agent-history-herdr' "$tmp/stderr"
+for n in $all_bins; do test "$("$boot/$n")" = "$n 0.1.0 (v9.9.10)"; done
+test -z "$(find "$tmp" -maxdepth 1 -name 'agent-history-install.*' -print -quit)"
+
+# The default prefix is ~/.local/bin, and an existing PATH entry needs no advice.
+env -i HOME="$boot_home" TMPDIR="$tmp" PATH="$boot_bin:/usr/bin:/bin:$boot_home/.local/bin" \
+  sh install.sh --tag v9.9.10 > "$tmp/stdout" 2> "$tmp/stderr"
+test -x "$boot_home/.local/bin/agent-history-herdr"
+if grep -q 'is not on your PATH' "$tmp/stdout"; then exit 1; fi
+rm -r "$boot_home/.local"
+
+# Bad arguments and unsupported machines stop before any download.
+for args in "--tag main" "--tag v1;id" "--tag" "--prefix relative" "--prefix /usr" "--yes"; do
+  if boot_run $args; then exit 1; fi
+done
+test "$(calls_to curl)" = 0
+printf '#!/bin/sh\necho Linux\n' > "$boot_bin/uname"
+if boot_run --tag v9.9.10 --prefix "$tmp/elsewhere-prefix"; then exit 1; fi
+grep -q 'built only for macOS on Apple Silicon; this is Linux' "$tmp/stderr"
+printf '#!/bin/sh\ncase "$1" in -s) echo Darwin ;; -m) echo x86_64 ;; esac\n' > "$boot_bin/uname"
+printf '#!/bin/sh\necho 0\n' > "$boot_bin/sysctl"; chmod 755 "$boot_bin/sysctl"
+if boot_run --tag v9.9.10 --prefix "$tmp/elsewhere-prefix"; then exit 1; fi
+grep -q 'built only for Apple Silicon Macs; this Mac is x86_64' "$tmp/stderr"
+# Under Rosetta the shell reports x86_64 on an Apple Silicon Mac.
+printf '#!/bin/sh\necho 1\n' > "$boot_bin/sysctl"
+boot_run --tag v9.9.10 --dry-run --prefix "$tmp/elsewhere-prefix"
+test "$(calls_to curl)" = 0
+test ! -e "$tmp/elsewhere-prefix"
+
+# The README leads with the pinned release it installs.
+grep -q "herdr plugin install mikitahimpel/herdr-agent-history/plugin/agent-history --ref $pinned_tag" README.md
+grep -q 'raw.githubusercontent.com/mikitahimpel/herdr-agent-history/main/install.sh | sh' README.md
 echo "packaging smoke passed"
