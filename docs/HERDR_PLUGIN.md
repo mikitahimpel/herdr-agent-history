@@ -13,7 +13,7 @@ herdr plugin pane open --plugin agent-history --entrypoint search
 
 `herdr plugin install OWNER/REPO/SUBDIR` (checked against Herdr 0.9.3) clones the repository at `--ref` into `~/.config/herdr/plugins/github/` and reads `herdr-plugin.toml` from `SUBDIR`, so the path must end in `plugin/agent-history`; `…/plugin` fails with `No such file or directory`. It prints the actions and pane command the manifest declares and asks before registering, unless given `--yes`. It needs no running server. Pin `--ref` to the release tag of the installed programs, so the manifest matches them. `herdr plugin uninstall agent-history` removes it.
 
-A Herdr without `plugin install`, such as 0.7.1, links the copy that `./install --with-herdr` places in `~/.local/share/agent-history/plugin` instead: `herdr plugin link "$HOME/.local/share/agent-history/plugin"`, removed with `herdr plugin unlink agent-history`.
+A Herdr without `plugin install` can link the copy that `./install --with-herdr` places in `~/.local/share/agent-history/plugin` instead: `herdr plugin link "$HOME/.local/share/agent-history/plugin"`, removed with `herdr plugin unlink agent-history`. Linking does not lower the requirement: resume refuses any host below 0.9.3, so on an older Herdr only standalone search and preview work.
 
 The manifest also declares a global action, `open`, which runs that same command; `herdr plugin action list` shows it. Herdr's default configuration binds no key to it. To open the overlay with **prefix+f** (Ctrl-b, then f, with Herdr's default prefix), add a command binding to `~/.config/herdr/config.toml` and apply it with `herdr server reload-config`:
 

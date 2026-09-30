@@ -133,7 +133,7 @@ herdr plugin install mikitahimpel/herdr-agent-history/plugin/agent-history --ref
 herdr plugin pane open --plugin agent-history --entrypoint search
 ```
 
-`plugin install` fetches the plugin manifest from this repository at the release tag, shows what it declares, and asks before registering it. Keep `--ref` at the tag of the programs you installed. The path must end in `plugin/agent-history`, where the manifest is; `…/plugin` alone fails with `No such file or directory`. A Herdr without `plugin install` (0.7.1 has none) links the copy that `./install --with-herdr` places instead: `herdr plugin link "$HOME/.local/share/agent-history/plugin"`.
+`plugin install` fetches the plugin manifest from this repository at the release tag, shows what it declares, and asks before registering it. Keep `--ref` at the tag of the programs you installed. The path must end in `plugin/agent-history`, where the manifest is; `…/plugin` alone fails with `No such file or directory`. A Herdr without `plugin install` can link the copy that `./install --with-herdr` places instead: `herdr plugin link "$HOME/.local/share/agent-history/plugin"` — but resume needs Herdr 0.9.3 or newer regardless, and refuses an older host outright.
 
 **4. Give it a key.** Add this to `~/.config/herdr/config.toml`, then run `herdr server reload-config`:
 
