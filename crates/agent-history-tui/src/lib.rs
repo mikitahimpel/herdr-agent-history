@@ -296,9 +296,8 @@ impl BrowserState {
         let in_preview = hits.preview.is_some_and(|r| r.contains(at));
         match event {
             Mouse::Click { .. } => {
-                if hits.search.contains(at) {
-                    self.mode = Mode::Query;
-                } else if let Some(&(_, filter)) = hits.tabs.iter().find(|(r, _)| r.contains(at)) {
+                // The tabs sit on the Search box's border, so they are tested first.
+                if let Some(&(_, filter)) = hits.tabs.iter().find(|(r, _)| r.contains(at)) {
                     if filter != self.role_filter {
                         self.role_filter = filter;
                         self.requery(store);
@@ -306,6 +305,8 @@ impl BrowserState {
                     if self.mode == Mode::Preview {
                         self.mode = Mode::Results;
                     }
+                } else if hits.search.contains(at) {
+                    self.mode = Mode::Query;
                 } else if in_results {
                     self.mode = Mode::Results;
                     if let Some(&(_, index)) = hits.rows.iter().find(|(r, _)| r.contains(at)) {
