@@ -72,15 +72,6 @@ fn install_panic_hook() {
     });
 }
 
-/// Restores the terminal and exits as an interrupted process would. Used
-/// while indexing, which cannot be cancelled cooperatively; SQLite
-/// transactions keep the index consistent.
-pub(crate) fn abort(term: Term) -> ! {
-    drop(term);
-    restore();
-    std::process::exit(130)
-}
-
 pub(crate) struct Screen {
     term: Option<Term>,
 }
@@ -94,15 +85,6 @@ impl Screen {
         set_mouse_capture(&mut io::stdout(), true)?;
         screen.term = Some(Terminal::new(CrosstermBackend::new(io::stdout()))?);
         Ok(screen)
-    }
-
-    /// Lends the terminal to another thread; hand it back with `put_back`.
-    pub(crate) fn take(&mut self) -> Term {
-        self.term.take().expect("terminal is lent out only once")
-    }
-
-    pub(crate) fn put_back(&mut self, term: Term) {
-        self.term = Some(term);
     }
 
     pub(crate) fn terminal(&mut self) -> &mut Term {

@@ -2,6 +2,7 @@ use crate::domain::*;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 pub type Result<T> = std::result::Result<T, CoreError>;
 #[derive(Debug)]
 pub enum CoreError {
@@ -34,6 +35,12 @@ impl From<rusqlite::Error> for CoreError {
 pub trait AgentAdapter {
     fn agent(&self) -> Agent;
     fn discover(&self) -> Result<Vec<SessionFile>>;
+    /// Like `discover`, but may give up once `stop` is set. The list is then
+    /// incomplete and must not be treated as the full set of sessions.
+    fn discover_until(&self, stop: &AtomicBool) -> Result<Vec<SessionFile>> {
+        let _ = stop;
+        self.discover()
+    }
     fn parse_record(
         &self,
         session: &Session,
@@ -47,6 +54,9 @@ impl<T: AgentAdapter + ?Sized> AgentAdapter for &T {
     }
     fn discover(&self) -> Result<Vec<SessionFile>> {
         (*self).discover()
+    }
+    fn discover_until(&self, stop: &AtomicBool) -> Result<Vec<SessionFile>> {
+        (*self).discover_until(stop)
     }
     fn parse_record(&self, s: &Session, r: &[u8], src: SourceRef) -> Result<ParsedRecord> {
         (*self).parse_record(s, r, src)

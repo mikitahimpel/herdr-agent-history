@@ -34,6 +34,9 @@ impl AgentAdapter for CodexAdapter {
     fn discover(&self) -> Result<Vec<SessionFile>> {
         discover_jsonl(&self.roots)
     }
+    fn discover_until(&self, stop: &std::sync::atomic::AtomicBool) -> Result<Vec<SessionFile>> {
+        discover_jsonl_until(&self.roots, stop)
+    }
     fn parse_record(
         &self,
         session: &Session,

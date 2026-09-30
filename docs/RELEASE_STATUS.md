@@ -727,7 +727,7 @@ those results before tagging stable V1; mocked tests are not substitutes.
 
 - Only sampled boundaries verify prior content during append; arbitrary interior rewrite followed by regrowth can evade detection. Same-size changes and ordinary replacements/truncations are covered.
 - Renamed sources retain unavailable old-path search rows alongside the new path.
-- Initial activation indexing is synchronous; elapsed time and per-agent/file progress are visible, but search waits for the scan and there is no cancellation API. Derived chunks are retained per file until commit, so memory grows with that file's extracted text.
+- Activation indexing runs on a background thread while the existing index serves search (#34). Until the scan finishes, the header says results may be incomplete and results refresh as files commit; on a first run the index starts empty and fills in. Only file counts are shown during the scan, not bytes or records. Ctrl-C and Esc stop the scan before its next record, but a commit already under way finishes first. Derived chunks are retained per file until commit, so memory grows with that file's extracted text.
 - The overlay is a terminal plugin, not an in-process native Herdr widget. Herdr 0.9.3 or newer is required and older hosts are refused (see the September 30 run); later CLI changes require compatibility work.
 - Safe worktree recreation uses the captured commit in detached HEAD state; it does not recreate uncommitted changes or reconstruct unavailable commits.
 - The package is a testing prerelease; clean-user installation acceptance remains pending.

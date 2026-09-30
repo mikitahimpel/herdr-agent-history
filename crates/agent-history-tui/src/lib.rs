@@ -3,10 +3,10 @@
 use agent_history_core::{
     adapters::{ClaudeAdapter, CodexAdapter},
     availability::Availability,
-    index::{index_all_with_progress, IndexProgress},
+    background::{BackgroundIndex, ScanSnapshot},
     preview::preview_source,
-    CoreError, EventKind, Result, SearchResult, Session, SessionId, SourceRef, SqliteStore,
-    Widening,
+    AgentAdapter, CoreError, EventKind, Result, SearchResult, Session, SessionId, SourceRef,
+    SqliteStore, Widening,
 };
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -16,11 +16,6 @@ use ratatui::layout::Position;
 use std::{
     io,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
-    thread,
     time::{Duration, Instant},
 };
 
@@ -40,6 +35,9 @@ pub use ui::draw;
 /// Maximum results fetched per query.
 pub const RESULT_LIMIT: usize = 50;
 const PREVIEW_BYTES: u64 = 64 * 1024;
+/// While indexing runs, results are re-queried at most this often, so that a
+/// stream of commits does not reshuffle the list under the reader.
+const RESULTS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Key {
@@ -83,6 +81,21 @@ pub enum Mode {
     Results,
     Preview,
     Action,
+}
+
+/// Whether the index the results come from has caught up with the history on
+/// disk.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Indexing {
+    /// The last scan finished; the index holds every file it found.
+    #[default]
+    Settled,
+    /// A scan is still running, so recently changed conversations may be
+    /// missing. `checked` of `total` files are done; `total` is 0 until the
+    /// files have been found.
+    Running { checked: u64, total: u64 },
+    /// The last scan did not finish; `BrowserState::status` says why.
+    Incomplete,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -144,6 +157,7 @@ pub struct BrowserState {
     pub notice: Option<String>,
     pub closed: bool,
     pub status: String,
+    pub indexing: Indexing,
     pub role_filter: RoleFilter,
     /// Whether each result's session still exists on disk, filled in by a
     /// background check.
@@ -159,6 +173,27 @@ pub struct BrowserState {
 }
 impl BrowserState {
     pub fn refresh(&mut self, store: &SqliteStore) {
+        self.search(store);
+        self.sync_preview(store);
+    }
+
+    /// Re-runs the query after the index changed underneath it. The selected
+    /// conversation stays selected while it is still among the results, and
+    /// an error the reader has not dismissed stays shown.
+    pub fn refresh_in_place(&mut self, store: &SqliteStore) {
+        let selected = self.selected_result().map(|r| r.source.clone());
+        let error = self.error.take();
+        self.search(store);
+        if self.error.is_none() {
+            self.error = error;
+        }
+        if let Some(i) = selected.and_then(|s| self.results.iter().position(|r| r.source == s)) {
+            self.selected = i;
+        }
+        self.sync_preview(store);
+    }
+
+    fn search(&mut self, store: &SqliteStore) {
         match store.search_with_fallback(&self.query, RESULT_LIMIT, self.role_filter.kind()) {
             Ok(outcome) => {
                 self.results = outcome.results;
@@ -173,7 +208,6 @@ impl BrowserState {
                 self.error = Some(e.to_string());
             }
         }
-        self.sync_preview(store);
     }
     pub fn selected_result(&self) -> Option<&SearchResult> {
         self.results.get(self.selected)
@@ -428,14 +462,95 @@ impl Integration for Standalone {
     }
 }
 
-pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<()> {
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{}\n\nOptions: --db PATH --claude-root PATH --codex-root PATH\nExplicit root options disable default history discovery for both agents.\nType a query; arrows/Tab focus results and preview; F2 filters role; Space previews; Enter {}; Esc goes back; Ctrl-C closes.", integration.title(), integration.enter_label().to_lowercase());
-        return Ok(());
+/// Carries the background scan into the browser: progress into the header,
+/// and each batch of commits into the results.
+struct ScanFollower {
+    started: Instant,
+    seen_chunks: u64,
+    refreshed: Instant,
+    /// Commits the results have not been re-queried for yet.
+    stale: bool,
+    finished: bool,
+}
+
+impl ScanFollower {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            seen_chunks: 0,
+            refreshed: started,
+            stale: false,
+            finished: false,
+        }
     }
-    let (db, claude, codex) = parse_args(args)?;
-    let custom = claude.is_some() || codex.is_some();
-    let adapters: Vec<Box<dyn agent_history_core::AgentAdapter>> = if custom {
+
+    /// Returns the scan's report the first time it is seen finished.
+    fn apply(
+        &mut self,
+        scan: &ScanSnapshot,
+        state: &mut BrowserState,
+        store: &SqliteStore,
+    ) -> Option<agent_history_core::index::IndexReport> {
+        if scan.committed_chunks > self.seen_chunks {
+            self.seen_chunks = scan.committed_chunks;
+            self.stale = true;
+        }
+        let mut report = None;
+        match (&scan.outcome, self.finished) {
+            (None, _) => {
+                let (checked, total) = scan
+                    .progress
+                    .as_ref()
+                    .map_or((0, 0), |p| (p.completed_files, p.total_files));
+                state.indexing = Indexing::Running { checked, total };
+            }
+            (Some(outcome), false) => {
+                self.finished = true;
+                // A finished scan may also have removed or rewritten chunks.
+                self.stale = true;
+                match outcome {
+                    Ok(r) => {
+                        state.status = format!(
+                            "{} files · {} chunks · {} failed · {} malformed · {:.1}s",
+                            r.files,
+                            r.chunks,
+                            r.failed_files,
+                            r.malformed_records,
+                            self.started.elapsed().as_secs_f32()
+                        );
+                        if !r.errors.is_empty() {
+                            state.status.push_str(" — ");
+                            state.status.push_str(&r.errors.join("; "));
+                        }
+                        state.indexing = if r.cancelled {
+                            Indexing::Incomplete
+                        } else {
+                            Indexing::Settled
+                        };
+                        report = Some(r.clone());
+                    }
+                    Err(e) => {
+                        state.status = format!("Index not updated: {e}");
+                        state.indexing = Indexing::Incomplete;
+                    }
+                }
+            }
+            (Some(_), true) => {}
+        }
+        // Never while the integration's action screen is open: the action
+        // belongs to the result that was selected when it opened.
+        let due = self.finished || self.refreshed.elapsed() >= RESULTS_REFRESH_INTERVAL;
+        if self.stale && due && state.mode != Mode::Action {
+            state.refresh_in_place(store);
+            self.stale = false;
+            self.refreshed = Instant::now();
+        }
+        report
+    }
+}
+
+fn adapters(claude: Option<PathBuf>, codex: Option<PathBuf>) -> Vec<Box<dyn AgentAdapter>> {
+    if claude.is_some() || codex.is_some() {
         vec![
             Box::new(ClaudeAdapter::new(claude)),
             Box::new(CodexAdapter::new(codex)),
@@ -445,113 +560,65 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
             Box::new(ClaudeAdapter::default()),
             Box::new(CodexAdapter::default()),
         ]
-    };
-    let palette = integration.palette();
-    let title = (!integration.host_draws_title()).then(|| integration.title().to_string());
+    }
+}
+
+pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}\n\nOptions: --db PATH --claude-root PATH --codex-root PATH\nExplicit root options disable default history discovery for both agents.\nType a query; arrows/Tab focus results and preview; F2 filters role; Space previews; Enter {}; Esc goes back; Ctrl-C closes.", integration.title(), integration.enter_label().to_lowercase());
+        return Ok(());
+    }
+    let (db, claude, codex) = parse_args(args)?;
     terminal::install_signal_handlers();
     let mut screen = terminal::Screen::enter()?;
-
     let started = Instant::now();
-    let progress: Arc<Mutex<Option<IndexProgress>>> = Arc::new(Mutex::new(None));
-    let done = Arc::new(AtomicBool::new(false));
-    let ticker = {
-        let progress = Arc::clone(&progress);
-        let done = Arc::clone(&done);
-        let mut term = screen.take();
-        thread::spawn(move || {
-            let mut typed = Vec::new();
-            let mut frame = 0usize;
-            while !done.load(Ordering::Acquire) {
-                let snapshot = progress.lock().map(|p| p.clone()).unwrap_or_default();
-                let _ = term.draw(|f| {
-                    ui::draw_progress(
-                        f,
-                        &palette,
-                        title.as_deref(),
-                        frame,
-                        started.elapsed(),
-                        snapshot.as_ref(),
-                    )
-                });
-                frame += 1;
-                if terminal::interrupted() {
-                    terminal::abort(term);
-                }
-                if event::poll(Duration::from_millis(120)).unwrap_or(false) {
-                    if let Ok(Event::Key(k)) = event::read() {
-                        if is_interrupt(&k) {
-                            terminal::abort(term);
-                        }
-                        if k.kind != KeyEventKind::Release {
-                            typed.extend(map_key(k.code));
-                        }
-                    }
-                }
-            }
-            (term, typed)
-        })
-    };
-    let finish = |ticker: thread::JoinHandle<_>| {
-        done.store(true, Ordering::Release);
-        ticker
-            .join()
-            .map_err(|_| io::Error::other("progress display failed"))
-    };
-    let mut store = match SqliteStore::open(db) {
-        Ok(store) => store,
-        Err(e) => {
-            finish(ticker)?;
-            return Err(core_io(e));
-        }
-    };
-    let progress_for_index = Arc::clone(&progress);
-    let report = index_all_with_progress(&mut store, &adapters, |p: IndexProgress| {
-        if let Ok(mut progress) = progress_for_index.lock() {
-            *progress = Some(p);
-        }
-    });
-    let (term, typed) = finish(ticker)?;
-    screen.put_back(term);
-    let report = report.map_err(core_io)?;
     let mut state = BrowserState {
-        status: format!(
-            "{} files · {} chunks · {} failed · {} malformed · {:.1}s",
-            report.files,
-            report.chunks,
-            report.failed_files,
-            report.malformed_records,
-            started.elapsed().as_secs_f32()
-        ),
+        status: "Opening the index…".into(),
+        indexing: Indexing::Running {
+            checked: 0,
+            total: 0,
+        },
         mouse_capture: true,
         ..Default::default()
     };
-    if !report.errors.is_empty() {
-        state.status.push_str(" — ");
-        state.status.push_str(&report.errors.join("; "));
-    }
-    // Replay what was typed while indexing, but never an action key.
-    for key in typed {
-        if matches!(key, Key::Char(_) | Key::Space | Key::Backspace) {
-            let _ = state.handle(key, &store);
-        }
-    }
+    let term = screen.terminal();
+    // Opening can migrate an old schema, which takes a moment once.
+    term.draw(|f| draw(f, &mut state, integration))?;
+    let store = SqliteStore::open(&db).map_err(core_io)?;
+    // The existing index is searchable from here on; the scan only adds to it.
+    let scan = BackgroundIndex::spawn(db, move || adapters(claude, codex))?;
+    let mut follower = ScanFollower::new(started);
     // One read of the session table and one host query; after this, only the
     // worker touches the filesystem, and only for sessions not seen before.
     let sessions = store.sessions().unwrap_or_default();
     state
         .availability
         .set_live(integration.live_sessions(&sessions));
-    let worker =
+    let mut worker =
         availability::Worker::spawn(sessions, agent_history_core::availability::availability);
-    let term = screen.terminal();
     while !state.closed {
+        let report = follower.apply(&scan.snapshot(), &mut state, &store);
+        if report.is_some_and(|r| r.bytes_read > 0) {
+            // The scan may have added sessions, or moved their sources.
+            let sessions = store.sessions().unwrap_or_default();
+            state.availability = Availabilities::default();
+            state
+                .availability
+                .set_live(integration.live_sessions(&sessions));
+            worker = availability::Worker::spawn(
+                sessions,
+                agent_history_core::availability::availability,
+            );
+        }
         worker.drain(&mut state.availability);
         worker.request(state.availability.wanted(&state.results));
         term.draw(|f| draw(f, &mut state, integration))?;
         if terminal::interrupted() {
             break;
         }
-        let wait = if state.availability.pending() {
+        let wait = if matches!(state.indexing, Indexing::Running { .. }) {
+            120
+        } else if state.availability.pending() {
             50
         } else {
             200
@@ -600,6 +667,8 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
             state.sync_preview(&store);
         }
     }
+    // Abandons the file in progress before its commit; everything committed stays.
+    scan.stop();
     Ok(())
 }
 
@@ -797,5 +866,166 @@ mod tests {
         state.mode = Mode::Results;
         assert!(state.handle(Key::Space, &store).is_err());
         assert_eq!(state.mode, Mode::Results);
+    }
+
+    fn claude_line(session: &str, text: &str) -> String {
+        format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"message\":{{\"content\":\"{text}\"}}}}\n"
+        )
+    }
+
+    /// Claude parsing, except that the record containing `gate` waits for the test.
+    struct Gated {
+        root: PathBuf,
+        gate: &'static str,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl AgentAdapter for Gated {
+        fn agent(&self) -> agent_history_core::Agent {
+            agent_history_core::Agent::Claude
+        }
+        fn discover(&self) -> Result<Vec<agent_history_core::SessionFile>> {
+            ClaudeAdapter::with_root(self.root.clone()).discover()
+        }
+        fn parse_record(
+            &self,
+            s: &Session,
+            r: &[u8],
+            src: SourceRef,
+        ) -> Result<agent_history_core::ParsedRecord> {
+            if String::from_utf8_lossy(r).contains(self.gate) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+            }
+            ClaudeAdapter::with_root(self.root.clone()).parse_record(s, r, src)
+        }
+    }
+
+    /// An index holding one `topic` conversation, a second one on disk that
+    /// is not indexed yet, and a scan held just before committing it.
+    struct Scanning {
+        _temp: agent_history_core::test_support::TempDir,
+        store: SqliteStore,
+        scan: BackgroundIndex,
+        release: std::sync::mpsc::Sender<()>,
+    }
+    fn scanning(name: &str) -> Scanning {
+        let temp = agent_history_core::test_support::TempDir::new(name).unwrap();
+        let root = temp.path().to_path_buf();
+        let store = fixture_store(&root, &[claude_line("old", "topic alpha").trim_end()]);
+        fs::write(
+            root.join("history/new.jsonl"),
+            claude_line("new", "topic beta"),
+        )
+        .unwrap();
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let history = root.join("history");
+        let scan = BackgroundIndex::spawn(root.join("private/index.sqlite"), move || {
+            vec![Box::new(Gated {
+                root: history,
+                gate: "beta",
+                entered,
+                release: release_rx,
+            }) as Box<dyn AgentAdapter>]
+        })
+        .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the scan reaches the new conversation");
+        Scanning {
+            _temp: temp,
+            store,
+            scan,
+            release,
+        }
+    }
+    fn finished(scan: &BackgroundIndex) -> ScanSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let snapshot = scan.snapshot();
+            if snapshot.finished() {
+                return snapshot;
+            }
+            assert!(Instant::now() < deadline, "scan did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn typing_searches_the_existing_index_while_the_scan_runs_and_results_follow_its_commit() {
+        let t = scanning("tui-scan");
+        let mut state = BrowserState::default();
+        let mut follower = ScanFollower::new(Instant::now());
+        assert!(follower
+            .apply(&t.scan.snapshot(), &mut state, &t.store)
+            .is_none());
+        assert!(matches!(state.indexing, Indexing::Running { .. }));
+        for c in "topic".chars() {
+            state.handle(Key::Char(c), &t.store).unwrap();
+        }
+        assert_eq!(state.results.len(), 1, "served from the existing index");
+        state.handle(Key::Down, &t.store).unwrap();
+        let selected = state.selected_result().unwrap().source.clone();
+        state.error = Some("resume failed".into());
+
+        t.release.send(()).unwrap();
+        let report = follower
+            .apply(&finished(&t.scan), &mut state, &t.store)
+            .expect("the finish is reported once");
+        assert!(report.bytes_read > 0);
+        assert_eq!(state.indexing, Indexing::Settled);
+        assert!(state.status.contains("0 failed"), "{}", state.status);
+        assert_eq!(state.results.len(), 2, "refreshed without a keystroke");
+        assert_eq!(
+            state.selected_result().unwrap().source,
+            selected,
+            "the reader's selection survives the refresh"
+        );
+        assert_eq!(state.error.as_deref(), Some("resume failed"));
+        assert_eq!(state.mode, Mode::Results);
+        assert!(follower
+            .apply(&t.scan.snapshot(), &mut state, &t.store)
+            .is_none());
+    }
+
+    #[test]
+    fn results_never_change_under_an_open_action_screen() {
+        let t = scanning("tui-action");
+        let mut state = BrowserState {
+            query: "topic".into(),
+            ..Default::default()
+        };
+        state.refresh(&t.store);
+        state.mode = Mode::Action;
+        let mut follower = ScanFollower::new(Instant::now());
+        t.release.send(()).unwrap();
+        follower.apply(&finished(&t.scan), &mut state, &t.store);
+        assert_eq!(state.results.len(), 1, "deferred while the action is open");
+        state.mode = Mode::Results;
+        follower.apply(&t.scan.snapshot(), &mut state, &t.store);
+        assert_eq!(state.results.len(), 2, "applied once it closes");
+    }
+
+    #[test]
+    fn a_scan_that_does_not_finish_marks_the_index_incomplete() {
+        let t = scanning("tui-incomplete");
+        let mut state = BrowserState::default();
+        let mut follower = ScanFollower::new(Instant::now());
+        t.scan.request_stop();
+        t.release.send(()).unwrap();
+        let stopped = t.scan.stop();
+        follower.apply(&stopped, &mut state, &t.store);
+        assert_eq!(state.indexing, Indexing::Incomplete);
+
+        let mut failed = BrowserState::default();
+        let snapshot = ScanSnapshot {
+            outcome: Some(Err("storage error: disk full".into())),
+            ..Default::default()
+        };
+        ScanFollower::new(Instant::now()).apply(&snapshot, &mut failed, &t.store);
+        assert_eq!(failed.indexing, Indexing::Incomplete);
+        assert!(failed.status.contains("disk full"), "{}", failed.status);
     }
 }
