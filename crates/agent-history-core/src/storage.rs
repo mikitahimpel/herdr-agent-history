@@ -394,8 +394,12 @@ impl SqliteStore {
     /// ties between sessions to the session order of the ordinary search.
     ///
     /// The first query reads only chunk IDs and scores, so snippets are made
-    /// for the chosen rows alone. `bm25` cannot be used inside a window
-    /// function, hence the materialized step.
+    /// for the chosen rows alone. Each session's best row is picked here
+    /// rather than in SQL: `bm25` is unavailable inside window functions and
+    /// aggregate subqueries. `CROSS JOIN` keeps the full-text scan outermost:
+    /// left to itself, the planner may start from the prioritized sessions and
+    /// run a full-text lookup per chunk, which measured up to a hundred times
+    /// slower on a real index.
     fn best_prioritized(
         &self,
         expression: &str,
@@ -403,34 +407,64 @@ impl SqliteStore {
         kind: Option<crate::EventKind>,
         priorities: &Priorities,
     ) -> Result<Vec<SearchResult>> {
-        let limit = limit.min(MAX_LIMIT);
         let sessions: Vec<_> = priorities.ordered().into_iter().take(MAX_LIMIT).collect();
         let values = vec!["(?,?,?)"; sessions.len()].join(",");
         let sql = format!(
-            "WITH p(agent,native_id,grp) AS (VALUES {values}), \
-             m AS MATERIALIZED (SELECT c.rowid AS id, p.grp AS grp, bm25(chunks_fts) AS score, c.agent AS agent, c.native_id AS native_id, c.ordinal AS ordinal \
-               FROM chunks_fts JOIN search_chunks c ON c.rowid=chunks_fts.rowid JOIN p ON p.agent=c.agent AND p.native_id=c.native_id \
-               WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?)) \
-             SELECT id FROM (SELECT id, grp, score, agent, native_id, row_number() OVER (PARTITION BY agent,native_id ORDER BY score,ordinal) AS n FROM m) \
-             WHERE n=1 ORDER BY grp,score,agent,native_id LIMIT ?"
+            "WITH p(agent,native_id,grp) AS (VALUES {values}) \
+             SELECT c.rowid, p.grp, bm25(chunks_fts), c.agent, c.native_id, c.ordinal \
+             FROM chunks_fts CROSS JOIN search_chunks c ON c.rowid=chunks_fts.rowid CROSS JOIN p ON p.agent=c.agent AND p.native_id=c.native_id \
+             WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?)"
         );
-        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(sessions.len() * 3 + 4);
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(sessions.len() * 3 + 3);
         for (id, group) in &sessions {
             params.push(agent_i(id.agent).into());
             params.push(id.native_id.clone().into());
             params.push(i64::from(*group).into());
         }
         let role = role_param(kind);
-        params.extend([
-            expression.to_string().into(),
-            role.clone(),
-            role,
-            (limit as i64).into(),
-        ]);
+        params.extend([expression.to_string().into(), role.clone(), role]);
+        struct Candidate {
+            id: i64,
+            group: i64,
+            score: f64,
+            agent: i64,
+            native_id: String,
+            ordinal: i64,
+        }
+        let key = |c: &Candidate| (c.score, c.ordinal);
+        let mut best: HashMap<(i64, String), Candidate> = HashMap::new();
         let mut st = self.conn.prepare_cached(&sql)?;
-        let ids = st
-            .query_map(rusqlite::params_from_iter(params), |r| r.get::<_, i64>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rows = st.query(rusqlite::params_from_iter(params))?;
+        while let Some(r) = rows.next()? {
+            let c = Candidate {
+                id: r.get(0)?,
+                group: r.get(1)?,
+                score: r.get(2)?,
+                agent: r.get(3)?,
+                native_id: r.get(4)?,
+                ordinal: r.get(5)?,
+            };
+            match best.entry((c.agent, c.native_id.clone())) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if key(&c) < key(e.get()) {
+                        e.insert(c);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(c);
+                }
+            }
+        }
+        let mut chosen: Vec<Candidate> = best.into_values().collect();
+        chosen.sort_by(|a, b| {
+            a.group
+                .cmp(&b.group)
+                .then(a.score.total_cmp(&b.score))
+                .then(a.agent.cmp(&b.agent))
+                .then_with(|| a.native_id.cmp(&b.native_id))
+        });
+        chosen.truncate(limit.min(MAX_LIMIT));
+        let ids: Vec<i64> = chosen.iter().map(|c| c.id).collect();
         if ids.is_empty() {
             return Ok(Vec::new());
         }
