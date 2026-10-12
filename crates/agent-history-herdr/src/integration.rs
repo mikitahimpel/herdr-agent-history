@@ -1,8 +1,8 @@
 //! Herdr-specific actions for the shared Agent History browser.
 use crate::{restore, resume_in_host, HostRuntime};
 use agent_history_core::{
-    availability::Availability, preview::preview_source, CoreError, Result, Session, SessionId,
-    SqliteStore,
+    availability::Availability, preview::preview_source, CoreError, Priorities, Result,
+    ResultPrioritizer, Session, SqliteStore,
 };
 use agent_history_tui::{BrowserState, Integration, Key, Mode, Palette, SessionState};
 
@@ -103,6 +103,25 @@ fn resumed_notice(session: &agent_history_core::Session) -> String {
     }
 }
 
+/// The one priority group: sessions whose agent is running in Herdr now.
+pub const RUNNING: u32 = 0;
+
+/// Surfaces sessions whose agent Herdr is running, ahead of relevance order.
+impl<H: HostRuntime> ResultPrioritizer for HerdrIntegration<H> {
+    /// Asks Herdr once for its workspaces and agents. A failed query only
+    /// means nothing is prioritized. The answer can be stale by the time Enter
+    /// is pressed, and Enter does not rely on it: resuming asks Herdr again.
+    fn prioritize(&mut self, sessions: &[Session]) -> Priorities {
+        match (self.host.workspaces(), self.host.agents()) {
+            (Ok(workspaces), Ok(agents)) => crate::live_sessions(sessions, &workspaces, &agents)
+                .into_iter()
+                .map(|id| (id, RUNNING))
+                .collect(),
+            _ => Priorities::default(),
+        }
+    }
+}
+
 impl<H: HostRuntime> Integration for HerdrIntegration<H> {
     fn title(&self) -> &str {
         "Agent History — Herdr"
@@ -124,18 +143,13 @@ impl<H: HostRuntime> Integration for HerdrIntegration<H> {
         self.palette
     }
 
-    /// Asks Herdr once for its workspaces and agents. A failed query only
-    /// means no session is marked live; Enter still checks again.
-    fn live_sessions(&mut self, sessions: &[Session]) -> Vec<SessionId> {
-        match (self.host.workspaces(), self.host.agents()) {
-            (Ok(workspaces), Ok(agents)) => crate::live_sessions(sessions, &workspaces, &agents),
-            _ => Vec::new(),
-        }
+    fn prioritizer(&mut self) -> Option<&mut dyn ResultPrioritizer> {
+        Some(self)
     }
 
     fn availability_label(&self, state: SessionState) -> &str {
         match state {
-            SessionState::Live => "running",
+            SessionState::Prioritized(_) => "running",
             SessionState::Stored(Availability::OnDisk) => "resumable",
             SessionState::Stored(Availability::Recoverable) => "recoverable",
             SessionState::Stored(Availability::RepositoryKnown) => "repo gone",
@@ -269,14 +283,20 @@ mod tests {
     struct Host {
         effects: Vec<String>,
         session: Option<Session>,
+        workspaces: Vec<crate::resume::WorkspaceRecord>,
+        agents: Vec<crate::resume::LiveAgent>,
+        unreachable: bool,
     }
     impl HostRuntime for Host {
         fn workspaces(&mut self) -> Result<Vec<crate::resume::WorkspaceRecord>> {
             self.effects.push("list".into());
-            Ok(vec![])
+            Ok(self.workspaces.clone())
         }
         fn agents(&mut self) -> Result<Vec<crate::resume::LiveAgent>> {
-            Ok(vec![])
+            if self.unreachable {
+                return Err(CoreError::Unsupported("herdr is not running".into()));
+            }
+            Ok(self.agents.clone())
         }
         fn focus_workspace(&mut self, _: &str) -> Result<()> {
             self.effects.push("focus".into());
@@ -327,6 +347,82 @@ mod tests {
     }
     fn enter(state: &mut BrowserState, db: &SqliteStore, integration: &mut HerdrIntegration<Host>) {
         integration.handle(Key::Enter, state, db).unwrap();
+    }
+
+    /// A host whose workspace at `cwd` runs the fixture's session.
+    fn running(db: &SqliteStore, cwd: &Path) -> Host {
+        let session = db.sessions().unwrap().remove(0);
+        Host {
+            workspaces: vec![crate::resume::WorkspaceRecord {
+                id: "w".into(),
+                cwd: cwd.into(),
+                root_pane_id: None,
+                root_pane_occupied: false,
+                created: false,
+            }],
+            agents: vec![crate::resume::LiveAgent {
+                id: "a".into(),
+                workspace_id: "w".into(),
+                agent: session.id.agent,
+                session_id: Some(session.id),
+                name: None,
+            }],
+            ..Host::default()
+        }
+    }
+
+    #[test]
+    fn running_sessions_are_prioritized_and_marked_running() {
+        let t = Temp::new();
+        let (db, _) = fixture(&t, &t.0);
+        let sessions = db.sessions().unwrap();
+        let mut i = HerdrIntegration::new(running(&db, &t.0));
+        let priorities = i.prioritize(&sessions);
+        assert_eq!(priorities.len(), 1);
+        assert_eq!(priorities.group(&sessions[0].id), Some(RUNNING));
+        let mut s = BrowserState::default();
+        s.set_priorities(priorities, &db);
+        search(&mut s, &db);
+        assert_eq!(s.prioritized, 1);
+        assert_eq!(s.results[0].session_id, sessions[0].id);
+        let state = s.availability.state(&sessions[0].id).unwrap();
+        assert_eq!(i.availability_label(state), "running");
+        // Nothing running, or Herdr unreachable: nothing is prioritized.
+        i.host_mut().agents.clear();
+        assert!(i.prioritize(&sessions).is_empty());
+        let mut unreachable = HerdrIntegration::new(Host {
+            unreachable: true,
+            ..running(&db, &t.0)
+        });
+        assert!(unreachable.prioritize(&sessions).is_empty());
+    }
+
+    #[test]
+    fn a_session_that_stopped_running_since_it_was_marked_still_resumes() {
+        let t = Temp::new();
+        let (db, _) = fixture(&t, &t.0);
+        let sessions = db.sessions().unwrap();
+        let mut i = HerdrIntegration::new(running(&db, &t.0));
+        let mut s = BrowserState::default();
+        s.set_priorities(i.prioritize(&sessions), &db);
+        search(&mut s, &db);
+        assert_eq!(s.prioritized, 1);
+        enter(&mut s, &db, &mut i);
+        assert!(i.host().effects.contains(&"agent focus".to_string()));
+        assert!(i.host().session.is_none(), "a running agent is focused");
+        // The agent exits after the marking: still shown as running, but Enter
+        // asks Herdr again and resumes instead of focusing a pane that is gone.
+        i.host_mut().agents.clear();
+        i.host_mut().effects.clear();
+        assert_eq!(s.prioritized, 1);
+        enter(&mut s, &db, &mut i);
+        assert_eq!(i.host().effects, ["list", "focus", "resume"]);
+        assert_eq!(
+            i.host().session.as_ref().map(|s| &s.id),
+            Some(&sessions[0].id)
+        );
+        assert!(s.error.is_none());
+        assert!(s.notice.as_deref().is_some_and(|n| n.contains("Resumed")));
     }
 
     #[test]

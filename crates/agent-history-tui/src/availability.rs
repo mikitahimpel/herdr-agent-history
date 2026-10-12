@@ -1,7 +1,9 @@
 //! Per-session availability markers. Checking the filesystem can be slow
 //! (a recorded path may sit on an unmounted network volume), so it runs on a
 //! worker thread, once per session, and the UI only reads the cache.
-use agent_history_core::{availability::Availability, SearchResult, Session, SessionId};
+use agent_history_core::{
+    availability::Availability, Priorities, SearchResult, Session, SessionId,
+};
 use std::{
     collections::{HashMap, HashSet},
     sync::mpsc::{channel, Receiver, Sender},
@@ -11,8 +13,10 @@ use std::{
 /// What a result row shows about its session.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SessionState {
-    /// The host already runs this session; opening it focuses that agent.
-    Live,
+    /// The integration placed this session in priority group `n` (see
+    /// [`agent_history_core::Priorities`]); what the group means, and how the
+    /// marker is worded, is the integration's to say.
+    Prioritized(u32),
     Stored(Availability),
 }
 
@@ -21,12 +25,12 @@ pub enum SessionState {
 pub struct Availabilities {
     known: HashMap<SessionId, Availability>,
     requested: HashSet<SessionId>,
-    live: HashSet<SessionId>,
+    priorities: Priorities,
 }
 
 impl Availabilities {
-    pub fn set_live(&mut self, ids: impl IntoIterator<Item = SessionId>) {
-        self.live = ids.into_iter().collect();
+    pub fn set_priorities(&mut self, priorities: Priorities) {
+        self.priorities = priorities;
     }
 
     /// Sessions in `results` not yet asked for; they are marked as asked.
@@ -47,8 +51,8 @@ impl Availabilities {
 
     /// `None` while the check is still pending.
     pub fn state(&self, id: &SessionId) -> Option<SessionState> {
-        if self.live.contains(id) {
-            return Some(SessionState::Live);
+        if let Some(group) = self.priorities.group(id) {
+            return Some(SessionState::Prioritized(group));
         }
         self.known.get(id).copied().map(SessionState::Stored)
     }
@@ -130,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn live_overrides_stored_and_unknown_is_pending() {
+    fn priority_overrides_stored_and_unknown_is_pending() {
         let mut a = Availabilities::default();
         assert_eq!(a.state(&id(1)), None);
         a.record(id(1), Availability::OnDisk);
@@ -138,8 +142,8 @@ mod tests {
             a.state(&id(1)),
             Some(SessionState::Stored(Availability::OnDisk))
         );
-        a.set_live([id(1)]);
-        assert_eq!(a.state(&id(1)), Some(SessionState::Live));
+        a.set_priorities(Priorities::from_iter([(id(1), 2)]));
+        assert_eq!(a.state(&id(1)), Some(SessionState::Prioritized(2)));
     }
 
     #[test]

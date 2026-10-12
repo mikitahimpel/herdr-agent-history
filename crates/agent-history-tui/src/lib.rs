@@ -5,8 +5,8 @@ use agent_history_core::{
     availability::Availability,
     background::{BackgroundIndex, ScanSnapshot},
     preview::preview_source,
-    AgentAdapter, CoreError, EventKind, Result, SearchResult, Session, SessionId, SourceRef,
-    SqliteStore, Widening,
+    AgentAdapter, CoreError, EventKind, Priorities, Result, ResultPrioritizer, SearchResult,
+    Session, SourceRef, SqliteStore, Widening,
 };
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -137,6 +137,11 @@ pub struct BrowserState {
     /// Non-empty when nothing matched the query exactly and `results` are
     /// near matches found by widening these words.
     pub widened: Vec<Widening>,
+    /// The integration's priorities, fixed between refreshes of its view of
+    /// the sessions so that typing never waits on it.
+    pub priorities: Priorities,
+    /// How many leading `results` are prioritized sessions' best matches.
+    pub prioritized: usize,
     pub selected: usize,
     pub mode: Mode,
     /// Original conversation around the selected result.
@@ -172,6 +177,16 @@ pub struct BrowserState {
     pub(crate) hits: ui::Hits,
 }
 impl BrowserState {
+    /// Replaces the priorities, re-running the query when they changed.
+    pub fn set_priorities(&mut self, priorities: Priorities, store: &SqliteStore) {
+        if priorities == self.priorities {
+            return;
+        }
+        self.availability.set_priorities(priorities.clone());
+        self.priorities = priorities;
+        self.refresh_in_place(store);
+    }
+
     pub fn refresh(&mut self, store: &SqliteStore) {
         self.search(store);
         self.sync_preview(store);
@@ -194,16 +209,23 @@ impl BrowserState {
     }
 
     fn search(&mut self, store: &SqliteStore) {
-        match store.search_with_fallback(&self.query, RESULT_LIMIT, self.role_filter.kind()) {
+        match store.search_prioritized(
+            &self.query,
+            RESULT_LIMIT,
+            self.role_filter.kind(),
+            &self.priorities,
+        ) {
             Ok(outcome) => {
                 self.results = outcome.results;
                 self.widened = outcome.widened;
+                self.prioritized = outcome.prioritized;
                 self.selected = self.selected.min(self.results.len().saturating_sub(1));
                 self.error = None;
             }
             Err(e) => {
                 self.results.clear();
                 self.widened.clear();
+                self.prioritized = 0;
                 self.selected = 0;
                 self.error = Some(e.to_string());
             }
@@ -429,15 +451,18 @@ pub trait Integration {
     }
     fn handle(&mut self, key: Key, state: &mut BrowserState, store: &SqliteStore) -> Result<bool>;
     fn action_lines(&self) -> Vec<String>;
-    /// Sessions the host already runs, asked once when the browser opens.
-    fn live_sessions(&mut self, _sessions: &[Session]) -> Vec<SessionId> {
-        Vec::new()
+    /// The extension that lifts sessions above relevance order, if any. It
+    /// is asked when the browser opens and when a scan changes the sessions,
+    /// never per keystroke; its groups are marked with
+    /// [`SessionState::Prioritized`] and drawn apart from the other results.
+    fn prioritizer(&mut self) -> Option<&mut dyn ResultPrioritizer> {
+        None
     }
     /// Short wording for a result's availability marker. The default only
     /// describes what exists on disk; it never promises that Enter resumes.
     fn availability_label(&self, state: SessionState) -> &str {
         match state {
-            SessionState::Live => "running",
+            SessionState::Prioritized(_) => "priority",
             SessionState::Stored(Availability::OnDisk) => "on disk",
             SessionState::Stored(Availability::Recoverable) => "repo only",
             SessionState::Stored(Availability::RepositoryKnown) => "repo gone",
@@ -598,9 +623,7 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
     // One read of the session table and one host query; after this, only the
     // worker touches the filesystem, and only for sessions not seen before.
     let sessions = store.sessions().unwrap_or_default();
-    state
-        .availability
-        .set_live(integration.live_sessions(&sessions));
+    state.set_priorities(priorities(integration, &sessions), &store);
     let mut worker =
         availability::Worker::spawn(sessions, agent_history_core::availability::availability);
     while !state.closed {
@@ -609,9 +632,8 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
             // The scan may have added sessions, or moved their sources.
             let sessions = store.sessions().unwrap_or_default();
             state.availability = Availabilities::default();
-            state
-                .availability
-                .set_live(integration.live_sessions(&sessions));
+            state.availability.set_priorities(state.priorities.clone());
+            state.set_priorities(priorities(integration, &sessions), &store);
             worker = availability::Worker::spawn(
                 sessions,
                 agent_history_core::availability::availability,
@@ -677,6 +699,13 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
     // Abandons the file in progress before its commit; everything committed stays.
     scan.stop();
     Ok(())
+}
+
+fn priorities(integration: &mut impl Integration, sessions: &[Session]) -> Priorities {
+    integration
+        .prioritizer()
+        .map(|p| p.prioritize(sessions))
+        .unwrap_or_default()
 }
 
 fn map_mouse(m: MouseEvent) -> Option<Mouse> {
@@ -792,6 +821,32 @@ mod tests {
                 r#"{"type":"assistant","message":{"content":"rememberable answer"}}"#,
             ],
         )
+    }
+
+    #[test]
+    fn new_priorities_reorder_the_open_results_and_keep_the_selection() {
+        let temp = agent_history_core::test_support::TempDir::new("tui-priorities").unwrap();
+        let store = rememberable(temp.path());
+        let mut state = BrowserState {
+            query: "rememberable".into(),
+            ..Default::default()
+        };
+        state.refresh(&store);
+        assert_eq!((state.results.len(), state.prioritized), (2, 0));
+        state.selected = 1;
+        let selected = state.results[1].source.clone();
+        let id = state.results[0].session_id.clone();
+        state.set_priorities(Priorities::from_iter([(id.clone(), 0)]), &store);
+        assert_eq!(state.prioritized, 1);
+        assert_eq!(state.results[state.selected].source, selected);
+        assert_eq!(
+            state.availability.state(&id),
+            Some(SessionState::Prioritized(0))
+        );
+        // The standalone browser registers no extension.
+        assert!(Standalone.prioritizer().is_none());
+        state.set_priorities(Priorities::default(), &store);
+        assert_eq!(state.prioritized, 0);
     }
 
     #[test]
