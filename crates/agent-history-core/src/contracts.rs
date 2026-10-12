@@ -15,6 +15,10 @@ pub enum CoreError {
     /// was committed, and the next scan reads the file again from its last
     /// committed offset.
     SourceChanged,
+    /// The source no longer matches what the index recorded for it, usually
+    /// because it grew after the last scan. Indexing it again resolves this;
+    /// nothing is wrong with the source.
+    StaleSource,
 }
 impl fmt::Display for CoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -24,6 +28,7 @@ impl fmt::Display for CoreError {
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
             Self::Storage(s) => write!(f, "storage error: {s}"),
             Self::SourceChanged => write!(f, "source changed during indexing; retry"),
+            Self::StaleSource => write!(f, "source generation is stale; index again"),
         }
     }
 }

@@ -839,6 +839,27 @@ fn draw_preview(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Pal
         .into_iter()
         .map(|l| (l, false))
         .collect()
+    } else if state.preview_stale {
+        // Normal for a conversation still being written: it grew after the
+        // last scan, and the next one reads it again.
+        vec![
+            Line::raw(""),
+            Line::styled("Loading conversation…", Style::new().fg(p.text)),
+            Line::styled(
+                "It changed since it was indexed and is being read again.",
+                p.muted(),
+            ),
+        ]
+        .into_iter()
+        .flat_map(|l| {
+            let style = l.style;
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            let wrapped = text::wrap(&text, w);
+            wrapped
+                .into_iter()
+                .map(move |t| (Line::styled(t, style), false))
+        })
+        .collect()
     } else if let Some(error) = &state.preview_error {
         let mut lines = vec![
             Line::raw(""),
@@ -1657,6 +1678,22 @@ mod tests {
         let inner = results_inner(&buf);
         assert_eq!(buf[(inner.x, inner.y)].symbol(), " ");
         assert!(!row(&buf, inner.bottom()).contains('◉'));
+    }
+
+    #[test]
+    fn a_changed_conversation_previews_as_loading_not_as_an_error() {
+        let temp = TempDir::new("ui-preview-loading").unwrap();
+        let (_store, mut state) = searched(&temp);
+        state.preview_stale = true;
+        for width in [120, 40] {
+            let buf = render(&mut state, &Standalone, width, 40);
+            let text: String = (0..40).map(|y| row(&buf, y)).collect::<Vec<_>>().join("\n");
+            assert!(text.contains("Loading conversation…"), "{text}");
+            assert!(!text.contains("unavailable"), "{text}");
+            assert!(!text.contains("stale"), "{text}");
+            let (x, y) = find(&buf, "Loading").unwrap();
+            assert_ne!(buf[(x, y)].fg, Palette::terminal().error().fg.unwrap());
+        }
     }
 
     #[test]

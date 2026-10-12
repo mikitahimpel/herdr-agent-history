@@ -38,6 +38,10 @@ const PREVIEW_BYTES: u64 = 64 * 1024;
 /// While indexing runs, results are re-queried at most this often, so that a
 /// stream of commits does not reshuffle the list under the reader.
 const RESULTS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// A conversation that is still being written can be changed again by the
+/// time a scan has read it, so scans asked for by a changed conversation are
+/// at least this far apart.
+const RESCAN_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Key {
@@ -150,6 +154,12 @@ pub struct BrowserState {
     pub preview_for: Option<SourceRef>,
     /// Why the selected result's conversation could not be read.
     pub preview_error: Option<String>,
+    /// The selected conversation changed since it was indexed, so it is shown
+    /// as loading until a scan has read it again.
+    pub preview_stale: bool,
+    /// An integration found a changed conversation, as the preview does with
+    /// `preview_stale`; the run loop then starts a scan when none is running.
+    pub reindex_wanted: bool,
     pub preview_scroll: usize,
     /// Scroll the preview to the first matched term on the next render.
     pub preview_anchor: bool,
@@ -205,6 +215,10 @@ impl BrowserState {
         if let Some(i) = selected.and_then(|s| self.results.iter().position(|r| r.source == s)) {
             self.selected = i;
         }
+        if self.preview_stale {
+            // The source may keep its identity after a scan reads it again.
+            self.preview_for = None;
+        }
         self.sync_preview(store);
     }
 
@@ -248,14 +262,18 @@ impl BrowserState {
                 self.preview.clear();
                 self.preview_for = None;
                 self.preview_error = None;
+                self.preview_stale = false;
                 self.preview_scroll = 0;
             }
         }
     }
 
+    /// A conversation that changed since it was indexed is not a failure:
+    /// it is marked as loading and a scan is asked for.
     fn load_preview(&mut self, store: &SqliteStore, source: SourceRef) -> Result<()> {
         self.preview.clear();
         self.preview_error = None;
+        self.preview_stale = false;
         self.preview_scroll = 0;
         self.preview_anchor = true;
         self.preview_for = Some(source.clone());
@@ -266,6 +284,10 @@ impl BrowserState {
                     self.preview
                         .push_str("\n\n[Surrounding context is limited]");
                 }
+                Ok(())
+            }
+            Err(CoreError::StaleSource) => {
+                self.preview_stale = true;
                 Ok(())
             }
             Err(e) => {
@@ -283,7 +305,10 @@ impl BrowserState {
             .ok_or_else(|| CoreError::Unsupported("no session selected".into()))?
             .source
             .clone();
-        if self.preview_for.as_ref() != Some(&source) || self.preview_error.is_some() {
+        if self.preview_for.as_ref() != Some(&source)
+            || self.preview_error.is_some()
+            || self.preview_stale
+        {
             self.load_preview(store, source)?;
         }
         self.mode = Mode::Preview;
@@ -618,8 +643,13 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
     term.draw(|f| draw(f, &mut state, integration))?;
     let store = SqliteStore::open(&db).map_err(core_io)?;
     // The existing index is searchable from here on; the scan only adds to it.
-    let scan = BackgroundIndex::spawn(db, move || adapters(claude, codex))?;
+    let scan_adapters = || {
+        let (claude, codex) = (claude.clone(), codex.clone());
+        move || adapters(claude, codex)
+    };
+    let mut scan = BackgroundIndex::spawn(db.clone(), scan_adapters())?;
     let mut follower = ScanFollower::new(started);
+    let mut scan_ended: Option<Instant> = None;
     // One read of the session table and one host query; after this, only the
     // worker touches the filesystem, and only for sessions not seen before.
     let sessions = store.sessions().unwrap_or_default();
@@ -628,6 +658,22 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
         availability::Worker::spawn(sessions, agent_history_core::availability::availability);
     while !state.closed {
         let report = follower.apply(&scan.snapshot(), &mut state, &store);
+        if follower.finished && scan_ended.is_none() {
+            scan_ended = Some(Instant::now());
+        }
+        let changed = state.preview_stale || state.reindex_wanted;
+        if changed && scan_ended.is_some_and(|t| t.elapsed() >= RESCAN_INTERVAL) {
+            // Only appended or replaced files are read again, so this costs
+            // about one discovery pass.
+            state.reindex_wanted = false;
+            let finished = std::mem::replace(
+                &mut scan,
+                BackgroundIndex::spawn(db.clone(), scan_adapters())?,
+            );
+            finished.stop();
+            follower = ScanFollower::new(Instant::now());
+            scan_ended = None;
+        }
         if report.is_some_and(|r| r.bytes_read > 0) {
             // The scan may have added sessions, or moved their sources.
             let sessions = store.sessions().unwrap_or_default();
@@ -912,15 +958,16 @@ mod tests {
 
     #[test]
     fn unreadable_source_is_reported_in_the_preview_not_as_a_crash() {
-        let temp = agent_history_core::test_support::TempDir::new("tui-stale").unwrap();
+        let temp = agent_history_core::test_support::TempDir::new("tui-unreadable").unwrap();
         let store = rememberable(temp.path());
-        fs::write(temp.path().join("history/session.jsonl"), "replaced\n").unwrap();
+        fs::remove_file(temp.path().join("history/session.jsonl")).unwrap();
         let mut state = BrowserState {
             query: "rememberable".into(),
             ..Default::default()
         };
         state.refresh(&store);
         assert!(state.preview_error.is_some());
+        assert!(!state.preview_stale);
         assert!(
             state.handle(Key::Space, &store).is_ok(),
             "space types in the query"
@@ -928,6 +975,37 @@ mod tests {
         state.mode = Mode::Results;
         assert!(state.handle(Key::Space, &store).is_err());
         assert_eq!(state.mode, Mode::Results);
+    }
+
+    #[test]
+    fn a_conversation_changed_since_indexing_is_loading_not_an_error() {
+        let temp = agent_history_core::test_support::TempDir::new("tui-stale").unwrap();
+        let store = rememberable(temp.path());
+        let source = temp.path().join("history/session.jsonl");
+        let mut appended = fs::read_to_string(&source).unwrap();
+        appended.push_str(r#"{"type":"assistant","message":{"content":"written after the scan"}}"#);
+        appended.push('\n');
+        fs::write(&source, appended).unwrap();
+        let mut state = BrowserState {
+            query: "rememberable".into(),
+            ..Default::default()
+        };
+        state.refresh(&store);
+        assert!(state.preview_stale);
+        assert!(state.preview_error.is_none());
+        state.mode = Mode::Results;
+        state.handle(Key::Space, &store).unwrap();
+        assert_eq!(state.mode, Mode::Preview);
+        assert!(state.preview_stale);
+        // Once a scan has read the file again, the next refresh loads it.
+        let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(ClaudeAdapter::with_root(
+            temp.path().join("history"),
+        ))];
+        let mut writer = SqliteStore::open(temp.path().join("private/index.sqlite")).unwrap();
+        agent_history_core::index::index_all(&mut writer, &adapters).unwrap();
+        state.refresh_in_place(&store);
+        assert!(!state.preview_stale);
+        assert!(state.preview.contains("rememberable"), "{}", state.preview);
     }
 
     fn claude_line(session: &str, text: &str) -> String {

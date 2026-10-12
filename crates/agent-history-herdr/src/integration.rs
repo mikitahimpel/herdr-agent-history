@@ -71,7 +71,17 @@ impl<H> HerdrIntegration<H> {
     where
         H: HostRuntime,
     {
-        let session = self.session(state, store)?;
+        let session = match self.session(state, store) {
+            Err(CoreError::StaleSource) => {
+                // Usually a running agent that has written since the last scan.
+                // Nothing is done to the host until the index has caught up.
+                state.reindex_wanted = true;
+                state.notice =
+                    Some("Reading this conversation again; press Enter in a moment".into());
+                return Ok(());
+            }
+            session => session?,
+        };
         if !session.cwd.as_ref().is_some_and(|p| p.is_dir()) {
             self.recovery = restore::recovery_options(
                 &session,
@@ -426,6 +436,39 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_a_conversation_written_since_the_scan_asks_for_one_first() {
+        let t = Temp::new();
+        let (db, source) = fixture(&t, &t.0);
+        let mut s = BrowserState::default();
+        let mut i = HerdrIntegration::new(running(&db, &t.0));
+        search(&mut s, &db);
+        // A running agent appends to its transcript after the index read it.
+        let mut grown = fs::read_to_string(&source).unwrap();
+        grown.push_str("{\"type\":\"user\",\"message\":{\"content\":\"one more turn\"}}\n");
+        fs::write(&source, grown).unwrap();
+        enter(&mut s, &db, &mut i);
+        assert!(s.reindex_wanted);
+        assert!(s.error.is_none());
+        assert!(s
+            .notice
+            .as_deref()
+            .is_some_and(|n| n.contains("press Enter")));
+        assert!(
+            i.host().effects.is_empty(),
+            "no host effect before the scan"
+        );
+        // After the scan, Enter acts.
+        let adapters: Vec<Box<dyn AgentAdapter>> =
+            vec![Box::new(ClaudeAdapter::with_root(t.0.join("histories")))];
+        let mut writer = SqliteStore::open(t.0.join("private/index.sqlite")).unwrap();
+        index_all(&mut writer, &adapters).unwrap();
+        s.refresh_in_place(&db);
+        enter(&mut s, &db, &mut i);
+        assert!(s.error.is_none());
+        assert!(i.host().effects.contains(&"agent focus".to_string()));
+    }
+
+    #[test]
     fn only_a_plugin_pane_leaves_the_title_to_herdr() {
         let manual = HerdrIntegration::new(Host::default());
         assert!(
@@ -467,9 +510,13 @@ mod tests {
         let mut i = HerdrIntegration::new(Host::default());
         search(&mut s, &db);
         fs::write(source, "replacement\n").unwrap();
-        assert!(i.handle(Key::Enter, &mut s, &db).is_err());
+        // Not an error: the index is behind the file, so a scan is asked for
+        // and nothing reaches the host until it has caught up.
+        assert!(i.handle(Key::Enter, &mut s, &db).unwrap());
+        assert!(s.reindex_wanted);
         assert!(!s.closed);
         assert!(i.host().effects.is_empty());
+        assert_ne!(s.mode, Mode::Action);
     }
     #[test]
     fn missing_workspace_view_and_cancel_have_no_host_effects() {
