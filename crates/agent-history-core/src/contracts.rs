@@ -2,7 +2,7 @@ use crate::domain::*;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 pub type Result<T> = std::result::Result<T, CoreError>;
 #[derive(Debug)]
@@ -134,6 +134,10 @@ impl FromIterator<(SessionId, u32)> for Priorities {
 #[derive(Clone, Debug, Default)]
 pub struct IndexBatch {
     pub file: Option<IndexedFile>,
+    /// The `stat` of `file` when its committed bytes were read, so that a later scan
+    /// can recognise an untouched file without opening it. Absent means a later scan
+    /// must compare the file the long way.
+    pub fingerprint: Option<FileFingerprint>,
     /// Compare-and-swap file progress; Some(None) requires a new path.
     pub expected_file: Option<Option<IndexedFile>>,
     /// Sessions with the provenance of their Git fields; `Session` converts with `into()`.
@@ -181,6 +185,31 @@ impl<T: Store + ?Sized> Store for &mut T {
 pub trait IndexStore: Store {
     fn next_file_id(&self) -> Result<u64>;
     fn indexed_file_state(&self, path: &Path) -> Result<Option<(IndexedFile, Option<Vec<u8>>)>>;
+    /// Every committed file that carries a fingerprint, by path, in one query.
+    ///
+    /// This exists so that a scan can decide what to skip from `stat` alone, without a
+    /// query, a checkpoint blob, or an open file per candidate. Omitting a path is
+    /// always safe: it only costs that file the full comparison it would have had
+    /// anyway, which is why the default implementation returns nothing.
+    fn committed_files(&self) -> Result<HashMap<PathBuf, CommittedFile>> {
+        Ok(HashMap::new())
+    }
+    /// Records `fingerprint` for a file whose bytes are already committed, without
+    /// touching anything derived from them.
+    ///
+    /// This is how an index written before fingerprints existed earns one: the first
+    /// scan after the upgrade still compares such a file the long way, finds it
+    /// unchanged, and leaves this behind so no later scan has to. Implementations must
+    /// apply it only while `file` is still exactly the committed row, so that a scan
+    /// racing a writer cannot certify bytes that have since moved.
+    fn record_fingerprint(
+        &mut self,
+        file: &IndexedFile,
+        fingerprint: FileFingerprint,
+    ) -> Result<()> {
+        let _ = (file, fingerprint);
+        Ok(())
+    }
     fn sessions(&self) -> Result<Vec<Session>>;
     fn session(&self, id: &SessionId) -> Result<Option<Session>>;
     /// The session with the origin of its Git fields. Stores that cannot distinguish
@@ -199,6 +228,12 @@ impl<T: IndexStore + ?Sized> IndexStore for &mut T {
     }
     fn indexed_file_state(&self, p: &Path) -> Result<Option<(IndexedFile, Option<Vec<u8>>)>> {
         (**self).indexed_file_state(p)
+    }
+    fn committed_files(&self) -> Result<HashMap<PathBuf, CommittedFile>> {
+        (**self).committed_files()
+    }
+    fn record_fingerprint(&mut self, f: &IndexedFile, p: FileFingerprint) -> Result<()> {
+        (**self).record_fingerprint(f, p)
     }
     fn sessions(&self) -> Result<Vec<Session>> {
         (**self).sessions()

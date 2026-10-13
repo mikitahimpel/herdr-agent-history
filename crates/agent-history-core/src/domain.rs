@@ -181,6 +181,40 @@ pub struct IndexedFile {
     pub size: u64,
     pub modified: Option<SystemTime>,
 }
+/// The filesystem identity of a source file as it stood when its last committed byte
+/// was read, held beside the byte offsets so that one `stat` can rule the file out.
+///
+/// `ctime` is what makes this trustworthy. The kernel sets it on every change to the
+/// inode, including a `utimes` call that puts `mtime` back, and no userspace interface
+/// can set it directly. A file that was rewritten, restored from a backup with its
+/// `mtime` preserved, or swapped for another inode therefore cannot present the same
+/// `(dev, ino, size, mtime, ctime)` as the file that was indexed.
+///
+/// What remains is resolution: two different versions of a file could collide if they
+/// shared a length and both timestamps fell in the same tick. APFS stores both to the
+/// nanosecond — consecutive writes in a directory were measured roughly 100 µs apart —
+/// so this needs two writes of equal length within the same nanosecond. A filesystem
+/// with one-second timestamps would make it reachable, which is worth knowing before
+/// indexing a history kept somewhere other than a Mac's own disk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileFingerprint {
+    pub dev: u64,
+    pub ino: u64,
+    pub ctime: i64,
+    pub ctime_nsec: i64,
+    /// Checkpoint format the committed chunks were derived with. An older format has
+    /// to be reparsed however untouched the file is.
+    pub format_version: u32,
+}
+/// A committed source file together with the fingerprint recorded for it.
+///
+/// Both halves are needed to skip work: the fingerprint proves the file is the same
+/// bytes, and `file.committed_offset` proves all of those bytes are already indexed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedFile {
+    pub file: IndexedFile,
+    pub fingerprint: FileFingerprint,
+}
 /// Where a persisted Git fact came from.
 ///
 /// The two are never interchangeable: `Observed` describes the repository as it

@@ -136,8 +136,13 @@ fn index_outcome(
     } else {
         String::new()
     };
+    let unchanged = if r.skipped_files > 0 {
+        format!(", {} unchanged", r.skipped_files)
+    } else {
+        String::new()
+    };
     let summary = format!(
-        "indexed {} files ({} failed{deferred}), {} records ({} bytes, {} chunks; {} malformed)",
+        "indexed {} files ({} failed{deferred}{unchanged}), {} records ({} bytes, {} chunks; {} malformed)",
         r.files, r.failed_files, r.records, r.bytes_read, r.chunks, r.malformed_records
     );
     let mut notes: Vec<String> = r

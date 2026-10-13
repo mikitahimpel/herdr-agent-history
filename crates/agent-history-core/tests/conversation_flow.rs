@@ -115,7 +115,7 @@ fn schema_two_rebuild_preserves_captured_context_and_invalidates_mixed_text() {
         .connection()
         .execute("UPDATE indexed_files SET open_turn_state=?", [&legacy])
         .unwrap();
-    store.connection().execute_batch("UPDATE search_chunks SET text=text || ' toolsecret'; ALTER TABLE search_chunks DROP COLUMN kind; ALTER TABLE sessions DROP COLUMN git_origin; ALTER TABLE sessions DROP COLUMN repository_url; PRAGMA user_version=2;").unwrap();
+    store.connection().execute_batch("UPDATE search_chunks SET text=text || ' toolsecret'; ALTER TABLE search_chunks DROP COLUMN kind; ALTER TABLE sessions DROP COLUMN git_origin; ALTER TABLE sessions DROP COLUMN repository_url; ALTER TABLE indexed_files DROP COLUMN dev; ALTER TABLE indexed_files DROP COLUMN ino; ALTER TABLE indexed_files DROP COLUMN ctime; ALTER TABLE indexed_files DROP COLUMN ctime_nsec; ALTER TABLE indexed_files DROP COLUMN checkpoint_format; PRAGMA user_version=2;").unwrap();
     drop(store);
 
     let mut store = SqliteStore::open(&db).unwrap();

@@ -1,7 +1,8 @@
 //! Disposable local SQLite index. Native transcript files are never written here.
 use crate::{
-    Agent, CoreError, GitOrigin, GitProvenance, IndexBatch, IndexedFile, Priorities, Result,
-    SearchOutcome, SearchResult, Session, SessionId, SessionRecord, Store, Widening,
+    Agent, CommittedFile, CoreError, FileFingerprint, GitOrigin, GitProvenance, IndexBatch,
+    IndexedFile, Priorities, Result, SearchOutcome, SearchResult, Session, SessionId,
+    SessionRecord, Store, Widening,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -11,7 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const VERSION: i32 = 4;
+const VERSION: i32 = 5;
 const MAX_LIMIT: usize = 1000;
 /// Location of the shared index below `$HOME`. The directory name predates the
 /// standalone/Herdr split and is kept so existing installations keep their data;
@@ -170,16 +171,30 @@ impl SqliteStore {
                 UPDATE sessions SET git_origin=0 WHERE repository_root IS NOT NULL;
                 PRAGMA user_version=4;")?;
         }
+        if (2..=4).contains(&version) {
+            // Nullable, and left null for rows committed before this schema: a scan
+            // cannot skip such a file from `stat` alone, so it compares the file the
+            // way it always did and fills these in when it commits. No reparse.
+            tx.execute_batch(
+                "\
+                ALTER TABLE indexed_files ADD COLUMN dev INTEGER;
+                ALTER TABLE indexed_files ADD COLUMN ino INTEGER;
+                ALTER TABLE indexed_files ADD COLUMN ctime INTEGER;
+                ALTER TABLE indexed_files ADD COLUMN ctime_nsec INTEGER;
+                ALTER TABLE indexed_files ADD COLUMN checkpoint_format INTEGER;
+                PRAGMA user_version=5;",
+            )?;
+        }
         if version == 0 {
             tx.execute_batch("\
                 CREATE TABLE sessions (agent INTEGER NOT NULL, native_id TEXT NOT NULL, source_path TEXT NOT NULL, source_file_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_start INTEGER NOT NULL DEFAULT 0, source_end INTEGER NOT NULL DEFAULT 0, cwd TEXT, repository TEXT, repository_root TEXT, worktree TEXT, branch TEXT, commit_hash TEXT, started_at INTEGER, ended_at INTEGER, git_observed_at INTEGER, git_origin INTEGER CHECK(git_origin IS NULL OR git_origin IN (0,1)), repository_url TEXT, PRIMARY KEY(agent,native_id));
-                CREATE TABLE indexed_files (path TEXT PRIMARY KEY, file_id INTEGER NOT NULL, generation INTEGER NOT NULL, committed_offset INTEGER NOT NULL, size INTEGER NOT NULL, modified INTEGER, open_turn_state BLOB);
+                CREATE TABLE indexed_files (path TEXT PRIMARY KEY, file_id INTEGER NOT NULL, generation INTEGER NOT NULL, committed_offset INTEGER NOT NULL, size INTEGER NOT NULL, modified INTEGER, open_turn_state BLOB, dev INTEGER, ino INTEGER, ctime INTEGER, ctime_nsec INTEGER, checkpoint_format INTEGER);
                 CREATE TABLE search_chunks (rowid INTEGER PRIMARY KEY, agent INTEGER NOT NULL, native_id TEXT NOT NULL, ordinal INTEGER NOT NULL, timestamp INTEGER, kind INTEGER NOT NULL CHECK(kind IN (0,1)), source_path TEXT NOT NULL, source_file_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_start INTEGER NOT NULL, source_end INTEGER NOT NULL, text TEXT NOT NULL, FOREIGN KEY(agent,native_id) REFERENCES sessions(agent,native_id) ON DELETE CASCADE, UNIQUE(agent,native_id,source_file_id,source_generation,ordinal));
                 CREATE VIRTUAL TABLE chunks_fts USING fts5(text, content='search_chunks', content_rowid='rowid', tokenize='unicode61');
                 CREATE TRIGGER chunks_ai AFTER INSERT ON search_chunks BEGIN INSERT INTO chunks_fts(rowid,text) VALUES (new.rowid,new.text); END;
                 CREATE TRIGGER chunks_ad AFTER DELETE ON search_chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES ('delete',old.rowid,old.text); END;
                 CREATE TRIGGER chunks_au AFTER UPDATE ON search_chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES ('delete',old.rowid,old.text); INSERT INTO chunks_fts(rowid,text) VALUES (new.rowid,new.text); END;
-                PRAGMA user_version=4;")?;
+                PRAGMA user_version=5;")?;
         }
         tx.commit()?;
         if version != 0 && version != VERSION {
@@ -261,6 +276,28 @@ impl SqliteStore {
     pub fn indexed_file_state(&self, path: impl AsRef<Path>) -> Result<Option<IndexedFileState>> {
         let p = path.as_ref().to_string_lossy().into_owned();
         Ok(self.conn.query_row("SELECT path,file_id,generation,committed_offset,size,modified,open_turn_state FROM indexed_files WHERE path=?", [p], |r| Ok(IndexedFileState { file: row_file(r)?, open_turn_state: r.get(6)? })).optional()?)
+    }
+    /// Every committed file whose fingerprint columns are all present, by path.
+    ///
+    /// One statement, and deliberately no `open_turn_state`: the checkpoint blobs are
+    /// tens of megabytes of JSON across a real history, and nothing here needs them.
+    pub fn committed_files(&self) -> Result<HashMap<PathBuf, CommittedFile>> {
+        let mut s = self.conn.prepare("SELECT path,file_id,generation,committed_offset,size,modified,dev,ino,ctime,ctime_nsec,checkpoint_format FROM indexed_files WHERE dev IS NOT NULL AND ino IS NOT NULL AND ctime IS NOT NULL AND ctime_nsec IS NOT NULL AND checkpoint_format IS NOT NULL")?;
+        let rows = s
+            .query_map([], |r| {
+                Ok(CommittedFile {
+                    file: row_file(r)?,
+                    fingerprint: FileFingerprint {
+                        dev: r.get(6)?,
+                        ino: r.get(7)?,
+                        ctime: r.get(8)?,
+                        ctime_nsec: r.get(9)?,
+                        format_version: r.get(10)?,
+                    },
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().map(|c| (c.file.path.clone(), c)).collect())
     }
     pub fn session(&self, id: &SessionId) -> Result<Option<Session>> {
         Ok(self.session_record(id)?.map(|r| r.session))
@@ -653,7 +690,8 @@ impl Store for SqliteStore {
             tx.execute("INSERT INTO search_chunks(agent,native_id,ordinal,timestamp,kind,source_path,source_file_id,source_generation,source_start,source_end,text) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent,native_id,source_file_id,source_generation,ordinal) DO UPDATE SET timestamp=excluded.timestamp,kind=excluded.kind,source_path=excluded.source_path,source_file_id=excluded.source_file_id,source_generation=excluded.source_generation,source_start=excluded.source_start,source_end=excluded.source_end,text=excluded.text",params![agent_i(c.session_id.agent),c.session_id.native_id,c.ordinal,ts(c.timestamp),kind_i(c.kind),pstr(&c.source.path),c.source.file_id,c.source.generation,c.source.byte_range.start,c.source.byte_range.end,c.text])?;
         }
         if let Some(f) = batch.file {
-            tx.execute("INSERT INTO indexed_files(path,file_id,generation,committed_offset,size,modified,open_turn_state) VALUES(?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET file_id=excluded.file_id,generation=excluded.generation,committed_offset=excluded.committed_offset,size=excluded.size,modified=excluded.modified,open_turn_state=excluded.open_turn_state",params![pstr(&f.path),f.file_id,f.generation,f.committed_offset,f.size,ts(f.modified),batch.open_turn_state])?;
+            let p = batch.fingerprint;
+            tx.execute("INSERT INTO indexed_files(path,file_id,generation,committed_offset,size,modified,open_turn_state,dev,ino,ctime,ctime_nsec,checkpoint_format) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET file_id=excluded.file_id,generation=excluded.generation,committed_offset=excluded.committed_offset,size=excluded.size,modified=excluded.modified,open_turn_state=excluded.open_turn_state,dev=excluded.dev,ino=excluded.ino,ctime=excluded.ctime,ctime_nsec=excluded.ctime_nsec,checkpoint_format=excluded.checkpoint_format",params![pstr(&f.path),f.file_id,f.generation,f.committed_offset,f.size,ts(f.modified),batch.open_turn_state,p.map(|p|p.dev),p.map(|p|p.ino),p.map(|p|p.ctime),p.map(|p|p.ctime_nsec),p.map(|p|p.format_version)])?;
         }
         tx.commit()?;
         Ok(())
@@ -685,6 +723,35 @@ impl crate::IndexStore for SqliteStore {
     }
     fn indexed_file_state(&self, path: &Path) -> Result<Option<(IndexedFile, Option<Vec<u8>>)>> {
         SqliteStore::indexed_file_state(self, path).map(|v| v.map(|s| (s.file, s.open_turn_state)))
+    }
+    fn committed_files(&self) -> Result<HashMap<PathBuf, CommittedFile>> {
+        SqliteStore::committed_files(self)
+    }
+    /// The `WHERE` clause is the guard: every byte-offset column must still hold what
+    /// the caller compared against the file, or no row is touched. `modified IS ?`
+    /// rather than `=` so that a row recorded without a timestamp still matches.
+    fn record_fingerprint(
+        &mut self,
+        file: &IndexedFile,
+        fingerprint: FileFingerprint,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE indexed_files SET dev=?,ino=?,ctime=?,ctime_nsec=?,checkpoint_format=? WHERE path=? AND file_id=? AND generation=? AND committed_offset=? AND size=? AND modified IS ?",
+            params![
+                fingerprint.dev,
+                fingerprint.ino,
+                fingerprint.ctime,
+                fingerprint.ctime_nsec,
+                fingerprint.format_version,
+                pstr(&file.path),
+                file.file_id,
+                file.generation,
+                file.committed_offset,
+                file.size,
+                ts(file.modified)
+            ],
+        )?;
+        Ok(())
     }
     fn sessions(&self) -> Result<Vec<Session>> {
         SqliteStore::sessions(self)
@@ -1404,7 +1471,7 @@ mod tests {
         let before = fs::metadata(&p).unwrap().len();
 
         let db = SqliteStore::open(&p).unwrap();
-        assert_eq!(pragma(&db, "user_version"), 4);
+        assert_eq!(pragma(&db, "user_version"), 5);
         // The upgrade drops every mixed-speaker chunk; the file must not keep the pages.
         assert_eq!(db.status().unwrap().chunks, 0);
         let (pages, free) = (pragma(&db, "page_count"), pragma(&db, "freelist_count"));

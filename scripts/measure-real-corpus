@@ -124,7 +124,10 @@ run_timed() {
 }
 real_ms() { awk '/ real /{print $1*1000; exit} / real$/{print $1*1000; exit}' "$1.time" 2>/dev/null; }
 max_rss() { awk '/maximum resident set size/{print $1; exit}' "$1.time" 2>/dev/null; }
-index_summary() { grep -Eo 'indexed [0-9]+ files \([0-9]+ failed\), [0-9]+ records \([0-9]+ bytes, [0-9]+ chunks; [0-9]+ malformed\)' "$1.out" 2>/dev/null || true; }
+# The parenthesised file counts carry optional ", N deferred" and ", N unchanged"
+# clauses, so match the whole group rather than "failed" alone; a tighter pattern
+# silently reports nothing for exactly the scans that have something to say.
+index_summary() { grep -Eo 'indexed [0-9]+ files \([0-9]+ failed[^)]*\), [0-9]+ records \([0-9]+ bytes, [0-9]+ chunks; [0-9]+ malformed\)' "$1.out" 2>/dev/null || true; }
 still_running() { pgrep -f "$bin" >/dev/null 2>&1 && echo yes || echo no; }
 
 emit "== host =="
@@ -164,6 +167,23 @@ fi
 emit "wall_ms=$(real_ms "$work/b")"
 emit "max_rss_bytes=$(max_rss "$work/b")"
 emit "$(index_summary "$work/b")"
+emit "process_still_running=$(still_running)"
+
+# --- phase B2: the same scan again, immediately. Phase B absorbed whatever
+# changed since phase A, so this one has nothing left to do and isolates the
+# cost of deciding that: the directory walk, one `stat` per file, and the
+# single query that reads every committed file's fingerprint. It is what the
+# user pays on every launch of an unchanged history. A live session can still
+# append between the two scans, so "records" is reported rather than assumed
+# to be zero; compare it against phase B before reading the timing.
+emit ""
+emit "== phase B2: settled rescan (nothing to do) =="
+if ! run_timed "$work/b2" env CLAUDE_CONFIG_DIR="$claude_config_dir_used" CODEX_HOME="$codex_home_used" "$bin" index --db "$db"; then
+  die "settled rescan failed, see $work/b2.out and $work/b2.time"
+fi
+emit "wall_ms=$(real_ms "$work/b2")"
+emit "max_rss_bytes=$(max_rss "$work/b2")"
+emit "$(index_summary "$work/b2")"
 emit "process_still_running=$(still_running)"
 
 # --- phase C: isolated single-file incremental append -------------------

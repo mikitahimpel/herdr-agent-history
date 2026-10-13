@@ -1,8 +1,8 @@
 //! Transactional indexing. Native files are opened read-only.
 use crate::{
-    chunks::ChunkBuilder, AgentAdapter, CoreError, GitContextProvider, GitOrigin, GitProvenance,
-    IndexBatch, IndexStore, IndexedFile, RecordedGit, Result, Session, SessionFile, SessionId,
-    SessionRecord, SourceRef,
+    chunks::ChunkBuilder, AgentAdapter, CommittedFile, CoreError, FileFingerprint,
+    GitContextProvider, GitOrigin, GitProvenance, IndexBatch, IndexStore, IndexedFile, RecordedGit,
+    Result, Session, SessionFile, SessionId, SessionRecord, SourceRef,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,6 +27,9 @@ pub struct IndexReport {
     pub chunks: u64,
     pub skipped: bool,
     pub files: u64,
+    /// Files found already indexed to their last byte, so nothing was read or parsed.
+    /// On a rescan of an unchanged history this equals `files`.
+    pub skipped_files: u64,
     pub failed_files: u64,
     /// Files written to while they were read, such as a live session appending. Not a
     /// failure: nothing from the attempt was committed, and the next scan reads them
@@ -81,6 +84,36 @@ pub(crate) struct Checkpoint {
 pub(crate) fn decode(bytes: &[u8]) -> Result<Checkpoint> {
     serde_json::from_slice(bytes)
         .map_err(|_| CoreError::Storage("invalid indexing checkpoint; rebuild index".into()))
+}
+/// A fingerprint of `meta` to record alongside a commit.
+fn fingerprint(meta: &Metadata) -> FileFingerprint {
+    FileFingerprint {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        ctime: meta.ctime(),
+        ctime_nsec: meta.ctime_nsec(),
+        format_version: CHECKPOINT_FORMAT_VERSION,
+    }
+}
+/// True when `meta` is the same inode, unchanged, and already indexed to its last byte
+/// in the current checkpoint format — so there is nothing to read and nothing to parse.
+///
+/// Both halves matter. The fingerprint says the bytes are the ones that were read:
+/// `dev`/`ino` rule out a replacement inode, `size` and `mtime` rule out an ordinary
+/// write, and `ctime` rules out the cases `mtime` alone would miss, because the kernel
+/// stamps it on every inode change and userspace cannot set it. `committed_offset` then
+/// says every one of those bytes reached the index, which is what distinguishes an
+/// untouched file from one whose indexing was interrupted part-way.
+fn settled(prior: &CommittedFile, meta: &Metadata) -> bool {
+    let f = &prior.fingerprint;
+    f.format_version == CHECKPOINT_FORMAT_VERSION
+        && f.dev == meta.dev()
+        && f.ino == meta.ino()
+        && f.ctime == meta.ctime()
+        && f.ctime_nsec == meta.ctime_nsec()
+        && prior.file.size == meta.len()
+        && prior.file.committed_offset == meta.len()
+        && prior.file.modified == meta.modified().ok()
 }
 pub(crate) fn same(a: &Metadata, b: &Metadata) -> bool {
     a.dev() == b.dev()
@@ -159,6 +192,7 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
         self.index_with_cache_progress(
             discovered,
             cache,
+            None,
             &AtomicBool::new(false),
             &mut |_, _, _| {},
         )
@@ -171,10 +205,26 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
         &mut self,
         discovered: &SessionFile,
         cache: &mut HashMap<std::path::PathBuf, crate::GitContext>,
+        committed: Option<&HashMap<std::path::PathBuf, CommittedFile>>,
         stop: &AtomicBool,
         progress: &mut dyn FnMut(u64, u64, u64),
     ) -> Result<IndexReport> {
         let path = &discovered.path;
+        // The overwhelmingly common case on a rescan: a finished transcript nobody has
+        // touched. One `stat` settles it, so the file is never opened, its checkpoint is
+        // never fetched or parsed, and no bytes are hashed. A file that fails this falls
+        // through to the full comparison below, which can still find it unchanged.
+        if let Some(prior) = committed.and_then(|c| c.get(path)) {
+            if let Ok(meta) = fs::metadata(path) {
+                if meta.is_file() && settled(prior, &meta) {
+                    return Ok(IndexReport {
+                        skipped: true,
+                        files: 1,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
         let file = File::open(path)?;
         let meta = file.metadata()?;
         if !meta.is_file() {
@@ -230,6 +280,14 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
         {
             if !same(meta, &fs::metadata(path)?) {
                 return Err(CoreError::SourceChanged);
+            }
+            // Reached here, the file has been read and hashed to prove what one `stat`
+            // could have settled. Leave the fingerprint behind so it is the last time:
+            // this is the path an index written before fingerprints existed takes once
+            // per file. The stat above is the one being certified, and the store applies
+            // it only while the committed row still matches.
+            if let Some((f, _)) = &prior {
+                self.store.record_fingerprint(f, fingerprint(meta))?;
             }
             return Ok(IndexReport {
                 skipped: true,
@@ -428,6 +486,9 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
                 size: meta.len(),
                 modified: meta.modified().ok(),
             }),
+            // Checked against the source immediately above, so it describes the bytes
+            // this batch commits. A scan that meets the same `stat` can skip the file.
+            fingerprint: Some(fingerprint(meta)),
             expected_file: Some(expected.clone()),
             sessions: vec![SessionRecord {
                 session,
@@ -477,6 +538,9 @@ pub fn index_all_until<S: IndexStore, C: FnMut(IndexProgress)>(
 ) -> Result<IndexReport> {
     let mut total = IndexReport::default();
     let mut cache = HashMap::new();
+    // One query for the whole scan. Every file is visited at most once, so a file this
+    // scan commits cannot need to be looked up again.
+    let committed = store.committed_files()?;
     let mut discovered = Vec::with_capacity(adapters.len());
     let mut total_files = 0u64;
     let mut completed_files = 0u64;
@@ -540,15 +604,20 @@ pub fn index_all_until<S: IndexStore, C: FnMut(IndexProgress)>(
                     deferred_files: total.deferred_files,
                 });
             };
-            match Indexer::new(adapter.as_ref(), &mut *store)
-                .index_with_cache_progress(&file, &mut cache, stop, &mut emit)
-            {
+            match Indexer::new(adapter.as_ref(), &mut *store).index_with_cache_progress(
+                &file,
+                &mut cache,
+                Some(&committed),
+                stop,
+                &mut emit,
+            ) {
                 Ok(r) => {
                     total.bytes_read += r.bytes_read;
                     total.records += r.records;
                     total.malformed_records += r.malformed_records;
                     total.chunks += r.chunks;
                     total.files += 1;
+                    total.skipped_files += u64::from(r.skipped);
                     completed_files += 1;
                     agent_completed_files += 1;
                     callback(IndexProgress {
@@ -650,6 +719,7 @@ mod tests {
         test_support::TempDir,
     };
     use std::io::Write;
+    use std::path::PathBuf;
     fn line(role: &str, text: &str) -> String {
         format!(
             "{{\"type\":\"{role}\",\"sessionId\":\"native\",\"message\":{{\"content\":{}}}}}\n",
@@ -673,6 +743,69 @@ mod tests {
     }
     fn db(d: &TempDir) -> SqliteStore {
         SqliteStore::open(d.path().join("private/index.sqlite")).unwrap()
+    }
+    /// Drops the checkpoint a path was committed with, leaving its byte offsets and
+    /// fingerprint intact. Only a decision taken from `stat` alone can still skip the
+    /// file afterwards: the full comparison needs this blob, and without it treats the
+    /// file as never indexed and reparses it from zero.
+    fn forget_checkpoint(store: &SqliteStore, path: &Path) {
+        let n = store
+            .connection()
+            .execute(
+                "UPDATE indexed_files SET open_turn_state=NULL WHERE path=?",
+                [path.to_string_lossy()],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "expected one committed row for {}", path.display());
+    }
+    /// Erases the fingerprint columns, reproducing a row committed by a build that had
+    /// none, so that an upgraded index can be exercised without a schema fixture.
+    fn forget_fingerprint(store: &SqliteStore, path: &Path) {
+        let n = store.connection().execute("UPDATE indexed_files SET dev=NULL,ino=NULL,ctime=NULL,ctime_nsec=NULL,checkpoint_format=NULL WHERE path=?", [path.to_string_lossy()]).unwrap();
+        assert_eq!(n, 1);
+    }
+    fn recorded_format(store: &SqliteStore, path: &Path) -> Option<i64> {
+        store
+            .connection()
+            .query_row(
+                "SELECT checkpoint_format FROM indexed_files WHERE path=?",
+                [path.to_string_lossy()],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .unwrap()
+    }
+    /// Puts a file's modification time back where it was, the way restoring it from an
+    /// archive does. `ctime` moves forward regardless, which is the point.
+    fn restore_mtime(path: &Path, to: SystemTime) {
+        let since = to.duration_since(std::time::UNIX_EPOCH).unwrap();
+        let spec = libc::timespec {
+            tv_sec: since.as_secs() as libc::time_t,
+            tv_nsec: since.subsec_nanos() as libc::c_long,
+        };
+        let name = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()))
+            .unwrap();
+        let times = [spec, spec];
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, name.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(
+            rc,
+            0,
+            "utimensat failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    fn claude_only(root: &Path) -> Vec<Box<dyn AgentAdapter>> {
+        vec![Box::new(ClaudeAdapter::with_root(root.to_path_buf()))]
+    }
+    /// A root holding one finished transcript, indexed once.
+    fn indexed_root(d: &TempDir) -> (PathBuf, PathBuf, SqliteStore) {
+        let root = d.path().join("claude");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("one.jsonl");
+        fs::write(&path, line("user", "settledmarker alpha")).unwrap();
+        let mut store = db(d);
+        let r = index_all(&mut store, &claude_only(&root)).unwrap();
+        assert_eq!((r.files, r.records, r.failed_files), (1, 1, 0));
+        (root, path, store)
     }
     #[test]
     fn both_adapters_discover_index_query_and_normalized_preview() {
@@ -1107,6 +1240,133 @@ mod tests {
             .unwrap();
         assert_eq!(codex_start.agent_total_files, 0);
         assert_eq!(codex_start.total_files, 2);
+    }
+
+    #[test]
+    fn an_untouched_file_is_skipped_without_its_checkpoint() {
+        let d = TempDir::new("settled-skip").unwrap();
+        let (root, path, mut store) = indexed_root(&d);
+        // Nothing but the fingerprint and the byte offsets are left to decide with.
+        forget_checkpoint(&store, &path);
+        let r = index_all(&mut store, &claude_only(&root)).unwrap();
+        assert_eq!(r.files, 1);
+        assert_eq!(r.skipped_files, 1, "an unchanged file must be skipped");
+        assert_eq!(
+            (r.records, r.bytes_read, r.chunks),
+            (0, 0, 0),
+            "a skip must not read or parse anything"
+        );
+        // The dropped checkpoint proves the skip was decided without it; the index is
+        // otherwise untouched, so what was already committed is still searchable.
+        assert_eq!(store.search("settledmarker", 10).unwrap().len(), 1);
+    }
+    #[test]
+    fn a_rewrite_that_restores_the_modification_time_is_still_reindexed() {
+        let d = TempDir::new("settled-mtime").unwrap();
+        let (root, path, mut store) = indexed_root(&d);
+        let before = fs::metadata(&path).unwrap();
+        // Same length, different content, and the timestamp an archive would restore.
+        // `mtime` and size alone now claim the file is untouched.
+        fs::write(&path, line("user", "settledmarker omega")).unwrap();
+        restore_mtime(&path, before.modified().unwrap());
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+        assert_ne!(
+            (after.ctime(), after.ctime_nsec()),
+            (before.ctime(), before.ctime_nsec()),
+            "the kernel must have moved ctime; the skip relies on it"
+        );
+        let r = index_all(&mut store, &claude_only(&root)).unwrap();
+        assert_eq!(r.skipped_files, 0, "a rewritten file must not be skipped");
+        assert_eq!(r.records, 1);
+        let hits = store.search("omega", 10).unwrap();
+        assert_eq!(hits.len(), 1, "the replacement text must be searchable");
+        assert!(store.search("alpha", 10).unwrap().is_empty());
+    }
+    #[test]
+    fn a_replaced_inode_is_still_reindexed() {
+        let d = TempDir::new("settled-inode").unwrap();
+        let (root, path, mut store) = indexed_root(&d);
+        let before = fs::metadata(&path).unwrap();
+        // The atomic-write shape: a fresh file renamed over the old name. Its length
+        // and restored timestamp match, so only the inode gives it away.
+        let staged = root.join("staged");
+        fs::write(&staged, line("user", "settledmarker gamma")).unwrap();
+        fs::rename(&staged, &path).unwrap();
+        restore_mtime(&path, before.modified().unwrap());
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_ne!(after.ino(), before.ino());
+        let r = index_all(&mut store, &claude_only(&root)).unwrap();
+        assert_eq!(r.skipped_files, 0);
+        assert_eq!(store.search("gamma", 10).unwrap().len(), 1);
+    }
+    #[test]
+    fn a_file_indexed_short_of_its_end_is_never_skipped() {
+        let d = TempDir::new("settled-partial").unwrap();
+        let root = d.path().join("claude");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("one.jsonl");
+        // A live transcript caught mid-write: the last record has no newline yet, so it
+        // is not committed and the file is longer than its committed offset.
+        let mut body = line("user", "settledmarker alpha");
+        body.push_str(line("user", "settledmarker beta").trim_end());
+        fs::write(&path, &body).unwrap();
+        let mut store = db(&d);
+        let r = index_all(&mut store, &claude_only(&root)).unwrap();
+        assert_eq!(r.records, 1);
+        let committed = store.indexed_file_state(&path).unwrap().unwrap().file;
+        assert!(committed.committed_offset < committed.size);
+        // Not one byte has changed, and the fingerprint matches, but the tail is still
+        // unindexed: skipping here would lose the record once it is completed.
+        let r = index_all(&mut store, &claude_only(&root)).unwrap();
+        assert!(
+            !r.skipped,
+            "an incompletely indexed file must not be skipped"
+        );
+        append(&path, b"\n");
+        let r = index_all(&mut store, &claude_only(&root)).unwrap();
+        assert_eq!(r.records, 1);
+        assert_eq!(store.search("beta", 10).unwrap().len(), 1);
+    }
+    #[test]
+    fn an_index_without_fingerprints_earns_them_on_its_next_scan() {
+        let d = TempDir::new("settled-backfill").unwrap();
+        let (root, path, mut store) = indexed_root(&d);
+        // What an index written before fingerprints existed looks like after migration.
+        forget_fingerprint(&store, &path);
+        assert_eq!(recorded_format(&store, &path), None);
+        assert!(store.committed_files().unwrap().is_empty());
+        // The first scan compares the file the long way, finds it unchanged, and leaves
+        // the fingerprint behind.
+        let r = index_all(&mut store, &claude_only(&root)).unwrap();
+        assert_eq!(r.skipped_files, 1);
+        assert_eq!(
+            recorded_format(&store, &path),
+            Some(i64::from(CHECKPOINT_FORMAT_VERSION))
+        );
+        // From here the cheap path applies, which the dropped checkpoint demonstrates.
+        forget_checkpoint(&store, &path);
+        let r = index_all(&mut store, &claude_only(&root)).unwrap();
+        assert_eq!(r.skipped_files, 1);
+        assert_eq!(r.bytes_read, 0);
+        assert_eq!(store.search("settledmarker", 10).unwrap().len(), 1);
+    }
+    #[test]
+    fn an_appended_file_is_read_from_its_committed_offset() {
+        let d = TempDir::new("settled-append").unwrap();
+        let (root, path, mut store) = indexed_root(&d);
+        let added = line("user", "settledmarker delta");
+        append(&path, added.as_bytes());
+        let r = index_all(&mut store, &claude_only(&root)).unwrap();
+        assert_eq!(r.skipped_files, 0);
+        assert_eq!(
+            r.bytes_read,
+            added.len() as u64,
+            "an append must read only the new bytes"
+        );
+        assert_eq!(store.search("delta", 10).unwrap().len(), 1);
     }
 }
 
