@@ -5,8 +5,8 @@ use agent_history_core::{
     availability::Availability,
     background::{BackgroundIndex, ScanSnapshot},
     preview::preview_source,
-    AgentAdapter, CoreError, EventKind, Result, SearchResult, Session, SessionId, SourceRef,
-    SqliteStore, Widening,
+    AgentAdapter, CoreError, EventKind, Priorities, Result, ResultPrioritizer, SearchResult,
+    Session, SourceRef, SqliteStore, Widening,
 };
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -38,6 +38,10 @@ const PREVIEW_BYTES: u64 = 64 * 1024;
 /// While indexing runs, results are re-queried at most this often, so that a
 /// stream of commits does not reshuffle the list under the reader.
 const RESULTS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// A conversation that is still being written can be changed again by the
+/// time a scan has read it, so scans asked for by a changed conversation are
+/// at least this far apart.
+const RESCAN_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Key {
@@ -137,6 +141,11 @@ pub struct BrowserState {
     /// Non-empty when nothing matched the query exactly and `results` are
     /// near matches found by widening these words.
     pub widened: Vec<Widening>,
+    /// The integration's priorities, fixed between refreshes of its view of
+    /// the sessions so that typing never waits on it.
+    pub priorities: Priorities,
+    /// How many leading `results` are prioritized sessions' best matches.
+    pub prioritized: usize,
     pub selected: usize,
     pub mode: Mode,
     /// Original conversation around the selected result.
@@ -145,6 +154,12 @@ pub struct BrowserState {
     pub preview_for: Option<SourceRef>,
     /// Why the selected result's conversation could not be read.
     pub preview_error: Option<String>,
+    /// The selected conversation changed since it was indexed, so it is shown
+    /// as loading until a scan has read it again.
+    pub preview_stale: bool,
+    /// An integration found a changed conversation, as the preview does with
+    /// `preview_stale`; the run loop then starts a scan when none is running.
+    pub reindex_wanted: bool,
     pub preview_scroll: usize,
     /// Scroll the preview to the first matched term on the next render.
     pub preview_anchor: bool,
@@ -172,6 +187,16 @@ pub struct BrowserState {
     pub(crate) hits: ui::Hits,
 }
 impl BrowserState {
+    /// Replaces the priorities, re-running the query when they changed.
+    pub fn set_priorities(&mut self, priorities: Priorities, store: &SqliteStore) {
+        if priorities == self.priorities {
+            return;
+        }
+        self.availability.set_priorities(priorities.clone());
+        self.priorities = priorities;
+        self.refresh_in_place(store);
+    }
+
     pub fn refresh(&mut self, store: &SqliteStore) {
         self.search(store);
         self.sync_preview(store);
@@ -190,20 +215,31 @@ impl BrowserState {
         if let Some(i) = selected.and_then(|s| self.results.iter().position(|r| r.source == s)) {
             self.selected = i;
         }
+        if self.preview_stale {
+            // The source may keep its identity after a scan reads it again.
+            self.preview_for = None;
+        }
         self.sync_preview(store);
     }
 
     fn search(&mut self, store: &SqliteStore) {
-        match store.search_with_fallback(&self.query, RESULT_LIMIT, self.role_filter.kind()) {
+        match store.search_prioritized(
+            &self.query,
+            RESULT_LIMIT,
+            self.role_filter.kind(),
+            &self.priorities,
+        ) {
             Ok(outcome) => {
                 self.results = outcome.results;
                 self.widened = outcome.widened;
+                self.prioritized = outcome.prioritized;
                 self.selected = self.selected.min(self.results.len().saturating_sub(1));
                 self.error = None;
             }
             Err(e) => {
                 self.results.clear();
                 self.widened.clear();
+                self.prioritized = 0;
                 self.selected = 0;
                 self.error = Some(e.to_string());
             }
@@ -226,14 +262,18 @@ impl BrowserState {
                 self.preview.clear();
                 self.preview_for = None;
                 self.preview_error = None;
+                self.preview_stale = false;
                 self.preview_scroll = 0;
             }
         }
     }
 
+    /// A conversation that changed since it was indexed is not a failure:
+    /// it is marked as loading and a scan is asked for.
     fn load_preview(&mut self, store: &SqliteStore, source: SourceRef) -> Result<()> {
         self.preview.clear();
         self.preview_error = None;
+        self.preview_stale = false;
         self.preview_scroll = 0;
         self.preview_anchor = true;
         self.preview_for = Some(source.clone());
@@ -244,6 +284,10 @@ impl BrowserState {
                     self.preview
                         .push_str("\n\n[Surrounding context is limited]");
                 }
+                Ok(())
+            }
+            Err(CoreError::StaleSource) => {
+                self.preview_stale = true;
                 Ok(())
             }
             Err(e) => {
@@ -261,7 +305,10 @@ impl BrowserState {
             .ok_or_else(|| CoreError::Unsupported("no session selected".into()))?
             .source
             .clone();
-        if self.preview_for.as_ref() != Some(&source) || self.preview_error.is_some() {
+        if self.preview_for.as_ref() != Some(&source)
+            || self.preview_error.is_some()
+            || self.preview_stale
+        {
             self.load_preview(store, source)?;
         }
         self.mode = Mode::Preview;
@@ -429,15 +476,18 @@ pub trait Integration {
     }
     fn handle(&mut self, key: Key, state: &mut BrowserState, store: &SqliteStore) -> Result<bool>;
     fn action_lines(&self) -> Vec<String>;
-    /// Sessions the host already runs, asked once when the browser opens.
-    fn live_sessions(&mut self, _sessions: &[Session]) -> Vec<SessionId> {
-        Vec::new()
+    /// The extension that lifts sessions above relevance order, if any. It
+    /// is asked when the browser opens and when a scan changes the sessions,
+    /// never per keystroke; its groups are marked with
+    /// [`SessionState::Prioritized`] and drawn apart from the other results.
+    fn prioritizer(&mut self) -> Option<&mut dyn ResultPrioritizer> {
+        None
     }
     /// Short wording for a result's availability marker. The default only
     /// describes what exists on disk; it never promises that Enter resumes.
     fn availability_label(&self, state: SessionState) -> &str {
         match state {
-            SessionState::Live => "running",
+            SessionState::Prioritized(_) => "priority",
             SessionState::Stored(Availability::OnDisk) => "on disk",
             SessionState::Stored(Availability::Recoverable) => "repo only",
             SessionState::Stored(Availability::RepositoryKnown) => "repo gone",
@@ -593,25 +643,43 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
     term.draw(|f| draw(f, &mut state, integration))?;
     let store = SqliteStore::open(&db).map_err(core_io)?;
     // The existing index is searchable from here on; the scan only adds to it.
-    let scan = BackgroundIndex::spawn(db, move || adapters(claude, codex))?;
+    let scan_adapters = || {
+        let (claude, codex) = (claude.clone(), codex.clone());
+        move || adapters(claude, codex)
+    };
+    let mut scan = BackgroundIndex::spawn(db.clone(), scan_adapters())?;
     let mut follower = ScanFollower::new(started);
+    let mut scan_ended: Option<Instant> = None;
     // One read of the session table and one host query; after this, only the
     // worker touches the filesystem, and only for sessions not seen before.
     let sessions = store.sessions().unwrap_or_default();
-    state
-        .availability
-        .set_live(integration.live_sessions(&sessions));
+    state.set_priorities(priorities(integration, &sessions), &store);
     let mut worker =
         availability::Worker::spawn(sessions, agent_history_core::availability::availability);
     while !state.closed {
         let report = follower.apply(&scan.snapshot(), &mut state, &store);
+        if follower.finished && scan_ended.is_none() {
+            scan_ended = Some(Instant::now());
+        }
+        let changed = state.preview_stale || state.reindex_wanted;
+        if changed && scan_ended.is_some_and(|t| t.elapsed() >= RESCAN_INTERVAL) {
+            // Only appended or replaced files are read again, so this costs
+            // about one discovery pass.
+            state.reindex_wanted = false;
+            let finished = std::mem::replace(
+                &mut scan,
+                BackgroundIndex::spawn(db.clone(), scan_adapters())?,
+            );
+            finished.stop();
+            follower = ScanFollower::new(Instant::now());
+            scan_ended = None;
+        }
         if report.is_some_and(|r| r.bytes_read > 0) {
             // The scan may have added sessions, or moved their sources.
             let sessions = store.sessions().unwrap_or_default();
             state.availability = Availabilities::default();
-            state
-                .availability
-                .set_live(integration.live_sessions(&sessions));
+            state.availability.set_priorities(state.priorities.clone());
+            state.set_priorities(priorities(integration, &sessions), &store);
             worker = availability::Worker::spawn(
                 sessions,
                 agent_history_core::availability::availability,
@@ -677,6 +745,13 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
     // Abandons the file in progress before its commit; everything committed stays.
     scan.stop();
     Ok(())
+}
+
+fn priorities(integration: &mut impl Integration, sessions: &[Session]) -> Priorities {
+    integration
+        .prioritizer()
+        .map(|p| p.prioritize(sessions))
+        .unwrap_or_default()
 }
 
 fn map_mouse(m: MouseEvent) -> Option<Mouse> {
@@ -795,6 +870,32 @@ mod tests {
     }
 
     #[test]
+    fn new_priorities_reorder_the_open_results_and_keep_the_selection() {
+        let temp = agent_history_core::test_support::TempDir::new("tui-priorities").unwrap();
+        let store = rememberable(temp.path());
+        let mut state = BrowserState {
+            query: "rememberable".into(),
+            ..Default::default()
+        };
+        state.refresh(&store);
+        assert_eq!((state.results.len(), state.prioritized), (2, 0));
+        state.selected = 1;
+        let selected = state.results[1].source.clone();
+        let id = state.results[0].session_id.clone();
+        state.set_priorities(Priorities::from_iter([(id.clone(), 0)]), &store);
+        assert_eq!(state.prioritized, 1);
+        assert_eq!(state.results[state.selected].source, selected);
+        assert_eq!(
+            state.availability.state(&id),
+            Some(SessionState::Prioritized(0))
+        );
+        // The standalone browser registers no extension.
+        assert!(Standalone.prioritizer().is_none());
+        state.set_priorities(Priorities::default(), &store);
+        assert_eq!(state.prioritized, 0);
+    }
+
+    #[test]
     fn standalone_has_no_actions_and_enter_opens_preview() {
         let temp = agent_history_core::test_support::TempDir::new("tui").unwrap();
         let store = rememberable(temp.path());
@@ -857,15 +958,16 @@ mod tests {
 
     #[test]
     fn unreadable_source_is_reported_in_the_preview_not_as_a_crash() {
-        let temp = agent_history_core::test_support::TempDir::new("tui-stale").unwrap();
+        let temp = agent_history_core::test_support::TempDir::new("tui-unreadable").unwrap();
         let store = rememberable(temp.path());
-        fs::write(temp.path().join("history/session.jsonl"), "replaced\n").unwrap();
+        fs::remove_file(temp.path().join("history/session.jsonl")).unwrap();
         let mut state = BrowserState {
             query: "rememberable".into(),
             ..Default::default()
         };
         state.refresh(&store);
         assert!(state.preview_error.is_some());
+        assert!(!state.preview_stale);
         assert!(
             state.handle(Key::Space, &store).is_ok(),
             "space types in the query"
@@ -873,6 +975,37 @@ mod tests {
         state.mode = Mode::Results;
         assert!(state.handle(Key::Space, &store).is_err());
         assert_eq!(state.mode, Mode::Results);
+    }
+
+    #[test]
+    fn a_conversation_changed_since_indexing_is_loading_not_an_error() {
+        let temp = agent_history_core::test_support::TempDir::new("tui-stale").unwrap();
+        let store = rememberable(temp.path());
+        let source = temp.path().join("history/session.jsonl");
+        let mut appended = fs::read_to_string(&source).unwrap();
+        appended.push_str(r#"{"type":"assistant","message":{"content":"written after the scan"}}"#);
+        appended.push('\n');
+        fs::write(&source, appended).unwrap();
+        let mut state = BrowserState {
+            query: "rememberable".into(),
+            ..Default::default()
+        };
+        state.refresh(&store);
+        assert!(state.preview_stale);
+        assert!(state.preview_error.is_none());
+        state.mode = Mode::Results;
+        state.handle(Key::Space, &store).unwrap();
+        assert_eq!(state.mode, Mode::Preview);
+        assert!(state.preview_stale);
+        // Once a scan has read the file again, the next refresh loads it.
+        let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(ClaudeAdapter::with_root(
+            temp.path().join("history"),
+        ))];
+        let mut writer = SqliteStore::open(temp.path().join("private/index.sqlite")).unwrap();
+        agent_history_core::index::index_all(&mut writer, &adapters).unwrap();
+        state.refresh_in_place(&store);
+        assert!(!state.preview_stale);
+        assert!(state.preview.contains("rememberable"), "{}", state.preview);
     }
 
     fn claude_line(session: &str, text: &str) -> String {

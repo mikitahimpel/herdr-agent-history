@@ -475,7 +475,7 @@ fn result_row(bar: &Span<'static>, content: Vec<Span<'static>>, w: usize) -> Lin
 pub(crate) fn marker(state: Option<SessionState>, p: &Palette) -> (&'static str, Color) {
     match state {
         None => ("·", p.overlay0),
-        Some(SessionState::Live) => ("◉", p.teal),
+        Some(SessionState::Prioritized(_)) => ("◉", p.teal),
         Some(SessionState::Stored(Availability::OnDisk)) => ("●", p.green),
         Some(SessionState::Stored(Availability::Recoverable)) => ("◐", p.yellow),
         Some(SessionState::Stored(Availability::RepositoryKnown)) => ("○", p.red),
@@ -503,13 +503,25 @@ fn draw_results(
         block = block.title(Line::styled(label, p.approximate()).right_aligned());
     }
     if !state.results.is_empty() {
-        block = block.title_bottom(
-            Line::styled(
-                format!(" {}/{} ", state.selected + 1, state.results.len()),
-                p.muted(),
-            )
-            .right_aligned(),
-        );
+        let mut counts = Vec::new();
+        if let Some(first) = state.results.first().filter(|_| state.prioritized > 0) {
+            // Worded like the group's own marker, so the count explains the stripe.
+            let group = state
+                .priorities
+                .group(&first.session_id)
+                .unwrap_or_default();
+            let label = integration.availability_label(SessionState::Prioritized(group));
+            counts.push(Span::styled(
+                format!(" ◉ {} {label} ", state.prioritized),
+                Style::new().fg(p.teal),
+            ));
+            counts.push(Span::styled("·", p.muted()));
+        }
+        counts.push(Span::styled(
+            format!(" {}/{} ", state.selected + 1, state.results.len()),
+            p.muted(),
+        ));
+        block = block.title_bottom(Line::from(counts).right_aligned());
     }
     state.hits.results = Some(area);
     let inner = block.inner(area);
@@ -545,8 +557,12 @@ fn draw_results(
         .skip(state.list_offset)
         .take(per_page)
     {
+        // The prioritized group carries a stripe down its left edge, through
+        // the rules inside it, so it reads as one block without a header row.
+        let grouped = i < state.prioritized;
+        let stripe = || Span::styled("▎", Style::new().fg(p.teal));
         if i > state.list_offset {
-            let mut separator = vec![Span::raw(" ")];
+            let mut separator = vec![if grouped { stripe() } else { Span::raw(" ") }];
             separator.extend(rule(w.saturating_sub(2), None, p).spans);
             separator.push(Span::raw(" "));
             lines.push(Line::from(separator));
@@ -554,6 +570,8 @@ fn draw_results(
         let selected = i == state.selected;
         let bar = if selected {
             Span::styled("▌", Style::new().fg(p.accent))
+        } else if grouped {
+            stripe()
         } else {
             Span::raw(" ")
         };
@@ -821,6 +839,27 @@ fn draw_preview(frame: &mut Frame, area: Rect, state: &mut BrowserState, p: &Pal
         .into_iter()
         .map(|l| (l, false))
         .collect()
+    } else if state.preview_stale {
+        // Normal for a conversation still being written: it grew after the
+        // last scan, and the next one reads it again.
+        vec![
+            Line::raw(""),
+            Line::styled("Loading conversation…", Style::new().fg(p.text)),
+            Line::styled(
+                "It changed since it was indexed and is being read again.",
+                p.muted(),
+            ),
+        ]
+        .into_iter()
+        .flat_map(|l| {
+            let style = l.style;
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            let wrapped = text::wrap(&text, w);
+            wrapped
+                .into_iter()
+                .map(move |t| (Line::styled(t, style), false))
+        })
+        .collect()
     } else if let Some(error) = &state.preview_error {
         let mut lines = vec![
             Line::raw(""),
@@ -991,7 +1030,7 @@ fn draw_keys(
 mod tests {
     use super::*;
     use crate::{tests::rememberable, Key, Standalone};
-    use agent_history_core::{test_support::TempDir, SqliteStore};
+    use agent_history_core::{test_support::TempDir, Priorities, SqliteStore};
     use ratatui::{backend::TestBackend, buffer::Buffer, style::Color, Terminal};
     use std::collections::HashSet;
 
@@ -1019,7 +1058,7 @@ mod tests {
         }
         fn availability_label(&self, state: SessionState) -> &str {
             match state {
-                SessionState::Live => "focus running",
+                SessionState::Prioritized(_) => "focus running",
                 _ => "other",
             }
         }
@@ -1508,7 +1547,7 @@ mod tests {
         let (store, mut state) = searched(temp);
         let template = state.results[0].clone();
         let states = vec![
-            SessionState::Live,
+            SessionState::Prioritized(0),
             SessionState::Stored(Availability::OnDisk),
             SessionState::Stored(Availability::Recoverable),
             SessionState::Stored(Availability::RepositoryKnown),
@@ -1523,7 +1562,9 @@ mod tests {
             .collect();
         for (r, s) in state.results.iter().zip(&states) {
             match s {
-                SessionState::Live => state.availability.set_live([r.session_id.clone()]),
+                SessionState::Prioritized(g) => state
+                    .availability
+                    .set_priorities(Priorities::from_iter([(r.session_id.clone(), *g)])),
                 SessionState::Stored(a) => state.availability.record(r.session_id.clone(), *a),
             }
         }
@@ -1579,6 +1620,80 @@ mod tests {
         // An integration supplies its own wording through the same boundary.
         let buf = render(&mut state, &Themed(Palette::terminal()), 120, 40);
         assert!(headers(&buf)[0].2.contains("focus running"));
+    }
+
+    #[test]
+    fn the_prioritized_group_is_striped_and_counted_without_a_header_row() {
+        let temp = TempDir::new("ui-priority-group").unwrap();
+        let (_store, mut state, _) = five_sessions(&temp);
+        let first_two = [&state.results[0], &state.results[1]].map(|r| (r.session_id.clone(), 0));
+        state
+            .availability
+            .set_priorities(Priorities::from_iter(first_two.clone()));
+        state.priorities = Priorities::from_iter(first_two);
+        state.prioritized = 2;
+        state.mode = Mode::Results;
+        state.selected = 4;
+        let p = Palette::terminal();
+        for width in [120, 36] {
+            let buf = render(&mut state, &Themed(p), width, 60);
+            let inner = results_inner(&buf);
+            let bars: Vec<(String, Color)> = (inner.y..inner.bottom())
+                .map(|y| (buf[(inner.x, y)].symbol().to_string(), buf[(inner.x, y)].fg))
+                .collect();
+            // The group's rows and the rule between them carry the stripe; the
+            // rule after the group and the rows below it do not.
+            let item = ITEM_HEIGHT;
+            let group_rows = 2 * item - 1;
+            assert!(
+                bars[..group_rows]
+                    .iter()
+                    .all(|(b, c)| b == "▎" && *c == p.teal),
+                "{width}: {bars:?}"
+            );
+            assert!(
+                bars[group_rows..3 * item - 1].iter().all(|(b, _)| b == " "),
+                "{width}: {bars:?}"
+            );
+            // No header row: the first row is the first result's own header.
+            assert!(
+                row(&buf, inner.y).contains("Claude"),
+                "{}",
+                row(&buf, inner.y)
+            );
+            // The count sits on the existing border, in the group's wording.
+            let bottom = row(&buf, inner.bottom());
+            assert!(bottom.contains("◉ 2 focus running"), "{width}: {bottom}");
+            assert!(bottom.contains("5/5"), "{width}: {bottom}");
+        }
+        // Selecting a grouped row shows the selection bar, not the stripe.
+        state.selected = 0;
+        let buf = render(&mut state, &Themed(p), 120, 60);
+        let inner = results_inner(&buf);
+        assert_eq!(buf[(inner.x, inner.y)].symbol(), "▌");
+        // Nothing prioritized: no stripe and no count.
+        state.prioritized = 0;
+        state.selected = 4;
+        let buf = render(&mut state, &Themed(p), 120, 60);
+        let inner = results_inner(&buf);
+        assert_eq!(buf[(inner.x, inner.y)].symbol(), " ");
+        assert!(!row(&buf, inner.bottom()).contains('◉'));
+    }
+
+    #[test]
+    fn a_changed_conversation_previews_as_loading_not_as_an_error() {
+        let temp = TempDir::new("ui-preview-loading").unwrap();
+        let (_store, mut state) = searched(&temp);
+        state.preview_stale = true;
+        for width in [120, 40] {
+            let buf = render(&mut state, &Standalone, width, 40);
+            let text: String = (0..40).map(|y| row(&buf, y)).collect::<Vec<_>>().join("\n");
+            assert!(text.contains("Loading conversation…"), "{text}");
+            assert!(!text.contains("unavailable"), "{text}");
+            assert!(!text.contains("stale"), "{text}");
+            let (x, y) = find(&buf, "Loading").unwrap();
+            assert_ne!(buf[(x, y)].fg, Palette::terminal().error().fg.unwrap());
+        }
     }
 
     #[test]

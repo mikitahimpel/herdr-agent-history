@@ -143,7 +143,7 @@ pub fn preview_source<S: IndexStore>(
     })
 }
 fn stale() -> CoreError {
-    CoreError::Unsupported("source generation is stale; index again".into())
+    CoreError::StaleSource
 }
 fn sanitize(s: &str) -> String {
     s.chars()

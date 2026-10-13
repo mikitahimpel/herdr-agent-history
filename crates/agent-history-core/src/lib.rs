@@ -12,8 +12,8 @@ pub mod query;
 pub mod storage;
 pub mod test_support;
 pub use contracts::{
-    AgentAdapter, CoreError, GitContextProvider, IndexBatch, IndexStore, Result, SessionResumer,
-    Store,
+    AgentAdapter, CoreError, GitContextProvider, IndexBatch, IndexStore, Priorities, Result,
+    ResultPrioritizer, SessionResumer, Store,
 };
 pub use domain::*;
 pub use git::{git_command, GitContextResolver, INHERITED_GIT_ENVIRONMENT};

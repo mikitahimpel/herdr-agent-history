@@ -1,9 +1,10 @@
 //! Disposable local SQLite index. Native transcript files are never written here.
 use crate::{
-    Agent, CoreError, GitOrigin, GitProvenance, IndexBatch, IndexedFile, Result, SearchOutcome,
-    SearchResult, Session, SessionId, SessionRecord, Store,
+    Agent, CoreError, GitOrigin, GitProvenance, IndexBatch, IndexedFile, Priorities, Result,
+    SearchOutcome, SearchResult, Session, SessionId, SessionRecord, Store, Widening,
 };
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
@@ -320,12 +321,30 @@ impl SqliteStore {
         limit: usize,
         kind: Option<crate::EventKind>,
     ) -> Result<SearchOutcome> {
+        self.search_prioritized(query, limit, kind, &Priorities::default())
+    }
+
+    /// [`Self::search_with_fallback`], with each prioritized session's best
+    /// match placed ahead of the ordinary results (see [`Priorities`]).
+    ///
+    /// The prioritized matches come from their own query, so a session is
+    /// surfaced however far down relevance alone would rank it. Whether the
+    /// near-match retry runs is decided by the ordinary results alone, and
+    /// both parts then use the same expression: an exact match elsewhere is
+    /// never displaced by a prioritized near match, and a prioritized match is
+    /// never exact while the rest are approximate. `limit` bounds the whole
+    /// list. Without priorities this is one query, as it always was.
+    pub fn search_prioritized(
+        &self,
+        query: &str,
+        limit: usize,
+        kind: Option<crate::EventKind>,
+        priorities: &Priorities,
+    ) -> Result<SearchOutcome> {
         let results = self.search_with_role(query, limit, kind)?;
         if !results.is_empty() || query.trim().is_empty() || limit == 0 {
-            return Ok(SearchOutcome {
-                results,
-                widened: Vec::new(),
-            });
+            let exact = || crate::query::fts_match_expression(query);
+            return self.lift(results, exact, limit, kind, priorities, Vec::new());
         }
         let Some((expression, widened)) =
             crate::query::lenient_match_expression(query, |word| self.near_words(word))?
@@ -336,7 +355,131 @@ impl SqliteStore {
         if results.is_empty() {
             return Ok(SearchOutcome::default());
         }
-        Ok(SearchOutcome { results, widened })
+        self.lift(results, || expression, limit, kind, priorities, widened)
+    }
+
+    /// Places the best match of each prioritized session before `results`,
+    /// which drop those rows and are cut so the whole list fits `limit`.
+    /// `expression` is built only when there is something to lift.
+    fn lift(
+        &self,
+        mut results: Vec<SearchResult>,
+        expression: impl FnOnce() -> String,
+        limit: usize,
+        kind: Option<crate::EventKind>,
+        priorities: &Priorities,
+        widened: Vec<Widening>,
+    ) -> Result<SearchOutcome> {
+        if priorities.is_empty() || results.is_empty() {
+            return Ok(SearchOutcome {
+                results,
+                widened,
+                prioritized: 0,
+            });
+        }
+        let mut lifted = self.best_prioritized(&expression(), limit, kind, priorities)?;
+        let prioritized = lifted.len();
+        results.retain(|r| !lifted.iter().any(|l| l.source == r.source));
+        results.truncate(limit.min(MAX_LIMIT).saturating_sub(prioritized));
+        lifted.append(&mut results);
+        Ok(SearchOutcome {
+            results: lifted,
+            widened,
+            prioritized,
+        })
+    }
+
+    /// The best-ranked matching chunk of each prioritized session, ordered by
+    /// group, then rank. Ties within a session go to the earliest chunk, and
+    /// ties between sessions to the session order of the ordinary search.
+    ///
+    /// The first query reads only chunk IDs and scores, so snippets are made
+    /// for the chosen rows alone. Each session's best row is picked here
+    /// rather than in SQL: `bm25` is unavailable inside window functions and
+    /// aggregate subqueries. `CROSS JOIN` keeps the full-text scan outermost:
+    /// left to itself, the planner may start from the prioritized sessions and
+    /// run a full-text lookup per chunk, which measured up to a hundred times
+    /// slower on a real index.
+    fn best_prioritized(
+        &self,
+        expression: &str,
+        limit: usize,
+        kind: Option<crate::EventKind>,
+        priorities: &Priorities,
+    ) -> Result<Vec<SearchResult>> {
+        let sessions: Vec<_> = priorities.ordered().into_iter().take(MAX_LIMIT).collect();
+        let values = vec!["(?,?,?)"; sessions.len()].join(",");
+        let sql = format!(
+            "WITH p(agent,native_id,grp) AS (VALUES {values}) \
+             SELECT c.rowid, p.grp, bm25(chunks_fts), c.agent, c.native_id, c.ordinal \
+             FROM chunks_fts CROSS JOIN search_chunks c ON c.rowid=chunks_fts.rowid CROSS JOIN p ON p.agent=c.agent AND p.native_id=c.native_id \
+             WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?)"
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(sessions.len() * 3 + 3);
+        for (id, group) in &sessions {
+            params.push(agent_i(id.agent).into());
+            params.push(id.native_id.clone().into());
+            params.push(i64::from(*group).into());
+        }
+        let role = role_param(kind);
+        params.extend([expression.to_string().into(), role.clone(), role]);
+        struct Candidate {
+            id: i64,
+            group: i64,
+            score: f64,
+            agent: i64,
+            native_id: String,
+            ordinal: i64,
+        }
+        let key = |c: &Candidate| (c.score, c.ordinal);
+        let mut best: HashMap<(i64, String), Candidate> = HashMap::new();
+        let mut st = self.conn.prepare_cached(&sql)?;
+        let mut rows = st.query(rusqlite::params_from_iter(params))?;
+        while let Some(r) = rows.next()? {
+            let c = Candidate {
+                id: r.get(0)?,
+                group: r.get(1)?,
+                score: r.get(2)?,
+                agent: r.get(3)?,
+                native_id: r.get(4)?,
+                ordinal: r.get(5)?,
+            };
+            match best.entry((c.agent, c.native_id.clone())) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if key(&c) < key(e.get()) {
+                        e.insert(c);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(c);
+                }
+            }
+        }
+        let mut chosen: Vec<Candidate> = best.into_values().collect();
+        chosen.sort_by(|a, b| {
+            a.group
+                .cmp(&b.group)
+                .then(a.score.total_cmp(&b.score))
+                .then(a.agent.cmp(&b.agent))
+                .then_with(|| a.native_id.cmp(&b.native_id))
+        });
+        chosen.truncate(limit.min(MAX_LIMIT));
+        let ids: Vec<i64> = chosen.iter().map(|c| c.id).collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows = self.search_rows(
+            &format!(
+                "AND c.rowid IN ({}) ORDER BY c.rowid",
+                vec!["?"; ids.len()].join(",")
+            ),
+            expression,
+            kind,
+            ids.iter().map(|&id| id.into()).collect(),
+        )?;
+        let order: HashMap<i64, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+        rows.sort_by_key(|(id, _)| order.get(id).copied().unwrap_or(usize::MAX));
+        Ok(rows.into_iter().map(|(_, r)| r).collect())
     }
 
     /// `None` when `word` is itself indexed; otherwise the indexed words near it.
@@ -387,12 +530,35 @@ impl SqliteStore {
         role: Option<crate::EventKind>,
     ) -> Result<Vec<SearchResult>> {
         let limit = limit.min(MAX_LIMIT);
-        let mut st=self.conn.prepare("SELECT c.agent,c.native_id,s.repository,s.branch,s.cwd,c.timestamp,c.kind,c.source_path,c.source_file_id,c.source_generation,c.source_start,c.source_end,snippet(chunks_fts,0,'','', ' … ', 24),s.repository_url,s.git_origin FROM chunks_fts JOIN search_chunks c ON c.rowid=chunks_fts.rowid JOIN sessions s ON s.agent=c.agent AND s.native_id=c.native_id WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?) ORDER BY bm25(chunks_fts),c.agent,c.native_id,c.ordinal LIMIT ?")?;
+        let rows = self.search_rows(
+            "ORDER BY bm25(chunks_fts),c.agent,c.native_id,c.ordinal LIMIT ?",
+            expression,
+            role,
+            vec![(limit as i64).into()],
+        )?;
+        Ok(rows.into_iter().map(|(_, r)| r).collect())
+    }
+
+    /// Matching chunks with their chunk IDs. `tail` follows the shared
+    /// `WHERE` clause and binds `extra` after its parameters.
+    fn search_rows(
+        &self,
+        tail: &str,
+        expression: &str,
+        role: Option<crate::EventKind>,
+        extra: Vec<rusqlite::types::Value>,
+    ) -> Result<Vec<(i64, SearchResult)>> {
+        let sql = format!("SELECT c.agent,c.native_id,s.repository,s.branch,s.cwd,c.timestamp,c.kind,c.source_path,c.source_file_id,c.source_generation,c.source_start,c.source_end,snippet(chunks_fts,0,'','', ' … ', 24),s.repository_url,s.git_origin,c.rowid FROM chunks_fts JOIN search_chunks c ON c.rowid=chunks_fts.rowid JOIN sessions s ON s.agent=c.agent AND s.native_id=c.native_id WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?) {tail}");
+        let mut st = self.conn.prepare_cached(&sql)?;
+        let role = role_param(role);
+        let mut params: Vec<rusqlite::types::Value> =
+            vec![expression.to_string().into(), role.clone(), role];
+        params.extend(extra);
         let rows = st
-            .query_map(
-                params![expression, role.map(kind_i), role.map(kind_i), limit as i64],
-                |r| {
-                    Ok(SearchResult {
+            .query_map(rusqlite::params_from_iter(params), |r| {
+                Ok((
+                    r.get::<_, i64>(15)?,
+                    SearchResult {
                         session_id: SessionId::new(agent_from(r.get(0)?)?, r.get::<_, String>(1)?),
                         agent: agent_from(r.get(0)?)?,
                         repository: r.get(2)?,
@@ -410,12 +576,16 @@ impl SqliteStore {
                         )
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
                         snippet: r.get(12)?,
-                    })
-                },
-            )?
+                    },
+                ))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+}
+
+fn role_param(role: Option<crate::EventKind>) -> rusqlite::types::Value {
+    role.map_or(rusqlite::types::Value::Null, |k| kind_i(k).into())
 }
 
 /// The smallest string greater than every string starting with `prefix`, in
@@ -1334,5 +1504,244 @@ mod tests {
         )
         .unwrap();
         assert!(SqliteStore::open(&p).is_err());
+    }
+
+    /// One session per entry, each with the given chunks in order.
+    fn sessions_fixture(
+        name: &str,
+        sessions: &[(&str, &[&str])],
+    ) -> (crate::test_support::TempDir, SqliteStore) {
+        let dir = crate::test_support::TempDir::new(name).unwrap();
+        let mut db = SqliteStore::open(dir.path().join("private/index.sqlite")).unwrap();
+        for (n, (native, texts)) in sessions.iter().enumerate() {
+            let file = 10 + n as u64;
+            let s = session(Agent::Claude, native, file, 1);
+            let chunks = texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| chunk(&s.id, file, 1, i as u64, t))
+                .collect();
+            db.commit_batch(IndexBatch {
+                sessions: vec![s.into()],
+                chunks,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        (dir, db)
+    }
+
+    fn sid(native: &str) -> SessionId {
+        SessionId::new(Agent::Claude, native)
+    }
+
+    fn natives(results: &[SearchResult]) -> Vec<&str> {
+        results
+            .iter()
+            .map(|r| r.session_id.native_id.as_str())
+            .collect()
+    }
+
+    /// Five sessions that say "deploy" plainly, and one, `quiet`, that only
+    /// mentions it in passing, so relevance ranks it last.
+    fn deploy_fixture(name: &str) -> (crate::test_support::TempDir, SqliteStore) {
+        sessions_fixture(
+            name,
+            &[
+                ("a", &["deploy deploy now", "unrelated words"]),
+                ("b", &["deploy deploy again"]),
+                ("c", &["deploy deploy today"]),
+                ("d", &["deploy deploy staging"]),
+                ("e", &["deploy deploy production"]),
+                (
+                    "quiet",
+                    &[
+                        "a long note about the weather, lunch, trains, music and, once, deploy",
+                        "the rate-limit middleware",
+                    ],
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn without_priorities_search_is_unchanged() {
+        let (_dir, db) = deploy_fixture("storage-priority-none");
+        let none = Priorities::default();
+        for (query, kind) in [
+            ("deploy", None),
+            ("deploy", Some(crate::EventKind::User)),
+            ("deploy", Some(crate::EventKind::Assistant)),
+            ("rate-limit", None),
+            ("deplyo", None),
+            ("", None),
+        ] {
+            let plain = db.search_with_fallback(query, 3, kind).unwrap();
+            let prioritized = db.search_prioritized(query, 3, kind, &none).unwrap();
+            assert_eq!(prioritized, plain, "{query:?}");
+            assert_eq!(prioritized.prioritized, 0);
+            if !plain.is_approximate() {
+                assert_eq!(plain.results, db.search_with_role(query, 3, kind).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn priorities_without_a_match_change_nothing() {
+        let (_dir, db) = deploy_fixture("storage-priority-unmatched");
+        // `a` is indexed but does not mention the weather; `ghost` is not indexed.
+        for priorities in [
+            Priorities::from_iter([(sid("ghost"), 0)]),
+            Priorities::from_iter([(sid("a"), 0), (sid("ghost"), 1)]),
+        ] {
+            for query in ["deploy", "weather", "wether"] {
+                let plain = db.search_with_fallback(query, 3, None).unwrap();
+                assert!(!plain.results.is_empty(), "{query:?}");
+                let outcome = db.search_prioritized(query, 3, None, &priorities).unwrap();
+                if query == "deploy" && priorities.group(&sid("a")).is_some() {
+                    // `a` matches "deploy", so it is lifted; nothing else moves.
+                    assert_eq!(outcome.prioritized, 1);
+                    continue;
+                }
+                assert_eq!(outcome, plain, "{query:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_prioritized_session_ranked_past_the_limit_comes_first() {
+        let (_dir, db) = deploy_fixture("storage-priority-cut");
+        let plain = db.search_with_role("deploy", 3, None).unwrap();
+        assert!(!natives(&plain).contains(&"quiet"), "{:?}", natives(&plain));
+        let outcome = db
+            .search_prioritized(
+                "deploy",
+                3,
+                None,
+                &Priorities::from_iter([(sid("quiet"), 0)]),
+            )
+            .unwrap();
+        assert_eq!(outcome.prioritized, 1);
+        assert_eq!(outcome.results.len(), 3, "the limit bounds the whole list");
+        assert_eq!(natives(&outcome.results)[0], "quiet");
+        assert!(outcome.results[0].snippet.contains("deploy"));
+        assert_eq!(outcome.results[1..], plain[..2]);
+    }
+
+    #[test]
+    fn a_prioritized_session_contributes_its_best_match_once() {
+        let (_dir, db) = sessions_fixture(
+            "storage-priority-best",
+            &[
+                (
+                    "busy",
+                    &["cache once", "cache cache cache", "cache twice cache"],
+                ),
+                ("other", &["cache cache", "more cache"]),
+            ],
+        );
+        let plain = db.search_with_role("cache", 50, None).unwrap();
+        let outcome = db
+            .search_prioritized(
+                "cache",
+                50,
+                None,
+                &Priorities::from_iter([(sid("busy"), 0)]),
+            )
+            .unwrap();
+        assert_eq!(outcome.prioritized, 1);
+        assert_eq!(outcome.results[0].snippet, "cache cache cache");
+        // The rest keep relevance order, without the lifted row repeated, and
+        // still include the prioritized session's other matches.
+        let rest: Vec<_> = plain
+            .iter()
+            .filter(|r| r.source != outcome.results[0].source)
+            .cloned()
+            .collect();
+        assert_eq!(outcome.results[1..], rest[..]);
+        assert_eq!(outcome.results.len(), plain.len());
+    }
+
+    #[test]
+    fn prioritized_sessions_order_by_group_then_relevance_then_id() {
+        let (_dir, db) = sessions_fixture(
+            "storage-priority-ties",
+            &[
+                ("strong", &["merge merge merge conflict"]),
+                (
+                    "weak",
+                    &["merge, after a long discussion of other matters entirely"],
+                ),
+                ("twin-b", &["merge conflict"]),
+                ("twin-a", &["merge conflict"]),
+                ("plain", &["merge merge merge merge"]),
+            ],
+        );
+        let same = Priorities::from_iter([
+            (sid("weak"), 0),
+            (sid("strong"), 0),
+            (sid("twin-b"), 0),
+            (sid("twin-a"), 0),
+        ]);
+        let outcome = db.search_prioritized("merge", 50, None, &same).unwrap();
+        assert_eq!(outcome.prioritized, 4);
+        // Equal scores fall back to the session ID, as the ordinary search does.
+        assert_eq!(
+            natives(&outcome.results),
+            ["strong", "twin-a", "twin-b", "weak", "plain"]
+        );
+        // A lower group comes first however weak its match.
+        let groups = Priorities::from_iter([(sid("weak"), 0), (sid("strong"), 1)]);
+        let outcome = db.search_prioritized("merge", 50, None, &groups).unwrap();
+        assert_eq!(outcome.prioritized, 2);
+        assert_eq!(natives(&outcome.results)[..2], ["weak", "strong"]);
+        // A session given twice keeps its lowest group.
+        let twice =
+            Priorities::from_iter([(sid("strong"), 3), (sid("weak"), 1), (sid("strong"), 0)]);
+        assert_eq!(twice.group(&sid("strong")), Some(0));
+        let outcome = db.search_prioritized("merge", 50, None, &twice).unwrap();
+        assert_eq!(natives(&outcome.results)[..2], ["strong", "weak"]);
+    }
+
+    #[test]
+    fn near_match_fallback_is_decided_by_the_ordinary_results() {
+        let (_dir, db) = sessions_fixture(
+            "storage-priority-fallback",
+            &[
+                ("exact", &["the database migration"]),
+                ("near", &["a databse typo"]),
+                ("live", &["another databse typo", "the rate-limit header"]),
+            ],
+        );
+        let live = Priorities::from_iter([(sid("live"), 0)]);
+        // An exact match elsewhere means no retry: the prioritized session's near
+        // match does not displace it, and nothing is lifted.
+        let outcome = db.search_prioritized("database", 50, None, &live).unwrap();
+        assert!(!outcome.is_approximate());
+        assert_eq!(outcome.prioritized, 0);
+        assert_eq!(natives(&outcome.results), ["exact"]);
+        // Only near matches: both parts use the widened expression, the
+        // prioritized one comes first, and the outcome says it is approximate.
+        let outcome = db.search_prioritized("databsee", 50, None, &live).unwrap();
+        assert_eq!(
+            outcome.approximation().as_deref(),
+            Some("databsee → databse, database, databsee*")
+        );
+        assert_eq!(outcome.prioritized, 1);
+        assert_eq!(natives(&outcome.results)[0], "live");
+        let mut rest = natives(&outcome.results[1..]);
+        rest.sort_unstable();
+        assert_eq!(rest, ["exact", "near"]);
+        // Punctuation stays literal: `rate-limit` is the phrase `rate limit`.
+        let outcome = db
+            .search_prioritized("rate-limit", 50, None, &live)
+            .unwrap();
+        assert_eq!(outcome.prioritized, 1);
+        assert_eq!(outcome.results.len(), 1);
+        assert!(db
+            .search_prioritized("limit-rate", 50, None, &live)
+            .unwrap()
+            .results
+            .is_empty());
     }
 }

@@ -131,6 +131,10 @@ pub struct SearchOutcome {
     /// Empty when `results` match the query exactly as typed. Otherwise the
     /// results are near matches and each entry is a word that was widened.
     pub widened: Vec<Widening>,
+    /// How many leading `results` are prioritized sessions' best matches (see
+    /// [`crate::Priorities`]); zero when the search had no priorities.
+    #[serde(default)]
+    pub prioritized: usize,
 }
 impl SearchOutcome {
     pub fn is_approximate(&self) -> bool {

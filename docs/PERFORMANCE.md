@@ -290,3 +290,51 @@ No thread or process outlives the browser. Closing it stops and joins the scan t
 - The live corpus grew during measurement, so "before" and "after" trials had slightly different amounts of new history (about 4,600–6,500 records). Before/after PTY runs of the same kind were run back to back to keep this small. The difference is far smaller than the effect.
 - The header shows only checked/total files during the scan. The byte, record and chunk counts of the old full-screen progress box are no longer displayed, although the core still reports them.
 - A file whose source changes while it is read (an active session appending) fails that attempt with `source changed during indexing; retry` and is retried next launch. This existing behaviour occurred in both modes during these runs and is reported in the status line. Since #41 such a file is counted as *deferred*, not failed: it commits nothing, is not listed as an error, does not make `agent-history index` exit non-zero, and is read again by the next scan from its last committed offset.
+
+## Result priority (#44)
+
+`SqliteStore::search_prioritized` lifts the best match of each prioritized session (in Herdr, each running session) ahead of the ordinary results. Those matches come from a second query restricted to the prioritized sessions, so a session ranked past the `LIMIT` still appears. With no priorities, which is every standalone search, the code runs the same single query as before and builds nothing extra. See [MODULES.md](MODULES.md#result-priority-44) for the boundary.
+
+### Reproduce
+
+```sh
+copy="$(mktemp -d)/index.sqlite"; chmod 700 "$(dirname "$copy")"
+sqlite3 "$HOME/Library/Application Support/Herdr Agent History/index.sqlite" ".backup '$copy'"
+cargo run --release --locked -p agent-history-core --example search_latency -- "$copy"
+rm -rf "$(dirname "$copy")"
+```
+
+`search_latency` now also prints `exact_prioritized` and `misspelled_prioritized`. These repeat the fallback sets with the `PRIORITIZED` (default 3) sessions that have the most chunks prioritized. That is the worst case, because the extra query's cost follows the prioritized sessions' matches. `lifted` counts the rows placed first. For the comparison, "before" is `main` at `ed64086`, built from a separate worktree, and "after" is this change. Both were built with rustc 1.98.1 and run alternately on an Apple M1 (macOS 26.6.2) on 2026-10-12.
+
+**The machine was heavily shared during these runs: the load average was 430–480 throughout.** Absolute timings are therefore inflated and noisy, and only the alternating before/after comparison is meaningful. The ~15 ms p50 of earlier sections could not be reproduced under that load by either build.
+
+### Real index: 2,355 sessions, 21,823 chunks, five alternating rounds of 160 queries per set
+
+| Set | Before, p50 per round (ms) | After, p50 per round (ms) | Median p50 before → after | Median p95 before → after |
+| --- | --- | --- | --- | --- |
+| `exact` (`search_with_role`) | 12.0 / 23.1 / 44.8 / 24.0 / 28.6 | 29.9 / 22.2 / 28.1 / 22.1 / 22.4 | 24.0 → 22.4 | 102.1 → 99.7 |
+| `exact_via_fallback`, no priorities | 12.7 / 23.1 / 41.0 / 23.5 / 20.0 | 37.9 / 22.3 / 18.5 / 22.5 / 30.8 | 23.1 → 22.5 | 63.8 → 93.5 |
+| `misspelled_via_fallback`, no priorities | 104.6 / 109.5 / 116.4 / 105.0 / 109.8 | 120.6 / 102.6 / 88.2 / 105.4 / 211.4 | 109.5 → 105.4 | 376.9 → 440.7 |
+| `exact_prioritized`, 3 largest sessions | — | 38.8 / 34.0 / 37.0 / 34.0 / 37.1 | — → 37.0 | — → 173.3 |
+| `misspelled_prioritized`, 3 largest sessions | — | 105.1 / 169.2 / 107.7 / 108.6 / 123.8 | — → 108.6 | — → 301.7 |
+
+### Synthetic corpus: `benchmark` example, 200 warm queries, three alternating runs, no priorities
+
+| Measurement | Before | After |
+| --- | --- | --- |
+| p50 | 31.9 / 62.3 / 49.2 ms | 30.0 / 41.4 / 30.7 ms |
+| p95 | 58.0 / 133.7 / 121.1 ms | 107.1 / 77.1 / 58.0 ms |
+
+The after build was no slower in any round. The spread between rounds of the *same* build (31.9 to 62.3 ms) shows how much the load moved. Part of the gain may be real, because the shared row query is now prepared once through rusqlite's statement cache instead of on every search. Treat it as "unchanged or better", not as a speed-up.
+
+### Reading the numbers
+
+- **Without priorities, latency is unchanged.** Before and after overlap round by round on both corpora, and the medians differ by less than the spread between rounds. The p95 differences go both ways and follow the load.
+- **With priorities, an exact search costs one more full-text scan:** about +14 ms at the median here, with the three largest sessions prioritized. Every exact query lifted all three (`lifted=480` over 160 searches). A near-match search costs about the same with or without priorities, because reading the vocabulary dominates it.
+- **The first implementation was rejected by measurement.** It picked each session's best chunk with a window function over a materialized CTE (`bm25` cannot be used inside a window function directly). SQLite then planned the join from the prioritized sessions and ran a full-text lookup for each of their chunks: **p50 615 ms, p95 4.2 s**. The current query keeps the full-text scan outermost with `CROSS JOIN` and picks each session's best row in Rust. In the same session, that brought the extra query from 0.1–2 s to 5–15 ms.
+- Over-fetching (re-ranking a larger page) was not chosen. Any factor is a guess that still misses a session ranked past it, and it costs every search, prioritized or not. Pushing the priorities into the main query's `ORDER BY` would let one busy running session fill the whole page. Lifting one row per session keeps the group's size bounded by the number of prioritized sessions.
+
+### Limitations
+
+- One machine and one real corpus, under heavy unrelated load. Repeat on a quiet machine before quoting absolute numbers.
+- The worst case measured is three prioritized sessions. The extra query reads every match in the prioritized sessions, so its cost grows with how much those sessions say about the query, not with the size of the corpus.

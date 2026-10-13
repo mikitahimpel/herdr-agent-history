@@ -1,4 +1,5 @@
 use crate::domain::*;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -14,6 +15,10 @@ pub enum CoreError {
     /// was committed, and the next scan reads the file again from its last
     /// committed offset.
     SourceChanged,
+    /// The source no longer matches what the index recorded for it, usually
+    /// because it grew after the last scan. Indexing it again resolves this;
+    /// nothing is wrong with the source.
+    StaleSource,
 }
 impl fmt::Display for CoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -23,6 +28,7 @@ impl fmt::Display for CoreError {
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
             Self::Storage(s) => write!(f, "storage error: {s}"),
             Self::SourceChanged => write!(f, "source changed during indexing; retry"),
+            Self::StaleSource => write!(f, "source generation is stale; index again"),
         }
     }
 }
@@ -72,6 +78,57 @@ pub trait GitContextProvider {
 }
 pub trait SessionResumer {
     fn resume(&self, session: &Session, workspace: &Path) -> Result<()>;
+}
+/// Supplies knowledge core does not have about which sessions matter most
+/// right now, as [`Priorities`] for [`crate::SqliteStore::search_prioritized`].
+///
+/// Asked when the caller's view of the sessions changes, never per search:
+/// an implementation may query another process here, and the search path only
+/// reads the set it returned. That set can go stale before it is used, so
+/// nothing may act on a session merely because it was prioritized.
+pub trait ResultPrioritizer {
+    fn prioritize(&mut self, sessions: &[Session]) -> Priorities;
+}
+/// Caller-assigned groups that lift sessions above relevance order. Core never
+/// interprets a group: lower numbers come first, and that is all.
+///
+/// For each prioritized session with a matching chunk, its best match is placed
+/// ahead of the ordinary results, ordered by group and then by relevance. The
+/// ordinary results are what the same search returns without priorities. An
+/// empty set leaves search exactly as it is without one.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Priorities {
+    groups: HashMap<SessionId, u32>,
+}
+impl Priorities {
+    pub fn group(&self, id: &SessionId) -> Option<u32> {
+        self.groups.get(id).copied()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.groups.len()
+    }
+    /// Sessions by group, then by ID: the order a bounded query keeps them in.
+    pub fn ordered(&self) -> Vec<(&SessionId, u32)> {
+        let mut entries: Vec<_> = self.groups.iter().map(|(id, g)| (id, *g)).collect();
+        entries.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+        entries
+    }
+}
+impl FromIterator<(SessionId, u32)> for Priorities {
+    /// A session listed twice keeps its lowest group.
+    fn from_iter<I: IntoIterator<Item = (SessionId, u32)>>(iter: I) -> Self {
+        let mut groups = HashMap::new();
+        for (id, group) in iter {
+            groups
+                .entry(id)
+                .and_modify(|g: &mut u32| *g = (*g).min(group))
+                .or_insert(group);
+        }
+        Self { groups }
+    }
 }
 /// A transaction commits derived chunks and the last complete-record offset atomically.
 #[derive(Clone, Debug, Default)]
