@@ -338,3 +338,83 @@ The after build was no slower in any round. The spread between rounds of the *sa
 
 - One machine and one real corpus, under heavy unrelated load. Repeat on a quiet machine before quoting absolute numbers.
 - The worst case measured is three prioritized sessions. The extra query reads every match in the prioritized sessions, so its cost grows with how much those sessions say about the query, not with the size of the corpus.
+
+## Rescanning an unchanged history (#47)
+
+Every launch rescans the whole history, and almost every file in it is a finished
+transcript nobody will touch again. The cost of establishing that was the whole cost of
+a rescan. For each already-indexed file the scan used to query `indexed_files` for that
+one path — pulling `open_turn_state`, the checkpoint blob — parse that JSON, then open
+the file, read 4 KiB from each end, and SHA-256 both halves. The blobs alone are
+**37,821,819 bytes of JSON read and parsed per scan** on the corpus below (2,655 rows,
+mean 14,245 B), to conclude what `size`, `mtime`, and `ctime` had already said.
+
+The `stat` that was true when a file's last byte was committed is now recorded beside
+those byte offsets: `dev`, `ino`, `ctime`, `ctime_nsec`, and the checkpoint format, as
+columns on `indexed_files` (schema 5). A scan reads them all in one query and skips any
+file whose current `stat` matches and whose `committed_offset` equals its length. Such a
+file is never opened.
+
+### Why metadata is enough, and where it is not
+
+`ctime` carries the weight. The kernel sets it on every change to the inode, including a
+`utimes` call that puts `mtime` back, and no userspace interface can set it directly —
+so neither a rewrite, nor a restore from an archive that preserves `mtime`, nor a
+replacement inode can present the fingerprint of the file that was indexed. `dev`/`ino`
+catch the atomic-write shape, where a fresh file is renamed over the old name.
+`committed_offset` is what separates an untouched file from one indexed only as far as
+an incomplete trailing record, which is how a live transcript looks mid-write.
+
+What remains is resolution. Two versions of a file collide if they share a length and
+both timestamps land in the same tick. APFS stores both to the nanosecond —
+consecutive writes in a directory measured roughly 100 µs apart — so this needs two
+writes of equal length within the same nanosecond. A filesystem with one-second
+timestamps would make it reachable, which matters only for a history kept somewhere
+other than a Mac's own disk.
+
+The content hash is kept for the case it is actually load-bearing: resuming an appended
+file, where the prefix must be proven unchanged before reading from the old offset.
+
+### Measurement
+
+Corpus: 2,646 real JSONL files, 12,140,622,551 bytes (11.31 GiB) from `~/.claude` and
+`~/.codex`, on an Apple M1. The before/after pair below runs both binaries against
+their own copy of the same populated index, alternating, so neither gets a warmer cache
+than the other.
+
+| Measurement | Before | After |
+| --- | --- | --- |
+| Rescan, nothing changed (6 alternating runs each) | **0.22 s** median (0.22 in 7 of 8; 0.32 once) | **0.03 s** median (0.03 in 6 of 8; 0.14 once) |
+| Initial index, cold, 2,646 files / 11.31 GiB | 81,100 ms, peak RSS 110.5 MiB | 80,140 ms, peak RSS 107.6 MiB |
+| Checkpoint JSON read per settled rescan | 37,821,819 B | 0 B |
+| Transcript bytes read per settled rescan | 21.7 MB (8 KiB × 2,646) | 0 B |
+| Sessions / chunks / files in the result | 2,363 / 23,202 / 2,655 | identical, and the same top results for the same query |
+
+`scripts/measure-real-corpus` gained a phase B2 that reports this directly: phase B
+absorbs whatever changed since phase A, and phase B2 repeats the scan immediately, so
+it measures only the decision. On the run above it was **30 ms**, with all 2,646 files reported unchanged and 0 bytes read.
+
+### Reading the numbers
+
+- **The initial index is unchanged**, as it must be: nothing here changes how a file is
+  parsed, only how a scan decides whether to parse it. The difference between the two
+  runs is load, not code.
+- **The result is equivalent, not merely similar.** Both indexes hold the same sessions,
+  the same chunks, and return identical top results for the same query.
+- **An existing index is not reparsed.** The migration adds five nullable columns; a row
+  without them takes the old comparison once, and the scan records its fingerprint when
+  it finds the file unchanged. One slower scan after the upgrade, then the cheap path
+  forever. On this corpus that scan backfilled all 2,646 rows.
+- **What is left is mostly not the scan.** A cold `status` against this database — spawn
+  the process, open SQLite, no query — was measured at a median of 10.5 ms. The settled
+  rescan is roughly that plus the walk, one `stat` per file, and one query.
+
+### Limitations
+
+- One machine, one real corpus, and a corpus with live sessions appending to it: the
+  "unchanged" count moves between runs, and phase B's record count shows how much.
+  Compare it against phase B2's before reading either timing.
+- Timestamp resolution is a filesystem property, measured here on APFS only.
+- The first index of a large history still dominates everything else at over a minute.
+  Parsing is single-threaded and CPU-bound; parallelising it across cores is the obvious
+  next step and is not attempted here.

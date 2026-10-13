@@ -17,7 +17,7 @@ pub(crate) fn discover_jsonl_until(
             continue;
         }
         // A single inaccessible directory must not hide sessions below other roots.
-        let _ = walk(root, &mut paths, stop);
+        let _ = walk(root, None, &mut paths, stop);
     }
     paths.sort();
     paths.dedup();
@@ -32,23 +32,34 @@ pub(crate) fn discover_jsonl_until(
         })
         .collect()
 }
-fn walk(path: &Path, out: &mut Vec<PathBuf>, stop: &AtomicBool) -> Result<()> {
+/// `kind` is the type a parent's `read_dir` already reported for `path`, which saves
+/// the `stat` this would otherwise need; only a root arrives without one. A directory
+/// entry whose type the platform withholds is stat'ed as before.
+fn walk(
+    path: &Path,
+    kind: Option<fs::FileType>,
+    out: &mut Vec<PathBuf>,
+    stop: &AtomicBool,
+) -> Result<()> {
     if stop.load(Ordering::Relaxed) {
         return Ok(());
     }
-    let meta = fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() {
+    let kind = match kind {
+        Some(kind) => kind,
+        None => fs::symlink_metadata(path)?.file_type(),
+    };
+    if kind.is_symlink() {
         return Ok(());
     }
-    if meta.is_file() {
+    if kind.is_file() {
         if path.extension().and_then(|x| x.to_str()) == Some("jsonl") {
             out.push(path.to_path_buf());
         }
         return Ok(());
     }
-    if meta.is_dir() {
+    if kind.is_dir() {
         for entry in fs::read_dir(path)?.flatten() {
-            let _ = walk(&entry.path(), out, stop);
+            let _ = walk(&entry.path(), entry.file_type().ok(), out, stop);
         }
     }
     Ok(())
