@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const VERSION: i32 = 5;
+const VERSION: i32 = 6;
 const MAX_LIMIT: usize = 1000;
 /// Location of the shared index below `$HOME`. The directory name predates the
 /// standalone/Herdr split and is kept so existing installations keep their data;
@@ -126,6 +126,14 @@ impl SqliteStore {
         Ok(())
     }
     fn migrate(&mut self) -> Result<()> {
+        // `search_chunks` rows carry the chunk text, which averages a couple of
+        // kilobytes. Ranking a one-word query matches thousands of chunks, and
+        // the search reads a handful of narrow columns from each before the
+        // `LIMIT` applies -- through the row, so every match dragged its text
+        // through the page cache. This index carries those columns instead, so
+        // that phase reads about a megabyte where it used to read tens. It is
+        // worth roughly 4.5 MB on an index of 23k chunks.
+        const INDEX_DDL: &str = "CREATE INDEX chunks_meta ON search_chunks(rowid, kind, agent, native_id, ordinal, timestamp, source_path, source_file_id, source_generation, source_start, source_end);";
         // A never-populated database is the only moment auto-vacuum can be enabled without
         // rewriting the file, so claim it before any table exists.
         if self
@@ -185,8 +193,14 @@ impl SqliteStore {
                 PRAGMA user_version=5;",
             )?;
         }
+        if (2..=5).contains(&version) {
+            // Every column the search reads except the chunk text, so ranking a
+            // match never touches the row it came from. See the index's comment
+            // beside the schema.
+            tx.execute_batch(&format!("{INDEX_DDL} PRAGMA user_version=6;"))?;
+        }
         if version == 0 {
-            tx.execute_batch("\
+            tx.execute_batch(&format!("\
                 CREATE TABLE sessions (agent INTEGER NOT NULL, native_id TEXT NOT NULL, source_path TEXT NOT NULL, source_file_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_start INTEGER NOT NULL DEFAULT 0, source_end INTEGER NOT NULL DEFAULT 0, cwd TEXT, repository TEXT, repository_root TEXT, worktree TEXT, branch TEXT, commit_hash TEXT, started_at INTEGER, ended_at INTEGER, git_observed_at INTEGER, git_origin INTEGER CHECK(git_origin IS NULL OR git_origin IN (0,1)), repository_url TEXT, PRIMARY KEY(agent,native_id));
                 CREATE TABLE indexed_files (path TEXT PRIMARY KEY, file_id INTEGER NOT NULL, generation INTEGER NOT NULL, committed_offset INTEGER NOT NULL, size INTEGER NOT NULL, modified INTEGER, open_turn_state BLOB, dev INTEGER, ino INTEGER, ctime INTEGER, ctime_nsec INTEGER, checkpoint_format INTEGER);
                 CREATE TABLE search_chunks (rowid INTEGER PRIMARY KEY, agent INTEGER NOT NULL, native_id TEXT NOT NULL, ordinal INTEGER NOT NULL, timestamp INTEGER, kind INTEGER NOT NULL CHECK(kind IN (0,1)), source_path TEXT NOT NULL, source_file_id INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_start INTEGER NOT NULL, source_end INTEGER NOT NULL, text TEXT NOT NULL, FOREIGN KEY(agent,native_id) REFERENCES sessions(agent,native_id) ON DELETE CASCADE, UNIQUE(agent,native_id,source_file_id,source_generation,ordinal));
@@ -194,7 +208,8 @@ impl SqliteStore {
                 CREATE TRIGGER chunks_ai AFTER INSERT ON search_chunks BEGIN INSERT INTO chunks_fts(rowid,text) VALUES (new.rowid,new.text); END;
                 CREATE TRIGGER chunks_ad AFTER DELETE ON search_chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES ('delete',old.rowid,old.text); END;
                 CREATE TRIGGER chunks_au AFTER UPDATE ON search_chunks BEGIN INSERT INTO chunks_fts(chunks_fts,rowid,text) VALUES ('delete',old.rowid,old.text); INSERT INTO chunks_fts(rowid,text) VALUES (new.rowid,new.text); END;
-                PRAGMA user_version=5;")?;
+                {INDEX_DDL}
+                PRAGMA user_version=6;"))?;
         }
         tx.commit()?;
         if version != 0 && version != VERSION {
@@ -446,12 +461,7 @@ impl SqliteStore {
     ) -> Result<Vec<SearchResult>> {
         let sessions: Vec<_> = priorities.ordered().into_iter().take(MAX_LIMIT).collect();
         let values = vec!["(?,?,?)"; sessions.len()].join(",");
-        let sql = format!(
-            "WITH p(agent,native_id,grp) AS (VALUES {values}) \
-             SELECT c.rowid, p.grp, bm25(chunks_fts), c.agent, c.native_id, c.ordinal \
-             FROM chunks_fts CROSS JOIN search_chunks c ON c.rowid=chunks_fts.rowid CROSS JOIN p ON p.agent=c.agent AND p.native_id=c.native_id \
-             WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?)"
-        );
+        let sql = prioritized_sql(&values);
         let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(sessions.len() * 3 + 3);
         for (id, group) in &sessions {
             params.push(agent_i(id.agent).into());
@@ -585,7 +595,7 @@ impl SqliteStore {
         role: Option<crate::EventKind>,
         extra: Vec<rusqlite::types::Value>,
     ) -> Result<Vec<(i64, SearchResult)>> {
-        let sql = format!("SELECT c.agent,c.native_id,s.repository,s.branch,s.cwd,c.timestamp,c.kind,c.source_path,c.source_file_id,c.source_generation,c.source_start,c.source_end,snippet(chunks_fts,0,'','', ' … ', 24),s.repository_url,s.git_origin,c.rowid FROM chunks_fts JOIN search_chunks c ON c.rowid=chunks_fts.rowid JOIN sessions s ON s.agent=c.agent AND s.native_id=c.native_id WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?) {tail}");
+        let sql = search_sql(tail);
         let mut st = self.conn.prepare_cached(&sql)?;
         let role = role_param(role);
         let mut params: Vec<rusqlite::types::Value> =
@@ -619,6 +629,28 @@ impl SqliteStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+}
+
+/// The ranked search. `tail` follows the shared `WHERE` clause.
+///
+/// `INDEXED BY` is load-bearing: the planner reaches a `rowid=?` row through
+/// the primary key however wide that row is, and these rows carry the chunk
+/// text. Ranking reads a few narrow columns from every match before the
+/// `LIMIT`, so without the hint each match drags its text through the page
+/// cache -- seconds for a common word on a real index.
+fn search_sql(tail: &str) -> String {
+    format!("SELECT c.agent,c.native_id,s.repository,s.branch,s.cwd,c.timestamp,c.kind,c.source_path,c.source_file_id,c.source_generation,c.source_start,c.source_end,snippet(chunks_fts,0,'','', ' … ', 24),s.repository_url,s.git_origin,c.rowid FROM chunks_fts JOIN search_chunks c INDEXED BY chunks_meta ON c.rowid=chunks_fts.rowid JOIN sessions s ON s.agent=c.agent AND s.native_id=c.native_id WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?) {tail}")
+}
+
+/// The prioritized sessions' own query; `values` holds its `(?,?,?)` rows.
+/// Hinted for the same reason as [`search_sql`].
+fn prioritized_sql(values: &str) -> String {
+    format!(
+        "WITH p(agent,native_id,grp) AS (VALUES {values}) \
+         SELECT c.rowid, p.grp, bm25(chunks_fts), c.agent, c.native_id, c.ordinal \
+         FROM chunks_fts CROSS JOIN search_chunks c INDEXED BY chunks_meta ON c.rowid=chunks_fts.rowid CROSS JOIN p ON p.agent=c.agent AND p.native_id=c.native_id \
+         WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?)"
+    )
 }
 
 fn role_param(role: Option<crate::EventKind>) -> rusqlite::types::Value {
@@ -1471,7 +1503,7 @@ mod tests {
         let before = fs::metadata(&p).unwrap().len();
 
         let db = SqliteStore::open(&p).unwrap();
-        assert_eq!(pragma(&db, "user_version"), 5);
+        assert_eq!(pragma(&db, "user_version"), 6);
         // The upgrade drops every mixed-speaker chunk; the file must not keep the pages.
         assert_eq!(db.status().unwrap().chunks, 0);
         let (pages, free) = (pragma(&db, "page_count"), pragma(&db, "freelist_count"));
@@ -1629,6 +1661,66 @@ mod tests {
                 ),
             ],
         )
+    }
+
+    /// The planner prefers the primary key for a `rowid=?` lookup however wide
+    /// the row is, so the hint is what keeps the ranking phase off the text.
+    /// Without this test, dropping it would cost seconds on a large index and
+    /// nothing a passing suite would notice.
+    #[test]
+    fn ranking_a_match_reads_the_index_and_not_the_chunk() {
+        let (_dir, db) = deploy_fixture("storage-covering-plan");
+        let plans = |sql: &str| -> String {
+            let mut st = db.conn.prepare(sql).unwrap();
+            // A plan does not depend on the values, only on their presence.
+            let nulls = vec![rusqlite::types::Value::Null; st.parameter_count()];
+            let rows = st
+                .query_map(rusqlite::params_from_iter(nulls), |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>();
+            rows.join("\n")
+        };
+        // The queries the search actually runs, not copies of them.
+        for (what, sql) in [
+            (
+                "ranked search",
+                search_sql("ORDER BY bm25(chunks_fts),c.agent,c.native_id,c.ordinal LIMIT ?"),
+            ),
+            ("prioritized search", prioritized_sql("(?,?,?)")),
+        ] {
+            let plan = plans(&format!("EXPLAIN QUERY PLAN {sql}"));
+            assert!(
+                plan.contains("COVERING INDEX chunks_meta"),
+                "{what} stopped using the covering index:\n{plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_index_without_the_covering_index_gains_it_on_open() {
+        let (dir, db) = deploy_fixture("storage-covering-migration");
+        let before = db.search_with_role("deploy", 10, None).unwrap();
+        let path = dir.path().join("private/index.sqlite");
+        db.conn
+            .execute_batch("DROP INDEX chunks_meta; PRAGMA user_version=5;")
+            .unwrap();
+        drop(db);
+
+        let db = SqliteStore::open(&path).unwrap();
+        assert_eq!(pragma(&db, "user_version"), 6);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='chunks_meta'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+        );
+        // The index changes how the rows are reached, never which ones.
+        assert_eq!(db.search_with_role("deploy", 10, None).unwrap(), before);
     }
 
     #[test]
