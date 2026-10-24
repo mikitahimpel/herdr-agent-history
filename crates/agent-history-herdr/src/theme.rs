@@ -5,14 +5,19 @@
 //! Herdr, this module reads Herdr's `config.toml` and looks the theme name up
 //! in copies of Herdr's built-in palettes.
 //!
-//! Those copies can drift from Herdr. They are taken from Herdr v0.7.5
-//! `src/app/state.rs` (`Palette::catppuccin` … `Palette::vesper` and
-//! `Palette::from_name`), which are unchanged since v0.7.1. To limit the
-//! damage when Herdr changes:
-//! - `[theme.custom]` and `[ui] accent` are read live, never copied;
+//! Those copies can drift from Herdr. They are taken from `src/app/state.rs`
+//! (`Palette::catppuccin` … `Palette::vesper` and `Palette::from_name`) and
+//! last compared token for token against Herdr v0.9.4, which agrees on all
+//! seventeen. To limit the damage when Herdr changes:
+//! - `[theme.custom]`, `[theme.custom.dark]` and `[ui] accent` are read live,
+//!   never copied;
 //! - a theme name not in the copied table falls back to the terminal palette
-//!   rather than to a guess;
+//!   rather than to a guess, and the custom tokens still apply on top of it;
 //! - `terminal` maps to the browser's own ANSI palette, not a copy.
+//!
+//! Herdr's `sidebar_bg`, `active_row_bg` and `selection_bg` tokens have no
+//! counterpart here — the browser has no sidebar and styles its own selection
+//! from `surface0` — so they are read and ignored.
 //!
 //! Nothing here fails: a missing, unreadable or malformed config, or an
 //! unparseable color, degrades to the terminal palette or the base token.
@@ -69,21 +74,15 @@ pub fn resolve(config: &str) -> Palette {
     } else {
         name.to_string()
     };
-    let Some(mut palette) = builtin(&effective) else {
-        return Palette::terminal();
-    };
+    // A name outside the copied table leaves the base on the terminal palette,
+    // but the custom tokens below still apply: each names its own color, so
+    // honoring them needs no table and guesses nothing.
+    let mut palette = builtin(&effective).unwrap_or_else(Palette::terminal);
     let custom = theme
         .and_then(|t| t.get("custom"))
         .and_then(toml::Value::as_table);
     if let Some(custom) = custom {
-        for (token, value) in custom {
-            if let (Some(slot), Some(color)) = (
-                token_mut(&mut palette, token),
-                value.as_str().and_then(parse_color),
-            ) {
-                *slot = color;
-            }
-        }
+        apply_overrides(&mut palette, custom);
     }
     let custom_accent = custom.is_some_and(|c| c.contains_key("accent"));
     let legacy_accent = section("ui")
@@ -93,7 +92,32 @@ pub fn resolve(config: &str) -> Palette {
     if let (false, Some(color)) = (custom_accent, legacy_accent.and_then(parse_color)) {
         palette.accent = color;
     }
+    // Herdr applies the appearance table after the shared one and after the
+    // legacy accent, and only for the appearance `auto_switch` chose. This
+    // process takes Herdr's dark default, so `light` never applies.
+    if auto_switch {
+        if let Some(dark) = custom
+            .and_then(|c| c.get("dark"))
+            .and_then(toml::Value::as_table)
+        {
+            apply_overrides(&mut palette, dark);
+        }
+    }
     palette
+}
+
+/// Writes every token in `table` the browser palette has a slot for. A key
+/// that names no slot, including Herdr's `sidebar_bg`, `active_row_bg` and
+/// `selection_bg` and the `dark` and `light` tables themselves, is skipped.
+fn apply_overrides(palette: &mut Palette, table: &toml::Table) {
+    for (token, value) in table {
+        if let (Some(slot), Some(color)) = (
+            token_mut(palette, token),
+            value.as_str().and_then(parse_color),
+        ) {
+            *slot = color;
+        }
+    }
 }
 
 fn token_mut<'a>(palette: &'a mut Palette, token: &str) -> Option<&'a mut Color> {
@@ -241,7 +265,7 @@ const THEMES: &[(&[&str], Palette)] = &[
     (&["solarized-light"], p([rgb(38,139,210), rgb(253,246,227), rgb(238,232,213), rgb(147,161,161), rgb(238,232,213), rgb(147,161,161), rgb(88,110,117), rgb(101,123,131), rgb(131,148,150), rgb(211,54,130), rgb(133,153,0), rgb(181,137,0), rgb(220,50,47), rgb(38,139,210), rgb(42,161,152), rgb(203,75,22)])),
     (&["kanagawa"], p([rgb(126,156,216), rgb(31,31,40), rgb(42,42,55), rgb(54,54,70), rgb(31,31,40), rgb(114,113,105), rgb(135,134,125), rgb(220,215,186), rgb(200,195,170), rgb(149,127,184), rgb(118,148,106), rgb(192,163,110), rgb(195,64,67), rgb(126,156,216), rgb(127,180,202), rgb(255,160,102)])),
     (&["kanagawa-lotus", "lotus"], p([rgb(77,105,155), rgb(242,236,188), rgb(220,213,172), rgb(201,203,209), rgb(213,206,163), rgb(160,156,172), rgb(138,137,128), rgb(84,84,100), rgb(67,67,108), rgb(98,76,131), rgb(111,137,78), rgb(119,113,63), rgb(200,64,83), rgb(77,105,155), rgb(78,140,162), rgb(204,109,0)])),
-    (&["rose-pine", "rosepine"], p([rgb(196,167,231), rgb(25,23,36), rgb(31,29,46), rgb(38,35,58), rgb(25,23,36), rgb(110,106,134), rgb(144,140,170), rgb(224,222,244), rgb(200,197,220), rgb(196,167,231), rgb(49,116,143), rgb(246,193,119), rgb(235,111,146), rgb(49,116,143), rgb(156,207,216), rgb(234,154,151)])),
+    (&["rose-pine", "rosepine"], p([rgb(196,167,231), rgb(25,23,36), rgb(31,29,46), rgb(38,35,58), rgb(38,35,58), rgb(110,106,134), rgb(144,140,170), rgb(224,222,244), rgb(200,197,220), rgb(196,167,231), rgb(49,116,143), rgb(246,193,119), rgb(235,111,146), rgb(49,116,143), rgb(156,207,216), rgb(234,154,151)])),
     (&["rose-pine-dawn", "rosepine-dawn", "dawn"], p([rgb(144,122,169), rgb(250,244,237), rgb(242,233,225), rgb(255,250,243), rgb(242,233,225), rgb(152,147,165), rgb(121,117,147), rgb(70,66,97), rgb(121,117,147), rgb(144,122,169), rgb(40,105,131), rgb(234,157,52), rgb(180,99,122), rgb(40,105,131), rgb(86,148,159), rgb(215,130,126)])),
     (&["vesper"], p([rgb(255,199,153), rgb(26,26,26), rgb(35,35,35), rgb(40,40,40), rgb(16,16,16), rgb(92,92,92), rgb(126,126,126), rgb(255,255,255), rgb(160,160,160), rgb(255,209,168), rgb(153,255,228), rgb(255,199,153), rgb(255,128,128), rgb(176,176,176), rgb(102,221,204), rgb(255,199,153)])),
 ];
@@ -318,6 +342,79 @@ mod tests {
             resolve("[theme]\nname = \"terminal\"\n"),
             Palette::terminal()
         );
+    }
+
+    #[test]
+    fn an_unknown_name_still_honors_the_custom_tokens() {
+        // The base is a guess this module refuses to make; the tokens are not.
+        let palette = resolve(
+            "[theme]\nname = \"neon-2099\"\n[theme.custom]\naccent = \"#ff0000\"\npanel_bg = \"#282c34\"\n",
+        );
+        let terminal = Palette::terminal();
+        assert_eq!(palette.accent, Color::Rgb(255, 0, 0));
+        assert_eq!(palette.panel_bg, Color::Rgb(0x28, 0x2c, 0x34));
+        assert_eq!(palette.text, terminal.text);
+        assert_eq!(palette.green, terminal.green);
+    }
+
+    #[test]
+    fn the_dark_custom_table_applies_under_auto_switch() {
+        // Herdr reads `[theme.custom.dark]` into its own type and applies it
+        // after `[theme.custom]`; a table read as a color string is dropped,
+        // which is how these overrides used to disappear without a trace.
+        let palette = resolve(
+            "[theme]\nname = \"catppuccin\"\nauto_switch = true\n[theme.custom]\naccent = \"#00ff00\"\ntext = \"#ffffff\"\n[theme.custom.dark]\naccent = \"#ff0000\"\npanel_bg = \"#282c34\"\n",
+        );
+        assert_eq!(
+            palette.accent,
+            Color::Rgb(255, 0, 0),
+            "dark wins over shared"
+        );
+        assert_eq!(palette.panel_bg, Color::Rgb(0x28, 0x2c, 0x34));
+        assert_eq!(
+            palette.text,
+            Color::Rgb(255, 255, 255),
+            "shared still applies"
+        );
+        assert_eq!(palette.green, builtin("catppuccin").unwrap().green);
+    }
+
+    #[test]
+    fn mode_custom_tables_are_ignored_without_auto_switch() {
+        // Herdr applies them only for the appearance `auto_switch` chose.
+        let config = "[theme]\nname = \"nord\"\n[theme.custom.dark]\naccent = \"#ff0000\"\n";
+        assert_eq!(resolve(config), builtin("nord").unwrap());
+    }
+
+    #[test]
+    fn the_light_custom_table_never_applies() {
+        // This process does not query the terminal, so it is always on Herdr's
+        // dark default; honoring `light` would be claiming to know otherwise.
+        let palette = resolve(
+            "[theme]\nname = \"nord\"\nauto_switch = true\n[theme.custom.light]\naccent = \"#ff0000\"\n",
+        );
+        assert_eq!(palette.accent, builtin("nord").unwrap().accent);
+    }
+
+    #[test]
+    fn a_dark_custom_accent_outranks_the_legacy_ui_accent() {
+        // Herdr's order: base, `[theme.custom]`, `[ui] accent`, then the mode
+        // table. Only a shared custom accent suppresses the legacy one.
+        let palette = resolve(
+            "[theme]\nauto_switch = true\n[ui]\naccent = \"magenta\"\n[theme.custom.dark]\naccent = \"#ff0000\"\n",
+        );
+        assert_eq!(palette.accent, Color::Rgb(255, 0, 0));
+        let palette = resolve("[theme]\nauto_switch = true\n[ui]\naccent = \"magenta\"\n");
+        assert_eq!(palette.accent, Color::Magenta);
+    }
+
+    #[test]
+    fn rose_pine_dims_a_selection_the_way_herdr_does() {
+        // Herdr v0.9.4 uses the overlay shade here. The copy had the base
+        // shade, which made an unfocused selection invisible.
+        let rose_pine = builtin("rose-pine").unwrap();
+        assert_eq!(rose_pine.surface_dim, Color::Rgb(38, 35, 58));
+        assert_ne!(rose_pine.surface_dim, rose_pine.panel_bg);
     }
 
     #[test]
