@@ -15,9 +15,17 @@
 //!   rather than to a guess, and the custom tokens still apply on top of it;
 //! - `terminal` maps to the browser's own ANSI palette, not a copy.
 //!
-//! Herdr's `sidebar_bg`, `active_row_bg` and `selection_bg` tokens have no
-//! counterpart here — the browser has no sidebar and styles its own selection
-//! from `surface0` — so they are read and ignored.
+//! Herdr spends two tokens on backgrounds. `sidebar_bg` fills a window —
+//! its sidebar, and the panes it hosts — and is `Color::Reset` in all
+//! seventeen themes it ships, which is why Herdr looks like the terminal it
+//! runs in. `panel_bg` is for what floats above a window: the tab strip,
+//! the menus, the modals. This overlay fills a pane, so its background is
+//! `sidebar_bg`, and a `panel_bg` that darkens Herdr's tab strip leaves the
+//! pane beneath it alone.
+//!
+//! Herdr's `active_row_bg` and `selection_bg` have no counterpart here — the
+//! browser styles its own selection from `surface0` — so they are read and
+//! ignored.
 //!
 //! Nothing here fails: a missing, unreadable or malformed config, or an
 //! unparseable color, degrades to the terminal palette or the base token.
@@ -123,7 +131,7 @@ fn apply_overrides(palette: &mut Palette, table: &toml::Table) {
 fn token_mut<'a>(palette: &'a mut Palette, token: &str) -> Option<&'a mut Color> {
     Some(match token {
         "accent" => &mut palette.accent,
-        "panel_bg" => &mut palette.panel_bg,
+        "sidebar_bg" => &mut palette.panel_bg,
         "surface0" => &mut palette.surface0,
         "surface1" => &mut palette.surface1,
         "surface_dim" => &mut palette.surface_dim,
@@ -273,7 +281,10 @@ const THEMES: &[(&[&str], Palette)] = &[
 const fn p(c: [Color; 16]) -> Palette {
     Palette {
         accent: c[0],
-        panel_bg: c[1],
+        // `c[1]` is Herdr's `panel_bg`. It stays in the table so the copies
+        // can be compared with Herdr token for token, but the background
+        // painted here comes from `sidebar_bg` instead; see the module docs.
+        panel_bg: Color::Reset,
         surface0: c[2],
         surface1: c[3],
         surface_dim: c[4],
@@ -348,7 +359,7 @@ mod tests {
     fn an_unknown_name_still_honors_the_custom_tokens() {
         // The base is a guess this module refuses to make; the tokens are not.
         let palette = resolve(
-            "[theme]\nname = \"neon-2099\"\n[theme.custom]\naccent = \"#ff0000\"\npanel_bg = \"#282c34\"\n",
+            "[theme]\nname = \"neon-2099\"\n[theme.custom]\naccent = \"#ff0000\"\nsidebar_bg = \"#282c34\"\n",
         );
         let terminal = Palette::terminal();
         assert_eq!(palette.accent, Color::Rgb(255, 0, 0));
@@ -363,7 +374,7 @@ mod tests {
         // after `[theme.custom]`; a table read as a color string is dropped,
         // which is how these overrides used to disappear without a trace.
         let palette = resolve(
-            "[theme]\nname = \"catppuccin\"\nauto_switch = true\n[theme.custom]\naccent = \"#00ff00\"\ntext = \"#ffffff\"\n[theme.custom.dark]\naccent = \"#ff0000\"\npanel_bg = \"#282c34\"\n",
+            "[theme]\nname = \"catppuccin\"\nauto_switch = true\n[theme.custom]\naccent = \"#00ff00\"\ntext = \"#ffffff\"\n[theme.custom.dark]\naccent = \"#ff0000\"\nsidebar_bg = \"#282c34\"\n",
         );
         assert_eq!(
             palette.accent,
@@ -408,6 +419,30 @@ mod tests {
         assert_eq!(palette.accent, Color::Magenta);
     }
 
+    /// Herdr fills a window with `sidebar_bg` and reserves `panel_bg` for what
+    /// floats above one. The overlay fills a pane, so it follows the sidebar:
+    /// a `panel_bg` that darkens Herdr's tab strip must leave the pane alone.
+    #[test]
+    fn the_background_follows_herdrs_sidebar_and_not_its_panel() {
+        for name in THEME_NAMES {
+            assert_eq!(
+                builtin(name).unwrap().panel_bg,
+                Color::Reset,
+                "{name} fills a window with the terminal's own background"
+            );
+        }
+        let panel =
+            resolve("[theme]\nname = \"catppuccin\"\n[theme.custom]\npanel_bg = \"#181825\"\n");
+        assert_eq!(
+            panel.panel_bg,
+            Color::Reset,
+            "panel_bg belongs to what floats above the pane"
+        );
+        let sidebar =
+            resolve("[theme]\nname = \"catppuccin\"\n[theme.custom]\nsidebar_bg = \"#282c34\"\n");
+        assert_eq!(sidebar.panel_bg, Color::Rgb(0x28, 0x2c, 0x34));
+    }
+
     #[test]
     fn rose_pine_dims_a_selection_the_way_herdr_does() {
         // Herdr v0.9.4 uses the overlay shade here. The copy had the base
@@ -435,12 +470,12 @@ mod tests {
     #[test]
     fn custom_tokens_override_the_base_theme() {
         let palette = resolve(
-            "[theme]\nname = \"nord\"\n[theme.custom]\naccent = \"#F5C2E7\"\nred = \"rgb(255, 85, 85)\"\npanel_bg = \"reset\"\nteal = \"#0f0\"\nunknown_token = \"#000000\"\n",
+            "[theme]\nname = \"nord\"\n[theme.custom]\naccent = \"#F5C2E7\"\nred = \"rgb(255, 85, 85)\"\nsidebar_bg = \"#2e3440\"\nteal = \"#0f0\"\nunknown_token = \"#000000\"\n",
         );
         let nord = builtin("nord").unwrap();
         assert_eq!(palette.accent, Color::Rgb(0xf5, 0xc2, 0xe7));
         assert_eq!(palette.red, Color::Rgb(255, 85, 85));
-        assert_eq!(palette.panel_bg, Color::Reset);
+        assert_eq!(palette.panel_bg, Color::Rgb(0x2e, 0x34, 0x40));
         assert_eq!(palette.teal, Color::Rgb(0, 255, 0));
         assert_eq!(palette.text, nord.text);
     }

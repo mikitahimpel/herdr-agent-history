@@ -12,9 +12,10 @@ pub struct Palette {
     pub accent: Color,
     /// Background painted behind the whole browser.
     pub panel_bg: Color,
-    /// Background of the selected result while the results pane is focused.
+    /// Background of the selected result while the results pane is focused,
+    /// and the rules drawn inside a pane.
     pub surface0: Color,
-    /// Unfocused borders and separators.
+    /// Unfocused borders.
     pub surface1: Color,
     /// Background of the selected result while another pane is focused.
     pub surface_dim: Color,
@@ -89,7 +90,7 @@ impl Palette {
         if focused {
             Style::new().fg(self.accent).add_modifier(Modifier::BOLD)
         } else {
-            Style::new().fg(self.subtext0)
+            Style::new().fg(self.overlay0).add_modifier(Modifier::BOLD)
         }
     }
     pub(crate) fn selection(&self, focused: bool) -> Style {
@@ -106,7 +107,7 @@ impl Palette {
             .add_modifier(Modifier::BOLD)
     }
     pub(crate) fn inactive_tab(&self) -> Style {
-        Style::new().fg(self.subtext0)
+        Style::new().fg(self.overlay1)
     }
     pub(crate) fn matched(&self) -> Style {
         Style::new()
@@ -117,13 +118,11 @@ impl Palette {
     pub(crate) fn key(&self) -> Style {
         Style::new().fg(self.accent).add_modifier(Modifier::BOLD)
     }
-    /// The key-hint bar. ANSI blue on ANSI dark gray is unreadable in many
-    /// terminal schemes, so on the terminal's own background the bar has none.
+    /// The key-hint bar. Herdr's own status bar carries no background of its
+    /// own -- it is the panel with accent keys on it -- so this one does not
+    /// either, and a Herdr pane reads as one surface from top to bottom.
     pub(crate) fn bar(&self) -> Style {
-        match self.panel_bg {
-            Color::Reset => Style::new(),
-            _ => Style::new().bg(self.surface_dim),
-        }
+        Style::new().bg(self.panel_bg)
     }
     /// Marks results that are near matches rather than exact ones.
     pub(crate) fn approximate(&self) -> Style {

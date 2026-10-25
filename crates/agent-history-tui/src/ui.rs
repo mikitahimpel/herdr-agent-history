@@ -123,11 +123,7 @@ pub(crate) fn split_body(body: Rect, mode: Mode) -> (Option<Rect>, Option<Rect>)
 
 fn pane<'a>(title: &'a str, focused: bool, p: &Palette) -> Block<'a> {
     Block::bordered()
-        .border_type(if focused {
-            BorderType::Thick
-        } else {
-            BorderType::Rounded
-        })
+        .border_type(BorderType::Plain)
         .border_style(p.border(focused))
         .title(Span::styled(format!(" {title} "), p.pane_title(focused)))
 }
@@ -264,11 +260,7 @@ fn draw_search(
     state.hits.search = area;
     let focused = state.mode == Mode::Query;
     let block = Block::bordered()
-        .border_type(if focused {
-            BorderType::Thick
-        } else {
-            BorderType::Rounded
-        })
+        .border_type(BorderType::Plain)
         .border_style(p.border(focused));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -455,7 +447,7 @@ fn rule(width: usize, label: Option<Span<'static>>, p: &Palette) -> Line<'static
     let used: usize = spans.iter().map(|s| width_of(&s.content)).sum();
     spans.push(Span::styled(
         "─".repeat(width.saturating_sub(used)),
-        Style::new().fg(p.surface1),
+        Style::new().fg(p.surface0),
     ));
     fit(spans, width)
 }
@@ -931,7 +923,7 @@ fn draw_action(frame: &mut Frame, body: Rect, action_lines: &[String], p: &Palet
     };
     frame.render_widget(Clear, area);
     let block = Block::bordered()
-        .border_type(BorderType::Thick)
+        .border_type(BorderType::Plain)
         .border_style(Style::new().fg(p.peach))
         .title(Span::styled(
             " Recovery ",
@@ -1017,7 +1009,7 @@ fn draw_keys(
         spans.push(Span::styled(key, p.key()));
         spans.push(Span::styled(
             format!(" {label}   "),
-            Style::new().fg(p.overlay1),
+            Style::new().fg(p.overlay0),
         ));
     }
     frame.render_widget(
@@ -1133,6 +1125,43 @@ mod tests {
         assert_eq!(buf[(second.0 + 2, second.1)].bg, Color::DarkGray);
     }
 
+    /// Herdr's status bar is the panel with accent keys written on it, not a
+    /// band of its own, and the overlay's pane has to read as one surface
+    /// beside Herdr's.
+    #[test]
+    fn the_key_bar_carries_no_background_of_its_own() {
+        let temp = TempDir::new("ui-bar").unwrap();
+        let (_store, mut state) = searched(&temp);
+        let panel_bg = Color::Rgb(24, 24, 37);
+        let surface_dim = Color::Rgb(30, 30, 46);
+        let accent = Color::Rgb(137, 180, 250);
+        let overlay0 = Color::Rgb(108, 112, 134);
+        let themed = Themed(Palette {
+            accent,
+            panel_bg,
+            surface_dim,
+            overlay0,
+            ..Palette::terminal()
+        });
+        let buf = render(&mut state, &themed, 100, 30);
+        let y = buf.area.height - 1;
+        for x in 0..buf.area.width {
+            assert_eq!(buf[(x, y)].bg, panel_bg, "column {x} of the key bar");
+        }
+        // Columns, not bytes: the bar's other hints carry arrow glyphs.
+        let kx = (0..buf.area.width)
+            .find(|&x| {
+                (x..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .starts_with("esc")
+            })
+            .expect("the bar names the quit key");
+        assert_eq!(buf[(kx, y)].fg, accent, "the key itself");
+        assert!(buf[(kx, y)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(kx + 4, y)].fg, overlay0, "the label beside it");
+    }
+
     #[test]
     fn focused_pane_is_distinguishable() {
         let temp = TempDir::new("ui-focus").unwrap();
@@ -1152,12 +1181,13 @@ mod tests {
             let buf = render(&mut state, &themed, 100, 30);
             for title in ["Search", "Results", "Preview"] {
                 let cell = corner(&buf, title);
+                // Every frame is square, as Herdr draws them; focus is in the
+                // border color alone.
+                assert_eq!(cell.symbol(), "┌", "{title} in {mode:?}");
                 if title == focused {
-                    assert_eq!(cell.symbol(), "┏", "{title} focused in {mode:?}");
-                    assert_eq!(cell.fg, accent);
+                    assert_eq!(cell.fg, accent, "{title} focused in {mode:?}");
                 } else {
-                    assert_eq!(cell.symbol(), "╭", "{title} unfocused in {mode:?}");
-                    assert_ne!(cell.fg, accent);
+                    assert_ne!(cell.fg, accent, "{title} unfocused in {mode:?}");
                 }
             }
         }
@@ -1271,7 +1301,7 @@ mod tests {
                     let (_, top) = find(&buf, " Results ").unwrap();
                     for y in top + 1..h - 3 {
                         let edge = buf[(w - 1, y)].symbol();
-                        assert!(matches!(edge, "│" | "┃"), "row {y}: {:?}", row(&buf, y));
+                        assert!(edge == "│", "row {y}: {:?}", row(&buf, y));
                     }
                 }
             }
@@ -1349,10 +1379,10 @@ mod tests {
         let (x, y) = find(buf, " Results ").unwrap();
         let left = x - 1;
         let right = (left + 1..buf.area.width)
-            .find(|&x| matches!(buf[(x, y)].symbol(), "┓" | "╮"))
+            .find(|&x| buf[(x, y)].symbol() == "┐")
             .unwrap();
         let bottom = (y + 1..buf.area.height)
-            .find(|&yy| matches!(buf[(left, yy)].symbol(), "┗" | "╰"))
+            .find(|&yy| buf[(left, yy)].symbol() == "└")
             .unwrap();
         Rect::new(left + 1, y + 1, right - left - 1, bottom - y - 1)
     }
@@ -1395,10 +1425,24 @@ mod tests {
         assert_eq!(buf[(inner.right() - 1, sep)].symbol(), " ");
         for x in inner.x + 1..inner.right() - 1 {
             assert_eq!(buf[(x, sep)].symbol(), "─");
-            assert_eq!(buf[(x, sep)].fg, Palette::terminal().surface1);
+            assert_eq!(buf[(x, sep)].fg, Palette::terminal().surface0);
             assert_eq!(buf[(x, sep)].bg, Color::Reset, "separator is not selected");
         }
         assert_eq!(buf[(inner.x + 1, ay)].bg, Color::Reset);
+
+        // The selection survives losing focus, one shade down: nothing else
+        // says which result the preview beside it belongs to.
+        state.mode = Mode::Preview;
+        let buf = render(&mut state, &Standalone, 100, 30);
+        let inner = results_inner(&buf);
+        let (_, hy) = find(&buf, "Claude  USER").unwrap();
+        let p = Palette::terminal();
+        for y in hy..hy + 4 {
+            for x in [inner.x, inner.right() - 1] {
+                assert_eq!(buf[(x, y)].bg, p.surface_dim, "unfocused cell {x},{y}");
+                assert_ne!(buf[(x, y)].bg, p.panel_bg, "unfocused cell {x},{y}");
+            }
+        }
     }
 
     #[test]
@@ -1449,7 +1493,7 @@ mod tests {
         let (ux, uy) = find_from(&buf, "USER ─", px).unwrap();
         assert_eq!(ux, px + 1, "preview content is padded from the border");
         assert_eq!(buf[(ux, uy)].fg, p.blue);
-        assert_eq!(buf[(ux + 6, uy)].fg, p.surface1);
+        assert_eq!(buf[(ux + 6, uy)].fg, p.surface0);
         assert!(find_from(&buf, "ASSISTANT ─", px).is_some());
         // Markdown is rendered, not shown raw.
         assert!(!all.contains("**") && !all.contains("```") && !all.contains("## "));
@@ -1466,7 +1510,7 @@ mod tests {
         assert_eq!(buf[(kx, ky)].bg, p.surface0, "code block");
         let right = (px..120)
             .rev()
-            .find(|&x| matches!(buf[(x, ky)].symbol(), "│" | "┃"))
+            .find(|&x| buf[(x, ky)].symbol() == "│")
             .unwrap();
         assert_eq!(
             buf[(right - 2, ky)].bg,
@@ -1531,7 +1575,7 @@ mod tests {
                     }
                     if w >= SIDE_BY_SIDE_MIN_WIDTH && y > 5 && y < h - 2 {
                         assert!(
-                            matches!(buf[(w - 1, y)].symbol(), "│" | "┃"),
+                            buf[(w - 1, y)].symbol() == "│",
                             "row {y}: {:?}",
                             row(&buf, y)
                         );
@@ -1779,17 +1823,17 @@ mod tests {
         row(buf, buf.area.height - 1)
     }
 
-    /// Asserts `focused` has the heavy accent frame, the other panes do not,
+    /// Asserts `focused` carries the accent frame, the other panes do not,
     /// and the status bar shows exactly the hints keyboard focus would.
     fn assert_focus(buf: &Buffer, state: &BrowserState, focused: &str) {
         let p = Palette::terminal();
         for title in ["Search", "Results", "Preview"] {
             let corner = &buf[pane_corner(buf, title)];
+            assert_eq!(corner.symbol(), "┌", "{title} should be square");
             if title == focused {
-                assert_eq!(corner.symbol(), "┏", "{title} should be focused");
-                assert_eq!(corner.fg, p.accent);
+                assert_eq!(corner.fg, p.accent, "{title} should be focused");
             } else {
-                assert_eq!(corner.symbol(), "╭", "{title} should not be focused");
+                assert_ne!(corner.fg, p.accent, "{title} should not be focused");
             }
         }
         let bar = status_bar(buf);
@@ -2010,22 +2054,22 @@ mod tests {
                 if host {
                     let all: String = (0..h).map(|y| row(&buf, y)).collect();
                     assert!(!all.contains("Agent History"), "the host shows the title");
-                    assert!(top.starts_with("┏ Search "), "{top:?}");
+                    assert!(top.starts_with("┌ Search "), "{top:?}");
                 }
             }
         }
 
         let buf = render(&mut state, &Standalone, 100, 30);
         let top = row(&buf, 0);
-        assert!(top.starts_with("┏ Agent History (Standalone) ━"), "{top:?}");
-        assert!(top.ends_with(" All   User   Assistant  F2 ┓"), "{top:?}");
-        assert!(row(&buf, 1).trim_end().ends_with("2 results ┃"));
+        assert!(top.starts_with("┌ Agent History (Standalone) ─"), "{top:?}");
+        assert!(top.ends_with(" All   User   Assistant  F2 ┐"), "{top:?}");
+        assert!(row(&buf, 1).trim_end().ends_with("2 results │"));
         let bottom = row(&buf, 2);
-        assert!(bottom.ends_with(" 412 files · 9120 chunks · 0 failed · 0 malformed · 0.4s ┛"));
+        assert!(bottom.ends_with(" 412 files · 9120 chunks · 0 failed · 0 malformed · 0.4s ┘"));
         let (x, y) = find(&buf, "412 files").unwrap();
         assert_eq!(
             buf[(x, y)].fg,
-            Palette::terminal().overlay1,
+            Palette::terminal().overlay0,
             "settled is quiet"
         );
 
@@ -2055,14 +2099,14 @@ mod tests {
         // on the tab advances the filter as F2 does.
         let buf = render(&mut state, &HostTitled, 30, 30);
         let top = row(&buf, 0);
-        assert!(top.contains(" Assistant  F2 ┓"), "{top:?}");
+        assert!(top.contains(" Assistant  F2 ┐"), "{top:?}");
         assert!(!top.contains(" User "), "{top:?}");
         let (x, y) = find(&buf, " Assistant ").unwrap();
         assert_eq!(buf[(x + 1, y)].bg, Color::Blue, "the active tab is marked");
         click(&mut state, &store, (x + 2, y));
         assert_eq!(state.role_filter, RoleFilter::All);
         let top = row(&render(&mut state, &HostTitled, 30, 30), 0);
-        assert!(top.contains(" All  F2 ┓"), "{top:?}");
+        assert!(top.contains(" All  F2 ┐"), "{top:?}");
     }
 
     #[test]
@@ -2101,7 +2145,7 @@ mod tests {
             assert_eq!(results_top(&buf), 3, "{w}");
         }
         assert!(row(&render(&mut state, &HostTitled, 50, 30), 2)
-            .contains(" Indexing 812/2510… may be incomplete ┛"));
+            .contains(" Indexing 812/2510… may be incomplete ┘"));
 
         state.query = "nonexistent".into();
         state.refresh(&store);
