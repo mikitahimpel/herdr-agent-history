@@ -147,6 +147,12 @@ pub(crate) fn verify(file: &mut File, c: &Checkpoint) -> Result<bool> {
 }
 /// Reads one newline record with bounded allocation, draining oversized records.
 /// The returned length includes newline; an incomplete tail is never committed.
+/// Read buffer for a transcript. The default eight kilobytes is smaller than a
+/// single Claude record carrying a tool result, so a scan of a few gigabytes spent
+/// hundreds of thousands of `read` calls refilling it. A quarter of a megabyte
+/// amortises the syscall over many records and costs one allocation per file.
+const READ_BUFFER_BYTES: usize = 256 * 1024;
+
 pub(crate) fn record<R: BufRead>(reader: &mut R, max: usize) -> Result<(Vec<u8>, u64, bool)> {
     let mut out = Vec::new();
     let mut length = 0;
@@ -333,7 +339,7 @@ impl<A: AgentAdapter, S: IndexStore> Indexer<A, S> {
             checkpoint.unwrap().session
         };
         file.seek(SeekFrom::Start(start))?;
-        let mut reader = BufReader::new(file.take(meta.len() - start));
+        let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, file.take(meta.len() - start));
         let mut cursor = start;
         let mut chunks = Vec::new();
         let mut pending_bytes = 0;

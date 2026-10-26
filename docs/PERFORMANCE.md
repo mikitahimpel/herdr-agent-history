@@ -418,3 +418,77 @@ it measures only the decision. On the run above it was **30 ms**, with all 2,646
 - The first index of a large history still dominates everything else at over a minute.
   Parsing is single-threaded and CPU-bound; parallelising it across cores is the obvious
   next step and is not attempted here.
+
+## Bootstrap was waiting, not working
+
+The note above — "parsing is single-threaded and CPU-bound" — was only half right, and the
+half that was wrong cost more. Re-measured on a corpus that has since grown to **2,761 files
+and 15.05 GB** (the Codex `archived_sessions` tree is now 8.3 GB of it), a cold bootstrap on
+`188ce14` took:
+
+```
+indexed 2761 files (0 failed), 1847079 records (15042695430 bytes, 24717 chunks; 273 malformed)
+      467.86 real        80.45 user        64.17 sys
+```
+
+**144 s of CPU inside 468 s of wall clock.** The process was idle 69% of the time, so
+parallelising the parser would have left most of the time untouched. A 10 s `sample(1)` of the
+running indexer attributed the main thread as: `git::git_value` 39%, `adapters::common`
+(serde_json) 29%, `index::record` 17%.
+
+### Where the waiting was
+
+`GitContextResolver::context` ran **seven `git` invocations per cwd**, one after another, and a
+scan resolves one cwd per distinct session directory — on the order of 470 here. On this host
+an exec of `git` costs about 55 ms of latency for about 1% of a core:
+
+```
+50x git rev-parse --git-dir   2.987 s total   0.02s user 0.03s system 1% cpu
+50x /usr/bin/true             0.485 s total
+```
+
+So a cwd cost ~385 ms of waiting and the seven-invocation pattern cost ~182 s of the 468 s.
+Four of the seven values are options of a single `rev-parse`, and the other three depend on
+nothing, so the resolver now starts one combined `rev-parse` and the three independent commands
+together and collects them afterwards: one exec latency per cwd instead of seven.
+
+`rev-parse` prints one line per option in the order given and stops at the first it cannot
+answer — `--show-toplevel` fails in a bare repository — so the lines are read by position and a
+partly answered invocation still yields the options that printed. That is pinned by
+`git::tests::a_partly_answered_rev_parse_still_yields_the_options_it_printed`.
+
+Separately, transcripts were read through `BufReader`'s default 8 KiB buffer, which is smaller
+than one Claude record carrying a tool result; 15 GB came in through roughly 1.8 M `read` calls.
+The buffer is now 256 KiB.
+
+### Result
+
+Both binaries were run against the same corpus back to back so that neither saw a colder page
+cache than the other (the host has 17 GB of RAM against a 15.05 GB corpus, so cache state moves
+this number by a third and a cold-vs-warm comparison would overstate the gain):
+
+| Binary | Page cache | Wall | User | Sys |
+| --- | --- | --- | --- | --- |
+| `188ce14` | cold | 467.86 s | 80.45 s | 64.17 s |
+| `188ce14` | warm | 352.98 s | 67.04 s | 54.30 s |
+| this change | warm | **108.34 s** | 62.67 s | 48.24 s |
+
+**Warm against warm: 352.98 s → 108.34 s, a 3.3x reduction.** Records, bytes and chunks match
+across all three runs (±0.03%, from this session appending to its own transcript while the runs
+were in flight; one run reported `1 deferred` for exactly that reason).
+
+The remaining 108 s is now ~111 s of CPU on one of eight cores, so the process is finally
+CPU-bound and the earlier note applies: parsing records into typed structs instead of a
+`serde_json::Value` per record, and then parsing files on more than one core behind a single
+SQLite writer, are what is left.
+
+### Method and limitations
+
+- Phase A only (initial indexing), measured as `/usr/bin/time -l agent-history index --db <tmp>`
+  against a private database under the session scratch directory. The shared installed index was
+  never opened and the history directories were only read.
+- One run per cell. The cold figure is a single observation and the page-cache effect above is
+  larger than any difference between repeats would be, which is why the warm pair is the claim.
+- Measured on one host (Apple M1, 8 cores, 17 GB, macOS 26.6.2). The exec latency that dominated
+  the old timing is a property of this machine's exec path; a host with cheap `fork`/`exec` would
+  have seen a smaller share of time in `git` and will see a smaller gain.
