@@ -51,7 +51,7 @@ fn resume_name(uuid: &str) -> String {
     )
 }
 
-fn is_uuid(value: &str) -> bool {
+pub(crate) fn is_uuid(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 36
         && [8, 13, 18, 23].into_iter().all(|i| bytes[i] == b'-')
@@ -84,6 +84,9 @@ pub struct LiveAgent {
     /// Host-reported agent name, used only as provenance for a pane this
     /// integration started itself.
     pub name: Option<String>,
+    /// The directory the agent was started in, which identifies a pane when
+    /// the host's session ID has gone stale.
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 #[cfg(test)]

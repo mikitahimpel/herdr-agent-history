@@ -1,5 +1,5 @@
 //! Herdr-specific actions for the shared Agent History browser.
-use crate::{restore, resume_in_host, HostRuntime};
+use crate::{restore, resume_in_host, HostRuntime, Resumed};
 use agent_history_core::{
     availability::Availability, preview::preview_source, CoreError, Priorities, Result,
     ResultPrioritizer, Session, SqliteStore,
@@ -92,25 +92,52 @@ impl<H> HerdrIntegration<H> {
             state.mode = Mode::Action;
             return Ok(());
         }
-        resume_in_host(&mut self.host, &session)?;
         // The browser stays open so one search can resume several sessions.
         // Herdr focuses the resumed pane, so this is what the user sees on return.
-        state.notice = Some(resumed_notice(&session));
+        match resume_in_host(&mut self.host, &session)? {
+            Resumed::AlreadyRunning => {
+                // The conversation has a live process that no pane here
+                // accounts for. Starting another would put two agents on one
+                // transcript, so it is shown where it can be shown: here.
+                state.show_preview(store)?;
+                state.notice = Some(already_running_notice(&session));
+            }
+            outcome => state.notice = Some(resumed_notice(&session, outcome)),
+        }
         Ok(())
     }
 }
 
-/// Names the session that was resumed, so returning to the browser explains
-/// what happened rather than looking as though nothing did.
-fn resumed_notice(session: &agent_history_core::Session) -> String {
-    let agent = match session.id.agent {
+fn agent_name(session: &agent_history_core::Session) -> &'static str {
+    match session.id.agent {
         agent_history_core::Agent::Claude => "Claude",
         agent_history_core::Agent::Codex => "Codex",
+    }
+}
+
+/// Names the session that was resumed, so returning to the browser explains
+/// what happened rather than looking as though nothing did. A session that
+/// was already running was shown, not started, and saying "resumed" for both
+/// would hide the difference that matters here.
+fn resumed_notice(session: &agent_history_core::Session, outcome: Resumed) -> String {
+    let agent = agent_name(session);
+    let verb = match outcome {
+        Resumed::Focused => "Opened running",
+        _ => "Resumed",
     };
     match session.repository.as_deref() {
-        Some(repository) => format!("Resumed {agent} session in {repository}"),
-        None => format!("Resumed {agent} session"),
+        Some(repository) => format!("{verb} {agent} session in {repository}"),
+        None => format!("{verb} {agent} session"),
     }
+}
+
+/// Explains the one case where Enter starts nothing: the conversation is
+/// already being served, but not by a pane this integration can point to.
+fn already_running_notice(session: &agent_history_core::Session) -> String {
+    format!(
+        "This {} session is already running on this machine; showing it here instead of starting a second one",
+        agent_name(session)
+    )
 }
 
 /// The one priority group: sessions whose agent is running in Herdr now.
@@ -123,10 +150,13 @@ impl<H: HostRuntime> ResultPrioritizer for HerdrIntegration<H> {
     /// is pressed, and Enter does not rely on it: resuming asks Herdr again.
     fn prioritize(&mut self, sessions: &[Session]) -> Priorities {
         match (self.host.workspaces(), self.host.agents()) {
-            (Ok(workspaces), Ok(agents)) => crate::live_sessions(sessions, &workspaces, &agents)
-                .into_iter()
-                .map(|id| (id, RUNNING))
-                .collect(),
+            (Ok(workspaces), Ok(agents)) => {
+                let running = crate::live::running_sessions();
+                crate::live_sessions(sessions, &workspaces, &agents, &running)
+                    .into_iter()
+                    .map(|id| (id, RUNNING))
+                    .collect()
+            }
             _ => Priorities::default(),
         }
     }
@@ -229,9 +259,9 @@ impl<H: HostRuntime> Integration for HerdrIntegration<H> {
                 {
                     let mut session = self.session(state, store)?;
                     session.cwd = session.repository_root.clone();
-                    resume_in_host(&mut self.host, &session)?;
+                    let outcome = resume_in_host(&mut self.host, &session)?;
                     state.mode = Mode::Results;
-                    state.notice = Some(resumed_notice(&session));
+                    state.notice = Some(resumed_notice(&session, outcome));
                     Ok(true)
                 }
                 Key::Char('v') => {
@@ -374,6 +404,7 @@ mod tests {
                 id: "a".into(),
                 workspace_id: "w".into(),
                 agent: session.id.agent,
+                cwd: session.cwd.clone(),
                 session_id: Some(session.id),
                 name: None,
             }],

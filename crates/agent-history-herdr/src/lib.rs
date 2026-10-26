@@ -3,6 +3,7 @@ use agent_history_core::{CoreError, Result, Session};
 use std::path::Path;
 
 pub mod integration;
+pub mod live;
 pub mod restore;
 pub mod resume;
 pub mod socket;
@@ -24,13 +25,46 @@ pub trait HostRuntime {
     ) -> Result<()>;
 }
 
-/// Finds the exact native session before starting anything. In particular, a
-/// live agent with another session ID is never treated as a match.
-pub fn resume_in_host<H: HostRuntime>(host: &mut H, session: &Session) -> Result<()> {
-    resume_in_host_with_checker(host, session, |path| path.exists())
+/// What resuming did, so the browser can say so rather than leave the reader
+/// guessing which of these happened.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Resumed {
+    /// A pane already running this session was brought to the front.
+    Focused,
+    /// The session was not running, so the agent was started for it.
+    Started,
+    /// A process on this machine is already serving this session and no pane
+    /// could be identified for it, so nothing was started.
+    AlreadyRunning,
 }
 
-pub fn resume_in_host_with_checker<H, F>(host: &mut H, session: &Session, exists: F) -> Result<()>
+/// Finds the exact native session before starting anything. In particular, a
+/// live agent with another session ID is never treated as a match.
+pub fn resume_in_host<H: HostRuntime>(host: &mut H, session: &Session) -> Result<Resumed> {
+    let running = live::running_sessions();
+    resume_in_host_with(host, session, |path| path.exists(), &running)
+}
+
+pub fn resume_in_host_with_checker<H, F>(
+    host: &mut H,
+    session: &Session,
+    exists: F,
+) -> Result<Resumed>
+where
+    H: HostRuntime,
+    F: Fn(&Path) -> bool,
+{
+    resume_in_host_with(host, session, exists, &std::collections::HashSet::new())
+}
+
+/// `running` names the sessions an agent process on this machine is already
+/// serving, from [`live::running_sessions`].
+pub fn resume_in_host_with<H, F>(
+    host: &mut H,
+    session: &Session,
+    exists: F,
+    running: &std::collections::HashSet<agent_history_core::SessionId>,
+) -> Result<Resumed>
 where
     H: HostRuntime,
     F: Fn(&Path) -> bool,
@@ -59,9 +93,41 @@ where
     }
     if let Some(agent) = matching.pop() {
         host.focus_agent(&agent.id)?;
-        return Ok(());
+        return Ok(Resumed::Focused);
     }
-    host.start_agent(&workspace, session, &plan)
+    if running.contains(&session.id) {
+        // A process is serving this conversation under an ID the host does
+        // not report, so starting the agent would put a second process on one
+        // transcript. The pane cannot be identified by session ID here; the
+        // directory is what is left, and it is only trusted when it picks out
+        // exactly one agent of the right kind.
+        if let Some(agent) = sole_agent_in_cwd(session, &workspace.id, &agents) {
+            host.focus_agent(&agent.id)?;
+            return Ok(Resumed::Focused);
+        }
+        return Ok(Resumed::AlreadyRunning);
+    }
+    host.start_agent(&workspace, session, &plan)?;
+    Ok(Resumed::Started)
+}
+
+/// The one agent of the session's kind running in the session's own directory
+/// within `workspace_id`, if it is the only one. Two candidates name no pane
+/// in particular, and focusing the wrong one hides the conversation the
+/// reader asked for behind another.
+pub fn sole_agent_in_cwd<'a>(
+    session: &Session,
+    workspace_id: &str,
+    agents: &'a [resume::LiveAgent],
+) -> Option<&'a resume::LiveAgent> {
+    let cwd = session.cwd.as_deref()?;
+    let mut candidates = agents.iter().filter(|agent| {
+        agent.workspace_id == workspace_id
+            && agent.agent == session.id.agent
+            && agent.cwd.as_deref() == Some(cwd)
+    });
+    let found = candidates.next()?;
+    candidates.next().is_none().then_some(found)
 }
 
 /// Live agents in `workspace_id` running exactly this native session.
@@ -89,17 +155,24 @@ pub fn matching_agents<'a>(
         .collect()
 }
 
-/// Sessions for which Enter would focus a running agent instead of starting
-/// one: exactly one matching agent in the workspace open at the session's
-/// recorded working directory, the same rule `resume_in_host` applies.
+/// Sessions for which Enter would show a running agent instead of starting
+/// one: those a process on this machine is already serving, and those with
+/// exactly one matching agent in the workspace open at the session's recorded
+/// working directory, the same rules `resume_in_host` applies.
 pub fn live_sessions(
     sessions: &[Session],
     workspaces: &[resume::WorkspaceRecord],
     agents: &[resume::LiveAgent],
+    running: &std::collections::HashSet<agent_history_core::SessionId>,
 ) -> Vec<agent_history_core::SessionId> {
     sessions
         .iter()
         .filter(|session| {
+            // A process serving the session is enough on its own: the pane it
+            // belongs to may report a different ID, or lie outside Herdr.
+            if running.contains(&session.id) {
+                return true;
+            }
             let (Ok(plan), Some(cwd)) = (
                 resume::NativeResumePlan::for_session(session),
                 session.cwd.as_deref(),
@@ -156,7 +229,16 @@ mod tests {
             agent: Agent::Codex,
             session_id: session.map(|s| s.id.clone()),
             name,
+            cwd: session.and_then(|s| s.cwd.clone()),
         }
+    }
+
+    fn nothing_running() -> std::collections::HashSet<SessionId> {
+        std::collections::HashSet::new()
+    }
+
+    fn running(sessions: [&Session; 1]) -> std::collections::HashSet<SessionId> {
+        sessions.iter().map(|s| s.id.clone()).collect()
     }
 
     #[test]
@@ -202,7 +284,135 @@ mod tests {
             ],
             &workspaces,
             &agents,
+            &nothing_running(),
         );
         assert_eq!(live, [reported.id, named.id]);
+    }
+
+    /// Herdr names the session a pane started with, and Claude's ID moves on
+    /// from there, so the host reports a live conversation as a stale ID in a
+    /// pane it cannot connect to it.
+    #[test]
+    fn a_session_its_pane_no_longer_names_is_still_live() {
+        let moved_on = session(1, "/w/a");
+        let stale = session(9, "/w/a");
+        let workspaces = [WorkspaceRecord {
+            id: "wa".into(),
+            cwd: "/w/a".into(),
+            root_pane_id: None,
+            root_pane_occupied: false,
+            created: false,
+        }];
+        // The pane reports the ID it launched with, not the one it serves.
+        let agents = [agent("1", "wa", Some(&stale), None)];
+        let live = live_sessions(
+            std::slice::from_ref(&moved_on),
+            &workspaces,
+            &agents,
+            &running([&moved_on]),
+        );
+        assert_eq!(live, [moved_on.id]);
+    }
+
+    #[test]
+    fn a_live_session_is_shown_rather_than_started_twice() {
+        let moved_on = session(1, "/w/a");
+        let stale = session(9, "/w/a");
+        let mut host = TestHost {
+            workspaces: vec![WorkspaceRecord {
+                id: "wa".into(),
+                cwd: "/w/a".into(),
+                root_pane_id: Some("p1".into()),
+                root_pane_occupied: true,
+                created: false,
+            }],
+            agents: vec![agent("p1", "wa", Some(&stale), None)],
+            effects: Vec::new(),
+        };
+        let outcome =
+            resume_in_host_with(&mut host, &moved_on, |_| true, &running([&moved_on])).unwrap();
+        assert_eq!(outcome, Resumed::Focused);
+        assert_eq!(host.effects, ["focus workspace wa", "focus agent p1"]);
+    }
+
+    #[test]
+    fn a_pane_that_cannot_be_told_apart_is_never_guessed_at() {
+        let moved_on = session(1, "/w/a");
+        let one = session(8, "/w/a");
+        let other = session(9, "/w/a");
+        let mut host = TestHost {
+            workspaces: vec![WorkspaceRecord {
+                id: "wa".into(),
+                cwd: "/w/a".into(),
+                root_pane_id: Some("p1".into()),
+                root_pane_occupied: true,
+                created: false,
+            }],
+            agents: vec![
+                agent("p1", "wa", Some(&one), None),
+                agent("p2", "wa", Some(&other), None),
+            ],
+            effects: Vec::new(),
+        };
+        let outcome =
+            resume_in_host_with(&mut host, &moved_on, |_| true, &running([&moved_on])).unwrap();
+        // Nothing started, and no pane picked at random.
+        assert_eq!(outcome, Resumed::AlreadyRunning);
+        assert_eq!(host.effects, ["focus workspace wa"]);
+    }
+
+    #[test]
+    fn a_session_nothing_is_serving_is_still_started() {
+        let idle = session(1, "/w/a");
+        let mut host = TestHost {
+            workspaces: vec![WorkspaceRecord {
+                id: "wa".into(),
+                cwd: "/w/a".into(),
+                root_pane_id: Some("p1".into()),
+                root_pane_occupied: true,
+                created: false,
+            }],
+            agents: Vec::new(),
+            effects: Vec::new(),
+        };
+        let outcome = resume_in_host_with(&mut host, &idle, |_| true, &nothing_running()).unwrap();
+        assert_eq!(outcome, Resumed::Started);
+        assert_eq!(host.effects, ["focus workspace wa", "start agent in wa"]);
+    }
+
+    struct TestHost {
+        workspaces: Vec<WorkspaceRecord>,
+        agents: Vec<LiveAgent>,
+        effects: Vec<String>,
+    }
+
+    impl HostRuntime for TestHost {
+        fn workspaces(&mut self) -> Result<Vec<WorkspaceRecord>> {
+            Ok(self.workspaces.clone())
+        }
+        fn agents(&mut self) -> Result<Vec<LiveAgent>> {
+            Ok(self.agents.clone())
+        }
+        fn focus_workspace(&mut self, id: &str) -> Result<()> {
+            self.effects.push(format!("focus workspace {id}"));
+            Ok(())
+        }
+        fn focus_agent(&mut self, id: &str) -> Result<()> {
+            self.effects.push(format!("focus agent {id}"));
+            Ok(())
+        }
+        fn open_workspace(&mut self, _: &Path) -> Result<WorkspaceRecord> {
+            unreachable!("every test opens a workspace that already exists")
+        }
+        fn start_agent(
+            &mut self,
+            workspace: &WorkspaceRecord,
+            _: &Session,
+            _: &resume::NativeResumePlan,
+        ) -> Result<()> {
+            self.effects
+                .push(format!("start agent in {}", workspace.id));
+            Ok(())
+        }
     }
 }
