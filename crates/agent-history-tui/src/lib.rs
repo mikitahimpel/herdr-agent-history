@@ -42,6 +42,10 @@ const RESULTS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// time a scan has read it, so scans asked for by a changed conversation are
 /// at least this far apart.
 const RESCAN_INTERVAL: Duration = Duration::from_secs(3);
+/// How long the query waits for the next keystroke before it is searched.
+/// Short enough that results feel immediate once typing stops, long enough that
+/// a key held down, a paste or a fast burst resolves to a single search.
+const QUERY_SETTLE: Duration = Duration::from_millis(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Key {
@@ -183,6 +187,16 @@ pub struct BrowserState {
     /// The results list was scrolled by the wheel, so it no longer follows
     /// the selection until the selection moves.
     pub list_scrolled: bool,
+    /// While set, editing the query records that a search is owed instead of
+    /// running one. The run loop sets it around a keystroke so that the frame
+    /// carrying the new text is drawn before the query behind it runs, and so
+    /// that a burst of keystrokes costs one search rather than one each.
+    /// Unset by default: a caller that edits the query and then reads
+    /// `results` still gets today's synchronous behaviour.
+    pub(crate) defer_search: bool,
+    /// The query changed while `defer_search` was set and nothing has searched
+    /// for it yet.
+    pub(crate) search_owed: bool,
     /// Where the last frame drew each clickable region.
     pub(crate) hits: ui::Hits,
 }
@@ -319,7 +333,22 @@ impl BrowserState {
         self.selected = 0;
         self.list_offset = 0;
         self.list_scrolled = false;
+        if self.defer_search {
+            self.search_owed = true;
+            return;
+        }
         self.refresh(store);
+    }
+
+    /// Runs a search the query is owed, if any. Returns whether it ran.
+    pub(crate) fn settle_query(&mut self, store: &SqliteStore) -> bool {
+        if !std::mem::take(&mut self.search_owed) {
+            return false;
+        }
+        let deferred = std::mem::replace(&mut self.defer_search, false);
+        self.refresh(store);
+        self.defer_search = deferred;
+        true
     }
 
     fn select(&mut self, index: usize, store: &SqliteStore) {
@@ -691,60 +720,115 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
         if terminal::interrupted() {
             break;
         }
-        let wait = if matches!(state.indexing, Indexing::Running { .. }) {
-            120
+        // The frame just drawn carries the text that was typed into it, and the
+        // query behind that text has not run yet. A match on a real index costs
+        // tens to hundreds of milliseconds, so it waits for the keyboard to go
+        // quiet first: a letter reaches the screen without one, and a burst, a
+        // held key or a paste costs one search rather than one per character.
+        let wait = if state.search_owed {
+            QUERY_SETTLE
+        } else if matches!(state.indexing, Indexing::Running { .. }) {
+            Duration::from_millis(120)
         } else if state.availability.pending() {
-            50
+            Duration::from_millis(50)
         } else {
-            200
+            Duration::from_millis(200)
         };
-        if !event::poll(Duration::from_millis(wait))? {
+        if !event::poll(wait)? {
+            // Nothing more is coming, so the query is paid for now.
+            state.settle_query(&store);
             continue;
         }
-        let k = match event::read()? {
-            Event::Key(k) => k,
-            Event::Mouse(m) => {
-                if let Some(action) = map_mouse(m) {
-                    state.mouse(action, &store);
+        // Everything already waiting is applied in one pass. A keystroke used to
+        // cost an FTS query and a preview read before the next frame could be
+        // drawn, so a burst of them arrived one slow frame at a time; now a burst
+        // costs one search instead of one search each.
+        let mut interrupt = false;
+        while !interrupt && !state.closed {
+            match event::read()? {
+                Event::Key(k) if k.kind != KeyEventKind::Release => {
+                    if is_interrupt(&k) {
+                        interrupt = true;
+                    } else if map_key(k.code) == Some(Key::F3) {
+                        // Handled before the integration so it works on every screen.
+                        state.mouse_capture = !state.mouse_capture;
+                        terminal::set_mouse_capture(&mut io::stdout(), state.mouse_capture)?;
+                    } else if let Some(key) = map_key(k.code) {
+                        // A confirmation describes the keystroke that caused it, so it
+                        // is cleared before the next one rather than lingering over new
+                        // results.
+                        state.notice = None;
+                        // Only an edit of the query may leave a search owed. Anything
+                        // else acts on the results, so it must see the results for what
+                        // has been typed: the owed search runs before it, not after.
+                        if !edits_query(key, state.mode) {
+                            state.settle_query(&store);
+                        }
+                        apply(key, &mut state, &store, integration);
+                    }
                 }
-                continue;
+                Event::Mouse(m) => {
+                    if let Some(action) = map_mouse(m) {
+                        state.mouse(action, &store);
+                    }
+                }
+                _ => {}
             }
-            _ => continue,
-        };
-        if k.kind == KeyEventKind::Release {
-            continue;
+            if !event::poll(Duration::ZERO)? {
+                break;
+            }
         }
-        if is_interrupt(&k) {
+        if interrupt {
             break;
-        }
-        if map_key(k.code) == Some(Key::F3) {
-            // Handled before the integration so it works on every screen.
-            state.mouse_capture = !state.mouse_capture;
-            terminal::set_mouse_capture(&mut io::stdout(), state.mouse_capture)?;
-            continue;
-        }
-        // A confirmation describes the keystroke that caused it, so it is
-        // cleared before the next one rather than lingering over new results.
-        state.notice = None;
-        if let Some(key) = map_key(k.code) {
-            let handled = match integration.handle(key, &mut state, &store) {
-                Ok(handled) => handled,
-                Err(e) => {
-                    state.error = Some(e.to_string());
-                    continue;
-                }
-            };
-            if !handled {
-                if let Err(e) = state.handle(key, &store) {
-                    state.error = Some(e.to_string());
-                }
-            }
-            state.sync_preview(&store);
         }
     }
     // Abandons the file in progress before its commit; everything committed stays.
     scan.stop();
     Ok(())
+}
+
+/// Whether a key edits the query rather than acting on the results. Only an
+/// edit may leave a search owed; anything else has to see the results for what
+/// has been typed, so the run loop settles the query before applying it.
+fn edits_query(key: Key, mode: Mode) -> bool {
+    match key {
+        Key::Char(_) | Key::Backspace => true,
+        // A space is part of the query while it has focus, and shows the
+        // selected conversation once the results do.
+        Key::Space => mode == Mode::Query,
+        _ => false,
+    }
+}
+
+/// Applies one key, giving the integration first refusal. A key that edits the
+/// query leaves the search owed rather than running it here, so the run loop can
+/// draw the new text first.
+fn apply(
+    key: Key,
+    state: &mut BrowserState,
+    store: &SqliteStore,
+    integration: &mut impl Integration,
+) {
+    match integration.handle(key, state, store) {
+        Ok(true) => {}
+        Ok(false) => {
+            state.defer_search = true;
+            let handled = state.handle(key, store);
+            state.defer_search = false;
+            if let Err(e) = handled {
+                state.error = Some(e.to_string());
+            }
+        }
+        Err(e) => {
+            state.error = Some(e.to_string());
+            return;
+        }
+    }
+    // Loading it now would read the conversation under a selection the owed
+    // search is about to replace, so the preview waits for the search too.
+    if !state.search_owed {
+        state.sync_preview(store);
+    }
 }
 
 fn priorities(integration: &mut impl Integration, sessions: &[Session]) -> Priorities {
@@ -867,6 +951,84 @@ mod tests {
                 r#"{"type":"assistant","message":{"content":"rememberable answer"}}"#,
             ],
         )
+    }
+
+    /// A keystroke must not wait on the index: a match against a real history
+    /// costs up to a quarter of a second, and the query used to run before the
+    /// frame carrying the letter could be drawn. The edit now only records that
+    /// a search is owed, so the run loop draws first and searches after, and a
+    /// burst of keystrokes costs one search rather than one each.
+    #[test]
+    fn a_deferred_query_edit_owes_one_search_for_a_whole_burst() {
+        let temp = agent_history_core::test_support::TempDir::new("tui-defer").unwrap();
+        let store = rememberable(temp.path());
+        let mut state = BrowserState {
+            defer_search: true,
+            ..Default::default()
+        };
+        for c in "rememberable".chars() {
+            state.handle(Key::Char(c), &store).unwrap();
+        }
+        assert_eq!(state.query, "rememberable", "every letter is in the query");
+        assert!(state.search_owed, "and the burst owes a search");
+        assert!(state.results.is_empty(), "but has not run one");
+        assert!(state.settle_query(&store), "settling runs the owed search");
+        assert_eq!(state.results.len(), 2);
+        assert!(!state.settle_query(&store), "nothing is owed twice");
+
+        // The deferral outlives the search it settled, and the results already on
+        // screen stay there until the next one runs.
+        state.handle(Key::Backspace, &store).unwrap();
+        assert_eq!(state.query, "rememberabl");
+        assert!(state.search_owed);
+        assert_eq!(state.results.len(), 2);
+    }
+
+    /// Without the run loop's deferral nothing changes: a caller that edits the
+    /// query and then reads the results gets them, as the integrations do.
+    #[test]
+    fn an_undeferred_query_edit_searches_at_once() {
+        let temp = agent_history_core::test_support::TempDir::new("tui-undeferred").unwrap();
+        let store = rememberable(temp.path());
+        let mut state = BrowserState::default();
+        for c in "rememberable".chars() {
+            state.handle(Key::Char(c), &store).unwrap();
+        }
+        assert!(!state.search_owed, "nothing was deferred");
+        assert_eq!(state.results.len(), 2);
+    }
+
+    /// Only an edit may leave a search owed. A key that acts on the results --
+    /// opening a preview, moving the selection, filtering by role -- would
+    /// otherwise act on the results of a query that is no longer on screen.
+    #[test]
+    fn only_a_query_edit_is_allowed_to_leave_a_search_owed() {
+        assert!(edits_query(Key::Char('a'), Mode::Query));
+        assert!(edits_query(Key::Backspace, Mode::Results));
+        assert!(
+            edits_query(Key::Space, Mode::Query),
+            "a space belongs to the query it is typed into"
+        );
+        assert!(
+            !edits_query(Key::Space, Mode::Results),
+            "a space over the results opens the selected conversation"
+        );
+        for key in [
+            Key::Enter,
+            Key::Tab,
+            Key::Esc,
+            Key::Up,
+            Key::Down,
+            Key::PageUp,
+            Key::PageDown,
+            Key::F2,
+            Key::F3,
+        ] {
+            assert!(
+                !edits_query(key, Mode::Query),
+                "{key:?} acts on the results"
+            );
+        }
     }
 
     #[test]
