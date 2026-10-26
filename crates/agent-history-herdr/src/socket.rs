@@ -418,6 +418,8 @@ struct AgentWire {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
     agent_session: Option<AgentSessionWire>,
 }
 #[derive(Deserialize)]
@@ -451,6 +453,7 @@ pub fn parse_agent_list(json: &str) -> Result<Vec<crate::resume::LiveAgent>> {
                 agent,
                 session_id,
                 name: a.name,
+                cwd: a.cwd.map(std::path::PathBuf::from),
             }))
         })
         .filter_map(|item| match item {
