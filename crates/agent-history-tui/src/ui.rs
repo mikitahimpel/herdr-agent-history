@@ -1774,7 +1774,7 @@ mod tests {
             .collect();
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
-        let worker = Worker::spawn(sessions, move |_| {
+        let worker = Worker::spawn(sessions.into(), move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
             Availability::OnDisk
         });

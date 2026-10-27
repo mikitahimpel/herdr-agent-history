@@ -66,6 +66,10 @@ impl CommandRunner for ProcessRunner {
         };
         let output = std::process::Command::new(executable)
             .args(args)
+            // The browser owns the terminal, and this query now runs beside
+            // it rather than before it. A command that read the pane's input
+            // would take keystrokes meant for the search box.
+            .stdin(std::process::Stdio::null())
             .output()
             .map_err(|e| RunError::Other(CoreError::Io(e)))?;
         if !output.status.success() {

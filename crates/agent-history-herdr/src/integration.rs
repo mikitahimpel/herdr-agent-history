@@ -4,7 +4,15 @@ use agent_history_core::{
     availability::Availability, preview::preview_source, CoreError, Priorities, Result,
     ResultPrioritizer, Session, SqliteStore,
 };
-use agent_history_tui::{BrowserState, Integration, Key, Mode, Palette, SessionState};
+use agent_history_tui::{
+    BackgroundPrioritizer, BrowserState, Integration, Key, Mode, Palette, SessionState,
+};
+use std::sync::Arc;
+
+/// Opens a second, independent connection to Herdr, for the priority query
+/// the browser runs on a worker thread. The browser's own connection stays
+/// where the keystrokes are, so neither waits for the other.
+pub type HostFactory = Arc<dyn Fn() -> Box<dyn HostRuntime + Send> + Send + Sync>;
 
 /// The Herdr adapter owns restoration choices and host side effects. Search,
 /// selection, and rendering remain in `agent-history-tui`.
@@ -14,6 +22,7 @@ pub struct HerdrIntegration<H> {
     confirmation_text: Option<String>,
     palette: Palette,
     host_titled: bool,
+    background_host: Option<HostFactory>,
 }
 
 impl<H> HerdrIntegration<H> {
@@ -24,7 +33,20 @@ impl<H> HerdrIntegration<H> {
             confirmation_text: None,
             palette: Palette::terminal(),
             host_titled: false,
+            background_host: None,
         }
+    }
+
+    /// Lets the browser ask the host which sessions are running without
+    /// blocking on the answer, by opening a connection of its own for the
+    /// worker thread. Without this the query runs where the browser draws,
+    /// and opening it waits for Herdr.
+    pub fn with_background_host(
+        mut self,
+        open: impl Fn() -> Box<dyn HostRuntime + Send> + Send + Sync + 'static,
+    ) -> Self {
+        self.background_host = Some(Arc::new(open));
+        self
     }
 
     /// Declares that Herdr frames this pane with a title, as it does for
@@ -149,16 +171,7 @@ impl<H: HostRuntime> ResultPrioritizer for HerdrIntegration<H> {
     /// means nothing is prioritized. The answer can be stale by the time Enter
     /// is pressed, and Enter does not rely on it: resuming asks Herdr again.
     fn prioritize(&mut self, sessions: &[Session]) -> Priorities {
-        match (self.host.workspaces(), self.host.agents()) {
-            (Ok(workspaces), Ok(agents)) => {
-                let running = crate::live::running_sessions();
-                crate::live_sessions(sessions, &workspaces, &agents, &running)
-                    .into_iter()
-                    .map(|id| (id, RUNNING))
-                    .collect()
-            }
-            _ => Priorities::default(),
-        }
+        crate::live_priorities(&mut self.host, sessions)
     }
 }
 
@@ -185,6 +198,16 @@ impl<H: HostRuntime> Integration for HerdrIntegration<H> {
 
     fn prioritizer(&mut self) -> Option<&mut dyn ResultPrioritizer> {
         Some(self)
+    }
+
+    /// Preferred over [`Self::prioritizer`] whenever a second connection to
+    /// Herdr is available, so that the commands and the process scan this
+    /// query needs are paid for beside the browser rather than before it.
+    fn background_prioritizer(&mut self) -> Option<BackgroundPrioritizer> {
+        let open = self.background_host.clone()?;
+        Some(Box::new(move |sessions| {
+            crate::live_priorities(open().as_mut(), sessions)
+        }))
     }
 
     fn availability_label(&self, state: SessionState) -> &str {
@@ -319,7 +342,7 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct Host {
         effects: Vec<String>,
         session: Option<Session>,
@@ -436,6 +459,37 @@ mod tests {
             ..running(&db, &t.0)
         });
         assert!(unreachable.prioritize(&sessions).is_empty());
+    }
+
+    /// The browser runs this query on a worker thread, so what that thread
+    /// answers must be what the integration would have answered in place.
+    /// Opening the panel used to wait for it: a Herdr command per workspace
+    /// and a scan of the process table, which is most of a startup.
+    #[test]
+    fn the_background_query_answers_as_the_direct_one_does() {
+        let t = Temp::new();
+        let (db, _) = fixture(&t, &t.0);
+        let sessions = db.sessions().unwrap();
+        let host = running(&db, &t.0);
+        let mut i = HerdrIntegration::new(host.clone())
+            .with_background_host(move || Box::new(host.clone()));
+        let direct = i.prioritize(&sessions);
+        assert_eq!(direct.group(&sessions[0].id), Some(RUNNING));
+        let mut background = i.background_prioritizer().expect("a query for the worker");
+        assert_eq!(background(&sessions), direct);
+        // Asked again, it answers again: the browser re-asks after a scan.
+        assert_eq!(background(&sessions), direct);
+    }
+
+    /// Without a second connection to the host there is nothing to run on a
+    /// worker, and the browser asks the integration in place instead.
+    #[test]
+    fn with_no_second_connection_there_is_no_background_query() {
+        let t = Temp::new();
+        let (db, _) = fixture(&t, &t.0);
+        let mut i = HerdrIntegration::new(running(&db, &t.0));
+        assert!(i.background_prioritizer().is_none());
+        assert!(i.prioritizer().is_some());
     }
 
     #[test]

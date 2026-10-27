@@ -69,24 +69,25 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
-    /// `sessions` is the session table, loaded once; `classify` is
+    /// `sessions` is the session table, loaded once and shared with whoever
+    /// else reads it; `classify` is
     /// `agent_history_core::availability::availability` outside tests.
     pub(crate) fn spawn(
-        sessions: Vec<Session>,
+        sessions: std::sync::Arc<[Session]>,
         classify: impl Fn(&Session) -> Availability + Send + 'static,
     ) -> Self {
         let (requests, inbox) = channel::<Vec<SessionId>>();
         let (outbox, answers) = channel();
         thread::spawn(move || {
-            let sessions: HashMap<SessionId, Session> =
-                sessions.into_iter().map(|s| (s.id.clone(), s)).collect();
+            let sessions: HashMap<&SessionId, &Session> =
+                sessions.iter().map(|s| (&s.id, s)).collect();
             for ids in inbox {
                 let batch: Vec<_> = ids
                     .into_iter()
                     .map(|id| {
                         let a = sessions
                             .get(&id)
-                            .map_or(Availability::TranscriptOnly, &classify);
+                            .map_or(Availability::TranscriptOnly, |s| classify(s));
                         (id, a)
                     })
                     .collect();
@@ -150,7 +151,7 @@ mod tests {
     fn worker_classifies_each_session_once_off_thread() {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
-        let worker = Worker::spawn(Vec::new(), move |_| {
+        let worker = Worker::spawn(Vec::new().into(), move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
             Availability::OnDisk
         });
