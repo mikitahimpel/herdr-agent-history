@@ -34,40 +34,53 @@ pub fn running_sessions() -> HashSet<SessionId> {
 
 /// The sessions named by a list of command lines, one per line.
 pub fn session_ids<'a>(command_lines: impl Iterator<Item = &'a str>) -> HashSet<SessionId> {
-    command_lines.filter_map(session_id).collect()
+    command_lines.flat_map(session_ids_in).collect()
 }
 
-/// The session one command line serves, judged by the shape of its arguments
-/// rather than by the program's name: Claude runs from a versioned path whose
-/// file name is a version number, not `claude`.
-fn session_id(command_line: &str) -> Option<SessionId> {
+/// Every session one command line serves, judged by the shape of its
+/// arguments rather than by the program's name: Claude runs from a versioned
+/// path whose file name is a version number, not `claude`.
+///
+/// One process can serve more than one of them. A fork writes a new
+/// transcript under a new ID while reading the one it grew out of, and both
+/// are the conversation the reader was looking at, so resuming either would
+/// put a second agent beside the one already showing it.
+fn session_ids_in(command_line: &str) -> Vec<SessionId> {
     let argv: Vec<&str> = command_line.split_whitespace().collect();
-    let after = |flag: &str| {
+    let values = |flag: &'static str| {
         argv.iter()
-            .rposition(|arg| *arg == flag)
-            .and_then(|i| argv.get(i + 1))
-            .copied()
-            .filter(|value| is_uuid(value))
+            .enumerate()
+            .filter(move |(_, arg)| **arg == flag)
+            .filter_map(|(i, _)| argv.get(i + 1).copied())
     };
-    // The id the agent is writing under, which a fork sets while `--resume`
-    // still names the transcript it forked from.
-    if let Some(id) = after("--session-id") {
-        return Some(SessionId::new(Agent::Claude, id));
-    }
-    // `claude --resume <id>`, the form this integration starts itself. A
-    // `--resume <path>` is a transcript, not an id, and is left alone.
-    if let Some(id) = after("--resume") {
-        return Some(SessionId::new(Agent::Claude, id));
-    }
+    // The ID the agent writes under, which a fork sets for itself.
+    let written = values("--session-id")
+        .filter(|value| is_uuid(value))
+        .map(|id| SessionId::new(Agent::Claude, id));
+    // What `--resume` was pointed at: an ID, as this integration starts it,
+    // or the transcript a fork grew out of.
+    let read = values("--resume")
+        .filter_map(resumed_session)
+        .map(|id| SessionId::new(Agent::Claude, id));
     // `codex resume <id>`, whose subcommand is positional. The program is
     // checked here because `resume` is too ordinary a word to stand alone.
     let codex = argv
         .iter()
-        .any(|arg| arg.rsplit('/').next() == Some("codex"));
-    match after("resume") {
-        Some(id) if codex => Some(SessionId::new(Agent::Codex, id)),
-        _ => None,
+        .any(|arg| arg.rsplit('/').next() == Some("codex"))
+        .then(|| values("resume").filter(|value| is_uuid(value)))
+        .into_iter()
+        .flatten()
+        .map(|id| SessionId::new(Agent::Codex, id));
+    written.chain(read).chain(codex).collect()
+}
+
+/// The session a `--resume` value names: an ID, or the transcript file of one.
+fn resumed_session(value: &str) -> Option<&str> {
+    if is_uuid(value) {
+        return Some(value);
     }
+    let id = value.rsplit('/').next()?.strip_suffix(".jsonl")?;
+    is_uuid(id).then_some(id)
 }
 
 #[cfg(test)]
@@ -77,30 +90,36 @@ mod tests {
     const ID: &str = "00000000-0000-4000-8000-000000000001";
     const OTHER: &str = "00000000-0000-4000-8000-000000000002";
 
-    fn one(command_line: &str) -> Option<SessionId> {
-        session_id(command_line)
+    fn one(command_line: &str) -> Vec<SessionId> {
+        let mut ids = session_ids_in(command_line);
+        ids.sort();
+        ids
     }
 
+    fn claude(id: &str) -> SessionId {
+        SessionId::new(Agent::Claude, id)
+    }
+
+    /// The shape Claude's own background host runs in. Both conversations are
+    /// the one on screen: resuming the transcript it grew out of would start a
+    /// second agent beside the fork already showing it.
     #[test]
-    fn a_fork_is_serving_the_id_it_writes_not_the_one_it_read() {
-        // The shape Claude's own background host runs in: the transcript it
-        // resumed from is a path, and the live conversation is `--session-id`.
-        let claude = format!(
+    fn a_fork_serves_the_conversation_it_read_as_well_as_the_one_it_writes() {
+        let argv = format!(
             "/Users/x/.local/share/claude/versions/2.1.306 --session-id {ID} \
              --fork-session --resume /Users/x/.claude/projects/-p/{OTHER}.jsonl --model opus"
         );
-        assert_eq!(one(&claude), Some(SessionId::new(Agent::Claude, ID)));
+        let mut expected = vec![claude(ID), claude(OTHER)];
+        expected.sort();
+        assert_eq!(one(&argv), expected);
     }
 
     #[test]
     fn the_form_this_integration_starts_is_recognized() {
-        assert_eq!(
-            one(&format!("claude --resume {ID}")),
-            Some(SessionId::new(Agent::Claude, ID))
-        );
+        assert_eq!(one(&format!("claude --resume {ID}")), [claude(ID)]);
         assert_eq!(
             one(&format!("/usr/local/bin/codex resume {ID}")),
-            Some(SessionId::new(Agent::Codex, ID))
+            [SessionId::new(Agent::Codex, ID)]
         );
     }
 
@@ -112,12 +131,23 @@ mod tests {
             "claude",
             "claude --resume",
             "codex resume --last",
-            &format!("claude --resume /Users/x/.claude/projects/-p/{ID}.jsonl"),
+            "claude --resume /Users/x/.claude/projects/-p/latest.jsonl",
+            &format!("claude --resume /Users/x/.claude/projects/-p/{ID}.json"),
             &format!("some-tool resume {ID}"),
             &format!("claude --session-id {}", &ID[..8]),
         ] {
-            assert_eq!(one(argv), None, "{argv}");
+            assert_eq!(one(argv), [], "{argv}");
         }
+    }
+
+    #[test]
+    fn a_transcript_path_names_the_session_it_holds() {
+        assert_eq!(
+            one(&format!(
+                "claude --resume /Users/x/.claude/projects/-p/{ID}.jsonl"
+            )),
+            [claude(ID)]
+        );
     }
 
     #[test]
