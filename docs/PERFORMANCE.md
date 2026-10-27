@@ -553,6 +553,10 @@ Minimum and maximum, same runs: 54.4–289.0 ms before and 5.6–17.8 ms after i
 58.8–368.0 ms and 10.2–556.7 ms wall. The wall outlier after the change sits with a 17.8 ms
 in-process maximum for the same set, so it is exec and scheduling, not the browser.
 
+A second interleaved run, 15 each, on a quieter machine (load average 7) gives 52.4 ms → 5.8 ms
+in process and 57.0 ms → 10.2 ms wall: the same ratios from a lower base, because what was
+removed from the startup path scales with load and what is left does not.
+
 The host query did not get cheaper, it got moved: it still costs 90–180 ms warm, and the
 `running` markers now appear at `markers=130 ms` or so rather than before the first frame.
 Typing during that window searches without them, and the markers arrive while the results are
