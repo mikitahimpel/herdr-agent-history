@@ -492,3 +492,98 @@ SQLite writer, are what is left.
 - Measured on one host (Apple M1, 8 cores, 17 GB, macOS 26.6.2). The exec latency that dominated
   the old timing is a property of this machine's exec path; a host with cheap `fork`/`exec` would
   have seen a smaller share of time in `git` and will see a smaller gain.
+
+## Opening the Herdr panel was waiting on the host (#61)
+
+Opening the panel ran the Herdr integration's priority query before the browser could read a
+key: `herdr --version`, `herdr workspace list`, one `herdr pane list` per workspace,
+`herdr agent list`, and a `ps -xww` over the whole process table. Eight process spawns and a
+process-table scan, in sequence, on the thread that draws the frame and reads the keyboard.
+
+Nothing on the first screen depends on that answer. A blank query matches nothing, so the
+results pane is empty until something is typed, and the query's only output is the `running`
+marker beside result rows and the group that lifts them. The browser was waiting for an answer
+it had nowhere to put. The query now runs on a worker thread, as the availability check already
+does, and its answer is shown when it arrives.
+
+### Reproduce
+
+With `AGENT_HISTORY_TRACE` set to a file, the browser appends one line per mark: the cost of
+each startup phase, and the elapsed total at `usable` (the run loop is entered; the first
+keystroke can be read), `markers` (the first priority answer is shown) and `settled` (the
+background scan has finished).
+
+```sh
+# Inside a Herdr pane, or from the plugin's pane command:
+AGENT_HISTORY_TRACE=/tmp/startup.txt agent-history-herdr
+```
+
+```
+startup: screen=0.2 first-frame=0.6 open-db=0.9 spawn-scan=0.0 sessions=5.8 priorities=0.0 spawn-availability=0.1 usable=7.7
+startup: markers=129.8
+startup: settled=373.1
+```
+
+The host query's own commands can be timed on their own, against a running Herdr:
+
+```sh
+cargo run --release -p agent-history-herdr --example host_latency
+```
+
+The panel needs a terminal, so the A/B below drives the real binary on a pty: open one with
+`pty.openpty`, set a window size, start the binary with `HERDR_ENV=1` and
+`AGENT_HISTORY_TRACE`, drain the master side on a thread so the child never blocks on a full
+buffer, and send `SIGTERM` once the trace file grows. Wall time is measured from `Popen` to
+that growth, polled every millisecond. The two binaries differ by one line — whether the
+integration is given a second connection to Herdr for the worker — and runs alternate between
+them, so both see the same machine.
+
+### Interleaved A/B, 15 runs each
+
+Apple M1, 8 cores, 17 GB, macOS 26.6.2, load average 23–26 (an ordinary working state on this
+machine), against the installed index: 2,387 sessions, 2,764 transcript files, 5 Herdr
+workspaces, 8 live agents.
+
+| Measured | Before | After | Change |
+| --- | --- | --- | --- |
+| In process, to the first readable keystroke | **71.1 ms** | **7.9 ms** | 9.0x |
+| Wall, `exec` to the first readable keystroke | **76.1 ms** | **13.0 ms** | 5.9x |
+
+Minimum and maximum, same runs: 54.4–289.0 ms before and 5.6–17.8 ms after in process;
+58.8–368.0 ms and 10.2–556.7 ms wall. The wall outlier after the change sits with a 17.8 ms
+in-process maximum for the same set, so it is exec and scheduling, not the browser.
+
+A second interleaved run, 15 each, on a quieter machine (load average 7) gives 52.4 ms → 5.8 ms
+in process and 57.0 ms → 10.2 ms wall: the same ratios from a lower base, because what was
+removed from the startup path scales with load and what is left does not.
+
+The host query did not get cheaper, it got moved: it still costs 90–180 ms warm, and the
+`running` markers now appear at `markers=130 ms` or so rather than before the first frame.
+Typing during that window searches without them, and the markers arrive while the results are
+on screen.
+
+### Where the old cost was, and why load matters
+
+`host_latency` against the same Herdr, one command after another:
+
+```
+version + workspace list    10.9 ms
+pane list per workspace      32.1 ms  (5 workspaces)
+agent list                    6.7 ms  (8 agents)
+process scan                 54.3 ms  (5 sessions served)
+asked one after another     104.4 ms
+```
+
+Every item is a process spawn or a scan of the process table, so the query degrades with
+machine load rather than with history size: the same panel measured 465–805 ms to `usable`
+at load average 87. That is why the fix is to move the query rather than to tune it, and why
+the scan now runs beside the Herdr commands instead of after them.
+
+### Limitations
+
+- One host. The gain is bounded by what the host query costs there, which is a function of
+  workspace count and load, not of history size.
+- `usable` is when the run loop can read a key, not when the pane appears: Herdr's own cost to
+  open the pane is outside this measurement.
+- The index scan is unchanged and still settles at 130–370 ms; it was already concurrent.
+- Medians of 15, one host, one Herdr state. The maxima show the spread.

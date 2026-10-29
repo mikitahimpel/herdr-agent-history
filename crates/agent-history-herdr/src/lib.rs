@@ -155,6 +155,47 @@ pub fn matching_agents<'a>(
         .collect()
 }
 
+/// [`live_sessions`] as the browser asks for it: the host's view and the
+/// process table, gathered together, as the one priority group [`RUNNING`].
+///
+/// The two questions are independent — one is a handful of commands to Herdr,
+/// the other a scan of the process table — so the scan runs while the
+/// commands do rather than after them. A host that cannot answer prioritizes
+/// nothing; it does not make the browser fail.
+///
+/// [`RUNNING`]: integration::RUNNING
+pub fn live_priorities(
+    host: &mut dyn HostRuntime,
+    sessions: &[Session],
+) -> agent_history_core::Priorities {
+    live_priorities_with(host, sessions, live::running_sessions)
+}
+
+/// [`live_priorities`] with the process scan given rather than run, so that a
+/// test can say what this machine is serving without starting anything.
+pub fn live_priorities_with<S>(
+    host: &mut dyn HostRuntime,
+    sessions: &[Session],
+    scan: S,
+) -> agent_history_core::Priorities
+where
+    S: FnOnce() -> std::collections::HashSet<agent_history_core::SessionId> + Send,
+{
+    let (running, hosted) = std::thread::scope(|scope| {
+        let scan = scope.spawn(scan);
+        // Asked in this order so a failure costs no second command.
+        let hosted = host.workspaces().and_then(|w| Ok((w, host.agents()?)));
+        (scan.join().unwrap_or_default(), hosted)
+    });
+    let Ok((workspaces, agents)) = hosted else {
+        return agent_history_core::Priorities::default();
+    };
+    live_sessions(sessions, &workspaces, &agents, &running)
+        .into_iter()
+        .map(|id| (id, integration::RUNNING))
+        .collect()
+}
+
 /// Sessions for which Enter would show a running agent instead of starting
 /// one: those a process on this machine is already serving, and those with
 /// exactly one matching agent in the workspace open at the session's recorded
@@ -378,6 +419,78 @@ mod tests {
         let outcome = resume_in_host_with(&mut host, &idle, |_| true, &nothing_running()).unwrap();
         assert_eq!(outcome, Resumed::Started);
         assert_eq!(host.effects, ["focus workspace wa", "start agent in wa"]);
+    }
+
+    /// The browser's whole priority query: what Herdr reports and what the
+    /// process table shows, which are not the same set. A conversation a
+    /// process is serving under an ID no pane reports is still running, and
+    /// dropping the scan here would quietly lose it.
+    #[test]
+    fn the_priority_query_counts_both_what_the_host_reports_and_what_runs() {
+        let reported = session(1, "/w/a");
+        let unreported = session(2, "/w/b");
+        let mut host = TestHost {
+            workspaces: vec![WorkspaceRecord {
+                id: "wa".into(),
+                cwd: "/w/a".into(),
+                root_pane_id: None,
+                root_pane_occupied: false,
+                created: false,
+            }],
+            agents: vec![agent("a", "wa", Some(&reported), None)],
+            effects: Vec::new(),
+        };
+        let sessions = [reported.clone(), unreported.clone()];
+
+        let both = live_priorities_with(&mut host, &sessions, || running([&unreported]));
+        assert_eq!(both.group(&reported.id), Some(integration::RUNNING));
+        assert_eq!(
+            both.group(&unreported.id),
+            Some(integration::RUNNING),
+            "a process serving it is enough on its own"
+        );
+
+        // Nothing serving it, and no pane for it: only the reported one.
+        let hosted_only = live_priorities_with(&mut host, &sessions, nothing_running);
+        assert_eq!(hosted_only.len(), 1);
+        assert_eq!(hosted_only.group(&reported.id), Some(integration::RUNNING));
+    }
+
+    /// A host that cannot be asked prioritizes nothing, and says so by
+    /// leaving the results alone rather than by failing.
+    #[test]
+    fn an_unreachable_host_prioritizes_nothing() {
+        struct Silent;
+        impl HostRuntime for Silent {
+            fn workspaces(&mut self) -> Result<Vec<WorkspaceRecord>> {
+                Err(CoreError::Unsupported("herdr is not running".into()))
+            }
+            fn agents(&mut self) -> Result<Vec<LiveAgent>> {
+                unreachable!("a failed first command costs no second one")
+            }
+            fn focus_workspace(&mut self, _: &str) -> Result<()> {
+                unreachable!()
+            }
+            fn focus_agent(&mut self, _: &str) -> Result<()> {
+                unreachable!()
+            }
+            fn open_workspace(&mut self, _: &Path) -> Result<WorkspaceRecord> {
+                unreachable!()
+            }
+            fn start_agent(
+                &mut self,
+                _: &WorkspaceRecord,
+                _: &Session,
+                _: &resume::NativeResumePlan,
+            ) -> Result<()> {
+                unreachable!()
+            }
+        }
+        let session = session(1, "/w/a");
+        let priorities = live_priorities_with(&mut Silent, std::slice::from_ref(&session), || {
+            running([&session])
+        });
+        assert!(priorities.is_empty());
     }
 
     struct TestHost {

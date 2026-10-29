@@ -27,6 +27,9 @@ fn start() -> io::Result<()> {
     run(
         args,
         &mut HerdrIntegration::new(HerdrCli::new(ProcessRunner))
+            // A connection of its own for the browser's worker thread, so
+            // opening the panel does not wait for Herdr to answer.
+            .with_background_host(|| Box::new(HerdrCli::new(ProcessRunner)))
             .with_palette(theme::palette_from_env())
             // Herdr sets this only for plugin panes, which it frames with the
             // manifest's title; a manual run in an ordinary pane has no title.

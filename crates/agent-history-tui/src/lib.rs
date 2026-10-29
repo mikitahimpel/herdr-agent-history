@@ -16,18 +16,22 @@ use ratatui::layout::Position;
 use std::{
     io,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 mod availability;
 mod markdown;
+mod priority;
 pub mod report;
 mod terminal;
 mod text;
 mod theme;
+mod trace;
 mod ui;
 
 pub use availability::{Availabilities, SessionState};
+pub use priority::BackgroundPrioritizer;
 pub use text::{safe, wrap};
 pub use theme::{Color, Palette};
 pub use ui::draw;
@@ -512,6 +516,18 @@ pub trait Integration {
     fn prioritizer(&mut self) -> Option<&mut dyn ResultPrioritizer> {
         None
     }
+    /// The same query as [`Self::prioritizer`], in a form the browser runs on
+    /// a worker thread, and which it prefers when both are offered.
+    ///
+    /// An integration whose answer comes from a host should supply this one.
+    /// Asking Herdr costs a command per workspace and a scan of the process
+    /// table — hundreds of milliseconds on a busy machine — and the browser
+    /// used to open only once that had finished, although nothing on the
+    /// first screen depends on it. Supplied here, the markers appear when the
+    /// answer does and the browser is ready before it.
+    fn background_prioritizer(&mut self) -> Option<BackgroundPrioritizer> {
+        None
+    }
     /// Short wording for a result's availability marker. The default only
     /// describes what exists on disk; it never promises that Enter resumes.
     fn availability_label(&self, state: SessionState) -> &str {
@@ -654,9 +670,11 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
         println!("{}\n\nOptions: --db PATH --claude-root PATH --codex-root PATH\nExplicit root options disable default history discovery for both agents.\nType a query; arrows/Tab focus results and preview; F2 filters role; Space previews; Enter {}; Esc goes back; Ctrl-C closes.", integration.title(), integration.enter_label().to_lowercase());
         return Ok(());
     }
+    let mut trace = trace::Trace::start("startup", std::env::var_os("AGENT_HISTORY_TRACE"));
     let (db, claude, codex) = parse_args(args)?;
     terminal::install_signal_handlers();
     let mut screen = terminal::Screen::enter()?;
+    trace.phase("screen");
     let started = Instant::now();
     let mut state = BrowserState {
         status: "Opening the index…".into(),
@@ -670,25 +688,45 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
     let term = screen.terminal();
     // Opening can migrate an old schema, which takes a moment once.
     term.draw(|f| draw(f, &mut state, integration))?;
+    trace.phase("first-frame");
     let store = SqliteStore::open(&db).map_err(core_io)?;
+    trace.phase("open-db");
     // The existing index is searchable from here on; the scan only adds to it.
     let scan_adapters = || {
         let (claude, codex) = (claude.clone(), codex.clone());
         move || adapters(claude, codex)
     };
     let mut scan = BackgroundIndex::spawn(db.clone(), scan_adapters())?;
+    trace.phase("spawn-scan");
     let mut follower = ScanFollower::new(started);
     let mut scan_ended: Option<Instant> = None;
-    // One read of the session table and one host query; after this, only the
-    // worker touches the filesystem, and only for sessions not seen before.
-    let sessions = store.sessions().unwrap_or_default();
-    state.set_priorities(priorities(integration, &sessions), &store);
+    // One read of the session table, shared from here on with the threads
+    // that classify and rank it; after this, only they touch the filesystem,
+    // and only for sessions not seen before.
+    let sessions: Arc<[Session]> = store.sessions().unwrap_or_default().into();
+    trace.phase("sessions");
+    // A host query runs on its own thread, so opening the browser never waits
+    // for one; an integration that offers no such query is still asked here.
+    let ranking = integration
+        .background_prioritizer()
+        .map(priority::Worker::spawn);
+    ask_for_priorities(ranking.as_ref(), integration, &sessions, &mut state, &store);
+    trace.phase("priorities");
     let mut worker =
         availability::Worker::spawn(sessions, agent_history_core::availability::availability);
+    trace.phase("spawn-availability");
+    trace.mark("usable");
+    // Only the first answer is marked: the rest come with later scans.
+    let mut marked = false;
     while !state.closed {
         let report = follower.apply(&scan.snapshot(), &mut state, &store);
         if follower.finished && scan_ended.is_none() {
             scan_ended = Some(Instant::now());
+            trace.mark("settled");
+        }
+        if take_priorities(ranking.as_ref(), &mut state, &store) && !marked {
+            marked = true;
+            trace.mark("markers");
         }
         let changed = state.preview_stale || state.reindex_wanted;
         if changed && scan_ended.is_some_and(|t| t.elapsed() >= RESCAN_INTERVAL) {
@@ -705,10 +743,10 @@ pub fn run(args: Vec<String>, integration: &mut impl Integration) -> io::Result<
         }
         if report.is_some_and(|r| r.bytes_read > 0) {
             // The scan may have added sessions, or moved their sources.
-            let sessions = store.sessions().unwrap_or_default();
+            let sessions: Arc<[Session]> = store.sessions().unwrap_or_default().into();
             state.availability = Availabilities::default();
             state.availability.set_priorities(state.priorities.clone());
-            state.set_priorities(priorities(integration, &sessions), &store);
+            ask_for_priorities(ranking.as_ref(), integration, &sessions, &mut state, &store);
             worker = availability::Worker::spawn(
                 sessions,
                 agent_history_core::availability::availability,
@@ -828,6 +866,39 @@ fn apply(
     // search is about to replace, so the preview waits for the search too.
     if !state.search_owed {
         state.sync_preview(store);
+    }
+}
+
+/// Asks for priorities however this integration allows: on the worker's
+/// thread when it offered one, and here when it did not, which is what the
+/// browser has always done.
+fn ask_for_priorities(
+    ranking: Option<&priority::Worker>,
+    integration: &mut impl Integration,
+    sessions: &Arc<[Session]>,
+    state: &mut BrowserState,
+    store: &SqliteStore,
+) {
+    match ranking {
+        Some(ranking) => ranking.request(Arc::clone(sessions)),
+        None => state.set_priorities(priorities(integration, sessions), store),
+    }
+}
+
+/// Shows an answer the worker has finished with, if one has arrived, and says
+/// whether it did. Only a changed answer re-runs the query; see
+/// [`BrowserState::set_priorities`].
+fn take_priorities(
+    ranking: Option<&priority::Worker>,
+    state: &mut BrowserState,
+    store: &SqliteStore,
+) -> bool {
+    match ranking.and_then(priority::Worker::take) {
+        Some(answer) => {
+            state.set_priorities(answer, store);
+            true
+        }
+        None => false,
     }
 }
 
@@ -1051,10 +1122,117 @@ mod tests {
             state.availability.state(&id),
             Some(SessionState::Prioritized(0))
         );
-        // The standalone browser registers no extension.
+        // The standalone browser registers no extension, of either kind.
         assert!(Standalone.prioritizer().is_none());
+        assert!(Standalone.background_prioritizer().is_none());
         state.set_priorities(Priorities::default(), &store);
         assert_eq!(state.prioritized, 0);
+    }
+
+    /// An integration that answers on a worker thread: the browser must open
+    /// without waiting for it and show its answer once it arrives. Before
+    /// this, asking Herdr — a command per workspace and a scan of the process
+    /// table — ran before the first keystroke could be read.
+    #[test]
+    fn a_priority_answer_from_the_worker_reaches_the_results() {
+        let temp = agent_history_core::test_support::TempDir::new("tui-priority").unwrap();
+        let store = rememberable(temp.path());
+        let sessions: Arc<[Session]> = store.sessions().unwrap().into();
+        assert_eq!(sessions.len(), 1);
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        let ranking = priority::Worker::spawn(Box::new(move |sessions: &[Session]| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            sessions.iter().map(|s| (s.id.clone(), 0)).collect()
+        }));
+        let mut state = BrowserState {
+            query: "rememberable".into(),
+            ..Default::default()
+        };
+        state.refresh(&store);
+        assert_eq!(state.prioritized, 0, "nothing is prioritized to begin with");
+
+        let mut integration = Standalone;
+        ask_for_priorities(
+            Some(&ranking),
+            &mut integration,
+            &sessions,
+            &mut state,
+            &store,
+        );
+        // The ask itself never waits: it is the worker that queries.
+        assert!(state.priorities.is_empty());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.priorities.is_empty() {
+            assert!(Instant::now() < deadline, "worker never answered");
+            take_priorities(Some(&ranking), &mut state, &store);
+            std::thread::yield_now();
+        }
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(state.priorities.group(&sessions[0].id), Some(0));
+        assert_eq!(state.prioritized, 1, "the answer re-ran the query");
+        assert_eq!(
+            state.availability.state(&sessions[0].id),
+            Some(SessionState::Prioritized(0))
+        );
+        // A second ask for the same answer leaves the results as they are.
+        ask_for_priorities(
+            Some(&ranking),
+            &mut integration,
+            &sessions,
+            &mut state,
+            &store,
+        );
+        while asked.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < deadline, "worker never answered again");
+            std::thread::yield_now();
+        }
+        assert!(take_priorities(Some(&ranking), &mut state, &store));
+        assert_eq!(state.prioritized, 1);
+    }
+
+    /// Without a worker the ask is answered in place, as it always was.
+    #[test]
+    fn an_integration_with_no_worker_is_asked_on_the_spot() {
+        let temp = agent_history_core::test_support::TempDir::new("tui-priority-sync").unwrap();
+        let store = rememberable(temp.path());
+        let sessions: Arc<[Session]> = store.sessions().unwrap().into();
+        struct Here(Priorities);
+        impl ResultPrioritizer for Here {
+            fn prioritize(&mut self, _: &[Session]) -> Priorities {
+                self.0.clone()
+            }
+        }
+        impl Integration for Here {
+            fn title(&self) -> &str {
+                "here"
+            }
+            fn enter_label(&self) -> &str {
+                "preview"
+            }
+            fn handle(&mut self, _: Key, _: &mut BrowserState, _: &SqliteStore) -> Result<bool> {
+                Ok(false)
+            }
+            fn action_lines(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn prioritizer(&mut self) -> Option<&mut dyn ResultPrioritizer> {
+                Some(self)
+            }
+        }
+        let mut integration = Here(Priorities::from_iter([(sessions[0].id.clone(), 3)]));
+        let mut state = BrowserState {
+            query: "rememberable".into(),
+            ..Default::default()
+        };
+        state.refresh(&store);
+        ask_for_priorities(None, &mut integration, &sessions, &mut state, &store);
+        assert_eq!(state.priorities.group(&sessions[0].id), Some(3));
+        assert_eq!(state.prioritized, 1);
+        // Nothing to take: there is no worker to have answered.
+        assert!(!take_priorities(None, &mut state, &store));
+        assert_eq!(state.prioritized, 1);
     }
 
     #[test]
