@@ -53,6 +53,7 @@ Implementation does not imply acceptance: real native-agent/Herdr validation and
 | overlay-actions | [Connect preview and resume/recovery interactions in Herdr](issues/overlay-actions.md) | overlay, preview, restore-existing, restore-deleted |
 | performance | [Measure search, incremental latency, storage, and idle resources](issues/performance.md) | cli, overlay-actions |
 | release | [Validate V1 end to end and document macOS installation](issues/release.md) | privacy, cli, overlay-actions, performance |
+| rex-host | [Add Rex as a host: resume in Rex sessions with agent-state markers](issues/rex-host.md) | resume-agents, restore-deleted, overlay-actions |
 
 ## Delivery sequence
 

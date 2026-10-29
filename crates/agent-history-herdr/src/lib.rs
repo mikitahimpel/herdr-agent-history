@@ -2,9 +2,9 @@
 use agent_history_core::{CoreError, Result, Session};
 use std::path::Path;
 
+pub use agent_history_restore::{live, restore, Resumed};
+
 pub mod integration;
-pub mod live;
-pub mod restore;
 pub mod resume;
 pub mod socket;
 pub mod theme;
@@ -23,19 +23,6 @@ pub trait HostRuntime {
         session: &Session,
         plan: &resume::NativeResumePlan,
     ) -> Result<()>;
-}
-
-/// What resuming did, so the browser can say so rather than leave the reader
-/// guessing which of these happened.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Resumed {
-    /// A pane already running this session was brought to the front.
-    Focused,
-    /// The session was not running, so the agent was started for it.
-    Started,
-    /// A process on this machine is already serving this session and no pane
-    /// could be identified for it, so nothing was started.
-    AlreadyRunning,
 }
 
 /// Finds the exact native session before starting anything. In particular, a

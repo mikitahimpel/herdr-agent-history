@@ -1,15 +1,17 @@
-# Standalone app and optional Herdr integration
+# Standalone app and optional Herdr and Rex integrations
 
-The repository contains four Rust crates. Herdr is an optional application integration, not a requirement for browsing history.
+The repository contains six Rust crates. Herdr and Rex are optional application integrations, not requirements for browsing history.
 
 | Module | Owns | Dependencies within this repository |
 | --- | --- | --- |
 | `agent-history-core` | Native transcript adapters, indexing, SQLite search, role filters, Git observations, source-verified preview | None |
 | `agent-history-tui` | Terminal rendering, keyboard navigation, indexing progress, search and preview state | Core |
 | `agent-history-cli` | Standalone browser and index/search/status/preview commands | Core, TUI |
-| `agent-history-herdr` | Herdr workspace discovery/focus, native resume, recovery choices and confirmed Git mutation | Core, TUI |
+| `agent-history-restore` | Host-independent resume pieces: the native resume argv (`plan`), the process scan for sessions already running (`live`), confirmed worktree recreation (`restore`), and the resume notices | Core |
+| `agent-history-herdr` | Herdr workspace discovery/focus, resume in Herdr panes, recovery choices, Herdr theme | Core, TUI, Restore |
+| `agent-history-rex` | Rex agent discovery/focus through `rex-agent`, resume in Rex sessions, agent-state priorities, recovery choices | Core, TUI, Restore |
 
-The shared TUI accepts an integration that supplies its title, Enter action, optional action screen, and color palette. The standalone integration uses the ordinary preview action, performs no host operations, and keeps the default palette: ANSI-16 plus the terminal's own foreground and background. The Herdr integration intercepts Enter to resume, owns recovery confirmation state, and resolves Herdr's configured theme (`agent-history-herdr/src/theme.rs`) into the palette it passes to the TUI. Shared UI code contains no Herdr commands, process launcher, worktree mutation, or Herdr config reading.
+The shared TUI accepts an integration that supplies its title, Enter action, optional action screen, and color palette. The standalone integration uses the ordinary preview action, performs no host operations, and keeps the default palette: ANSI-16 plus the terminal's own foreground and background. The Herdr integration intercepts Enter to resume, owns recovery confirmation state, and resolves Herdr's configured theme (`agent-history-herdr/src/theme.rs`) into the palette it passes to the TUI. The Rex integration intercepts Enter the same way, with the terminal palette. Shared UI code contains no host commands, process launcher, worktree mutation, or host config reading; anything host-specific it draws (title, Enter wording, markers, the word for closing, key spellings) comes from `Integration` methods.
 
 ### Title and input ownership
 
@@ -35,6 +37,18 @@ The prioritizer is asked when the caller's view of the sessions changes, never p
 
 Herdr does not pass its theme to the panes it hosts, so the Herdr integration reads `config.toml` itself, from `HERDR_CONFIG_PATH`, `$XDG_CONFIG_HOME/herdr/`, or `~/.config/herdr/`, the same order Herdr uses. `[theme] name` selects a copy of one of Herdr's built-in palettes; `[theme.custom]` tokens and a legacy `[ui] accent` are applied on top, read live from the file. The built-in tables are copied from Herdr v0.7.5 `src/app/state.rs` (identical in v0.7.1) and can drift when Herdr changes them. A theme name missing from the copy, the `terminal` theme, and a missing or malformed config all fall back to the terminal palette; an unparseable custom color keeps the base theme's token. With `auto_switch`, the dark theme is used, because this process does not query the terminal's background the way Herdr does.
 
+### Rex integration
+
+`agent-history-rex` uses the same restore crate and the same recovery screen as Herdr; only the host boundary differs. Every Rex operation is a `rex-agent` command (agent-box's CLI over `rex`), run as an argv vector with stdin closed, through the `RexHost` trait so tests use a fake host. Values are passed as `--opt=value`, and a directory after `--`, so nothing a session recorded can be read as an option; nothing goes through a shell. `REX_AGENT_BIN` overrides the executable found on `PATH`. A command that exits 0 but prints to stderr (such as the app not switching because Remote Control is off) is kept as a warning that keeps the browser open with a notice.
+
+The binary refuses to run without `REX_SESSION`, before opening the index; `--help` works anywhere. Its title is the product name alone (`integration::TITLE`), since the user is already in Rex.
+
+**Enter.** For Claude, `rex-agent list --json` names the pane serving the session ID, which is focused; two panes for one ID are an error, not a guess. If the process scan (`restore::live`) says a process serves the session under an ID Rex does not report, the one Rex agent in its directory is focused, or nothing happens when there is not exactly one. Rex reports only Claude Code, so a running Codex session is never started twice but cannot be focused. Otherwise `rex-agent session-for <dir>` picks the Rex session whose terminals work in the directory: exit 0 opens the resume as a tab in it (`open --session=…`, tab named for the agent), any other exit (no session, or several) opens a new Rex session named after the directory. The recovery paths (recreated worktree, resume in repository) go through the same function. The browser closes after a successful focus or open, since it floats over the window it was opened from.
+
+**Priorities.** The prioritizer runs on a worker thread with its own `rex-agent` host, alongside the process scan. A session exactly one Rex agent reports is grouped by that agent's state, most urgent first: `blocked` (waiting on a permission or answer), `error`, `done` (finished turn not yet seen), `working`, `idle`. A session found only by the process scan, or a Rex state the crate does not know, is group `RUNNING`, labelled `running`. When several groups are present, the Results border counts each in its own wording (`◉ 1 blocked 2 idle`). A Rex that cannot answer prioritizes nothing.
+
+**Wording.** No Herdr terms appear in the Rex UI: the recovery screen speaks of the session's directory rather than a workspace, the key bar says `close` rather than `quit` and spells Control as `⌃C`. Esc from the search box closes the browser, as it does everywhere.
+
 ## Running and building
 
 ```sh
@@ -47,11 +61,15 @@ cargo build --release -p agent-history-cli
 # Optional Herdr integration, from a terminal pane managed by Herdr:
 cargo build --release -p agent-history-herdr
 ./target/release/agent-history-herdr
+
+# Optional Rex integration, from a Rex terminal (needs rex-agent):
+cargo build --release -p agent-history-rex
+./target/release/agent-history-rex
 ```
 
 Standalone Enter opens preview. In the explicitly titled Herdr integration, Enter resumes. F2 role filtering and Space preview are shared. The Herdr executable checks its runtime context before opening the index; its help remains available anywhere.
 
-The package contains both applications, but the installer selects standalone by default. `./install --with-herdr` additionally installs the Herdr executable and plugin manifest. Native Claude Code/Codex programs are needed for resume, not for reading existing history files.
+The package contains both applications, but the installer selects standalone by default. `./install --with-herdr` additionally installs the Herdr executable and plugin manifest, and `./install --with-rex` the Rex executable. Native Claude Code/Codex programs are needed for resume, not for reading existing history files.
 
 ## Existing data and compatibility
 

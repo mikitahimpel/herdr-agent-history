@@ -13,7 +13,7 @@ out=${1:-dist}
 case "$out" in -*|'') echo "package: output directory must not start with -" >&2; exit 2 ;; esac
 identity=${AGENT_HISTORY_SIGN_IDENTITY:-}
 profile=${AGENT_HISTORY_NOTARY_PROFILE:-}
-binaries="agent-history agent-history-overlay agent-history-herdr"
+binaries="agent-history agent-history-overlay agent-history-herdr agent-history-rex"
 if [ -n "$profile" ] && [ -z "$identity" ]; then
   echo "package: AGENT_HISTORY_NOTARY_PROFILE needs AGENT_HISTORY_SIGN_IDENTITY; Apple does not notarize ad-hoc signatures" >&2; exit 2
 fi
@@ -41,7 +41,7 @@ mkdir -p "$out"
 archive="$out/agent-history-macos-arm64.tar.gz"
 if [ -e "$archive" ]; then echo "package: refusing to overwrite $archive" >&2; exit 2; fi
 ./scripts/check
-AGENT_HISTORY_BUILD_ID=$build_id cargo build --release --locked -p agent-history-cli -p agent-history-herdr
+AGENT_HISTORY_BUILD_ID=$build_id cargo build --release --locked -p agent-history-cli -p agent-history-herdr -p agent-history-rex
 for name in $binaries; do
   if [ ! -x "target/release/$name" ]; then echo "package: required binary target/release/$name is missing" >&2; exit 2; fi
 done

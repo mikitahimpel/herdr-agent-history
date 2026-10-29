@@ -1,10 +1,12 @@
 #!/bin/sh
 set -eu
 with_herdr=false
+with_rex=false
 prefix=
 for arg in "$@"; do
   case "$arg" in
     --with-herdr) with_herdr=true ;;
+    --with-rex) with_rex=true ;;
     --*) echo "install: unknown option: $arg" >&2; exit 2 ;;
     '') echo "install: prefix must not be empty" >&2; exit 2 ;;
     *) if [ -n "$prefix" ]; then echo "install: expected one prefix" >&2; exit 2; fi; prefix=$arg ;;
@@ -36,6 +38,7 @@ if $with_herdr; then
   fi
   if [ -z "$plugin_source" ]; then echo "install: --with-herdr requested but the Herdr plugin manifest is missing" >&2; exit 2; fi
 fi
+if $with_rex && [ ! -x "$source_dir/agent-history-rex" ]; then echo "install: --with-rex requested but agent-history-rex is missing" >&2; exit 2; fi
 # Replace the directory entry rather than writing through it. macOS validates a
 # code signature against the inode it already mapped, so overwriting a binary in
 # place leaves the next launch with a signature that no longer matches its
@@ -68,4 +71,15 @@ else
     echo "existing Herdr integration found; rerun with --with-herdr to update it"
   fi
   echo "Herdr integration is available with: $0 --with-herdr $prefix"
+fi
+# Rex itself is not needed to install: the browser asks for rex-agent when
+# it runs.
+if $with_rex; then
+  install_file "$source_dir/agent-history-rex" "$prefix/agent-history-rex" 755
+  echo "installed Agent History Rex integration in $prefix"
+  echo "Run agent-history-rex from a Rex terminal; it needs rex-agent on PATH or REX_AGENT_BIN."
+elif [ -f "$prefix/agent-history-rex" ]; then
+  echo "existing Rex integration found; rerun with --with-rex to update it"
+else
+  echo "Rex integration is available with: $0 --with-rex $prefix"
 fi
