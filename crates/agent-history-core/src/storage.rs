@@ -469,7 +469,14 @@ impl SqliteStore {
             params.push(i64::from(*group).into());
         }
         let role = role_param(kind);
-        params.extend([expression.to_string().into(), role.clone(), role]);
+        // The score's parameter comes first: it is in the select list, ahead
+        // of the match and the role in the statement.
+        params.extend([
+            now_nanos().into(),
+            expression.to_string().into(),
+            role.clone(),
+            role,
+        ]);
         struct Candidate {
             id: i64,
             group: i64,
@@ -578,10 +585,10 @@ impl SqliteStore {
     ) -> Result<Vec<SearchResult>> {
         let limit = limit.min(MAX_LIMIT);
         let rows = self.search_rows(
-            "ORDER BY bm25(chunks_fts),c.agent,c.native_id,c.ordinal LIMIT ?",
+            &ranked_tail(),
             expression,
             role,
-            vec![(limit as i64).into()],
+            vec![now_nanos().into(), (limit as i64).into()],
         )?;
         Ok(rows.into_iter().map(|(_, r)| r).collect())
     }
@@ -638,6 +645,51 @@ impl SqliteStore {
 /// text. Ranking reads a few narrow columns from every match before the
 /// `LIMIT`, so without the hint each match drags its text through the page
 /// cache -- seconds for a common word on a real index.
+/// How much better a match from this moment ranks than the same text from
+/// long ago, and how quickly that advantage fades.
+///
+/// Relevance alone has no sense of time. A phrase a reader has used across
+/// months matches in every one of those conversations, and BM25 then surfaces
+/// whichever chunk happens to score best — usually a short old one — while the
+/// conversation they just had, which is almost always the one they mean, sits
+/// below it. The score is scaled by `1 + WEIGHT * FADE / (FADE + age in days)`:
+/// at most `WEIGHT` better than the same text from long ago, half of that
+/// advantage left at `FADE` days old, and a few percent after a month. It
+/// decides between matches of comparable strength and never overturns a
+/// clearly better one.
+const RECENCY_WEIGHT: f64 = 0.25;
+const RECENCY_FADE_DAYS: f64 = 7.0;
+
+/// The score rows are ranked by, lowest first: BM25 scaled by [`RECENCY_WEIGHT`].
+/// BM25 is negative and a better match is more negative, so a scale above one
+/// moves a row up. Binds one parameter, the current time in nanoseconds.
+///
+/// A chunk with no timestamp is ranked as if it were as old as the epoch, so
+/// rows that all lack one keep exactly their BM25 order: every score is scaled
+/// by the same number.
+fn ranked_score() -> String {
+    format!(
+        "bm25(chunks_fts)*(1.0+{RECENCY_WEIGHT:?}*{RECENCY_FADE_DAYS:?}/({RECENCY_FADE_DAYS:?}+max(0.0,(?-coalesce(c.timestamp,0))/86400000000000.0)))"
+    )
+}
+
+/// The ordinary search's ordering: recency-weighted relevance, a tie-break
+/// that keeps equal rows in a stable order, and the caller's limit. Binds the
+/// score's parameter and then the limit.
+fn ranked_tail() -> String {
+    format!(
+        "ORDER BY {},c.agent,c.native_id,c.ordinal LIMIT ?",
+        ranked_score()
+    )
+}
+
+/// Now, in the nanoseconds since the epoch that chunk timestamps are stored in.
+fn now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+}
+
 fn search_sql(tail: &str) -> String {
     format!("SELECT c.agent,c.native_id,s.repository,s.branch,s.cwd,c.timestamp,c.kind,c.source_path,c.source_file_id,c.source_generation,c.source_start,c.source_end,snippet(chunks_fts,0,'','', ' … ', 24),s.repository_url,s.git_origin,c.rowid FROM chunks_fts JOIN search_chunks c INDEXED BY chunks_meta ON c.rowid=chunks_fts.rowid JOIN sessions s ON s.agent=c.agent AND s.native_id=c.native_id WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?) {tail}")
 }
@@ -645,9 +697,10 @@ fn search_sql(tail: &str) -> String {
 /// The prioritized sessions' own query; `values` holds its `(?,?,?)` rows.
 /// Hinted for the same reason as [`search_sql`].
 fn prioritized_sql(values: &str) -> String {
+    let score = ranked_score();
     format!(
         "WITH p(agent,native_id,grp) AS (VALUES {values}) \
-         SELECT c.rowid, p.grp, bm25(chunks_fts), c.agent, c.native_id, c.ordinal \
+         SELECT c.rowid, p.grp, {score}, c.agent, c.native_id, c.ordinal \
          FROM chunks_fts CROSS JOIN search_chunks c INDEXED BY chunks_meta ON c.rowid=chunks_fts.rowid CROSS JOIN p ON p.agent=c.agent AND p.native_id=c.native_id \
          WHERE chunks_fts MATCH ? AND (? IS NULL OR c.kind=?)"
     )
@@ -1641,6 +1694,137 @@ mod tests {
             .collect()
     }
 
+    /// Sessions of one chunk each, timestamped a given number of days ago, so
+    /// that ranking by age can be tested without waiting for one to pass.
+    fn dated_fixture(
+        name: &str,
+        sessions: &[(&str, u64, &str)],
+    ) -> (crate::test_support::TempDir, SqliteStore) {
+        let dir = crate::test_support::TempDir::new(name).unwrap();
+        let mut db = SqliteStore::open(dir.path().join("private/index.sqlite")).unwrap();
+        for (n, (native, days, text)) in sessions.iter().enumerate() {
+            let file = 10 + n as u64;
+            let s = session(Agent::Claude, native, file, 1);
+            let mut c = chunk(&s.id, file, 1, 0, text);
+            c.timestamp = std::time::SystemTime::now()
+                .checked_sub(std::time::Duration::from_secs(days * 24 * 60 * 60));
+            db.commit_batch(IndexBatch {
+                sessions: vec![s.into()],
+                chunks: vec![c],
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        (dir, db)
+    }
+
+    /// Relevance alone has no sense of time: the same sentence in two
+    /// conversations ranked by whichever chunk BM25 happened to prefer, so the
+    /// conversation a reader had an hour ago could sit below one from months
+    /// back, which is almost never the one they meant.
+    #[test]
+    fn a_recent_match_outranks_an_older_one_of_equal_relevance() {
+        let text = "the deploy went out";
+        let (_dir, db) = dated_fixture(
+            "storage-recency-equal",
+            &[
+                ("old", 300, text),
+                ("middle", 30, text),
+                ("recent", 1, text),
+            ],
+        );
+        let outcome = db.search_with_fallback("deploy", 10, None).unwrap();
+        assert_eq!(natives(&outcome.results), ["recent", "middle", "old"]);
+    }
+
+    /// The advantage is bounded, so it decides between matches of comparable
+    /// strength and never overturns a clearly better one. `quiet` mentions
+    /// the word once in a long passage; the old sessions are about nothing
+    /// else, and still come first however recent `quiet` is.
+    #[test]
+    fn a_clearly_better_older_match_still_outranks_a_recent_weak_one() {
+        let (_dir, db) = dated_fixture(
+            "storage-recency-strength",
+            &[
+                ("old", 300, "deploy deploy now"),
+                (
+                    "quiet",
+                    0,
+                    "a long note about the weather, lunch, trains, music and, once, deploy",
+                ),
+            ],
+        );
+        let outcome = db.search_with_fallback("deploy", 10, None).unwrap();
+        assert_eq!(natives(&outcome.results), ["old", "quiet"]);
+    }
+
+    /// A lifted session shows one chunk, and it is chosen by the same rule
+    /// as the rest of the list. Without that, the row a reader is shown for
+    /// their running conversation could be a passing mention from months ago
+    /// while today's is the reason they searched.
+    #[test]
+    fn a_lifted_session_offers_its_most_recent_comparable_match() {
+        let dir = crate::test_support::TempDir::new("storage-recency-lifted").unwrap();
+        let mut db = SqliteStore::open(dir.path().join("private/index.sqlite")).unwrap();
+        let s = session(Agent::Claude, "live", 10, 1);
+        let ages = [300u64, 1];
+        let chunks = ages
+            .iter()
+            .enumerate()
+            .map(|(i, days)| {
+                let mut c = chunk(&s.id, 10, 1, i as u64, "the deploy went out");
+                c.timestamp = std::time::SystemTime::now()
+                    .checked_sub(std::time::Duration::from_secs(days * 24 * 60 * 60));
+                c
+            })
+            .collect();
+        db.commit_batch(IndexBatch {
+            sessions: vec![s.clone().into()],
+            chunks,
+            ..Default::default()
+        })
+        .unwrap();
+        let outcome = db
+            .search_prioritized("deploy", 10, None, &Priorities::from_iter([(s.id, 0)]))
+            .unwrap();
+        assert_eq!(outcome.prioritized, 1);
+        // Ordinal 1 is the recent chunk; ordinal 0 is the one from months ago.
+        assert_eq!(outcome.results[0].source.byte_range.start, 10);
+    }
+
+    /// Conversations whose records carry no timestamp are ranked as the
+    /// oldest there are, which leaves a set of them in exactly the relevance
+    /// order it had before ages were weighed at all.
+    #[test]
+    fn chunks_without_a_timestamp_keep_their_relevance_order() {
+        let (_dir, db) = deploy_fixture("storage-recency-undated");
+        let outcome = db.search_with_fallback("deploy", 10, None).unwrap();
+        let undated = natives(&outcome.results);
+        // Every fixture chunk is undated, so `quiet` ranks last on relevance
+        // alone, exactly as it did before.
+        assert_eq!(undated.last(), Some(&"quiet"));
+        assert_eq!(undated.len(), 6);
+        // And one dated conversation among them is placed by its own age.
+        let (_dir, dated) = dated_fixture(
+            "storage-recency-mixed",
+            // Named so that relevance alone, which breaks its ties by
+            // session ID, would put the older one first.
+            &[
+                ("aa-old", 300, "deploy deploy now"),
+                ("zz-new", 0, "deploy deploy now"),
+            ],
+        );
+        assert_eq!(
+            natives(
+                &dated
+                    .search_with_fallback("deploy", 10, None)
+                    .unwrap()
+                    .results
+            ),
+            ["zz-new", "aa-old"]
+        );
+    }
+
     /// Five sessions that say "deploy" plainly, and one, `quiet`, that only
     /// mentions it in passing, so relevance ranks it last.
     fn deploy_fixture(name: &str) -> (crate::test_support::TempDir, SqliteStore) {
@@ -1683,10 +1867,7 @@ mod tests {
         };
         // The queries the search actually runs, not copies of them.
         for (what, sql) in [
-            (
-                "ranked search",
-                search_sql("ORDER BY bm25(chunks_fts),c.agent,c.native_id,c.ordinal LIMIT ?"),
-            ),
+            ("ranked search", search_sql(&ranked_tail())),
             ("prioritized search", prioritized_sql("(?,?,?)")),
         ] {
             let plan = plans(&format!("EXPLAIN QUERY PLAN {sql}"));
