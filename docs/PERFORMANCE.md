@@ -492,3 +492,63 @@ SQLite writer, are what is left.
 - Measured on one host (Apple M1, 8 cores, 17 GB, macOS 26.6.2). The exec latency that dominated
   the old timing is a property of this machine's exec path; a host with cheap `fork`/`exec` would
   have seen a smaller share of time in `git` and will see a smaller gain.
+
+## Ranking had no sense of time (#63)
+
+Results were ordered by `bm25(chunks_fts)` alone, with ties breaking toward the lower rowid —
+the older chunk. BM25 does not know when anything was said, so a phrase a reader has used
+across months matches in every one of those conversations and the order among them is decided
+by chunk length and term density, never by age.
+
+The score is now scaled by `1 + WEIGHT * FADE / (FADE + age in days)`, with `WEIGHT` 0.25 and
+`FADE` 7 days: at most a quarter better than the same text from long ago, half that advantage
+left after a week, a few percent after a month. A chunk with no timestamp is ranked as the
+oldest there is, so a set of undated chunks keeps exactly the order it had before. The same
+score picks the one chunk a prioritized session contributes.
+
+### Effect on a real index
+
+2,387 sessions, 25,414 chunks. A two-word query matching 36 chunks across three weeks:
+
+| | Before | After |
+| --- | --- | --- |
+| Rank of the match from the previous day | 8th | **3rd** |
+
+The two still above it are two days old with materially better BM25, so relevance still leads.
+A query whose strongest match is an old conversation — a distinctive phrase used once, months
+ago — returns that conversation first both before and after.
+
+Single common words move most, because nearly every match scores the same and a bounded scale
+then decides the order. For `worktree`, the top five went from five mentions four to five
+months old to five from the last four days.
+
+### Cost: none measurable
+
+`timestamp` is in the covering index `chunks_meta`, so the ordering reads nothing the ranking
+did not already read, and the covering plan is asserted by
+`ranking_a_match_reads_the_index_and_not_the_chunk` for both the ranked and the prioritized
+query.
+
+Wall-clock percentiles were unusable on this host: load average moved between 200 and 460
+during the runs, and one interleaved pass had `exact` twice as fast and `exact_prioritized`
+14% slower in the same pass. CPU time for the same fixed workload is not distorted by
+contention, so that is the claim — `search_latency` against a private copy of the real index,
+four alternating runs each:
+
+| | Before | After |
+| --- | --- | --- |
+| CPU seconds, user + sys, median of 4 | 22.20 s | 22.31 s |
+
+Individual runs spanned 21.11–24.40 s before and 20.48–25.66 s after, so the 0.1 s difference
+is well inside the spread.
+
+### Limitations
+
+- `WEIGHT` and `FADE` are one choice, tuned against one corpus to move a known case from 8th to
+  3rd without displacing strong old matches. They are not derived from anything.
+- No relevance judgements exist for this corpus, so "better" above means a handful of inspected
+  queries, not a measured quality score.
+- Near-duplicate chunks are untouched: a sentence repeated in a conversation still occupies two
+  rows near the top.
+- One host, one corpus, and the CPU-time comparison assumes the two binaries do the same work
+  apart from the ordering, which they do.
