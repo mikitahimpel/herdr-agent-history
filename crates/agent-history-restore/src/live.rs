@@ -1,13 +1,13 @@
 //! Which native sessions a process on this machine is already running.
 //!
-//! Herdr names the session a pane started with, and Claude's own id moves on
+//! A host names the session a pane started with, and Claude's own id moves on
 //! from there: `/resume`, a fork or a continuation writes a new transcript
 //! under a new id while the same pane keeps showing the conversation. Asking
 //! the host alone therefore reports a live conversation as merely resumable,
 //! and Enter starts a second process against a transcript that already has
 //! one. The agent itself is not so forgetful: it carries the id it is serving
 //! in its own command line, which is true whoever started it, Herdr or not.
-use crate::resume::is_uuid;
+use crate::plan::is_uuid;
 use agent_history_core::{Agent, SessionId};
 use std::collections::HashSet;
 

@@ -496,15 +496,29 @@ fn draw_results(
     }
     if !state.results.is_empty() {
         let mut counts = Vec::new();
-        if let Some(first) = state.results.first().filter(|_| state.prioritized > 0) {
-            // Worded like the group's own marker, so the count explains the stripe.
-            let group = state
-                .priorities
-                .group(&first.session_id)
-                .unwrap_or_default();
-            let label = integration.availability_label(SessionState::Prioritized(group));
+        if state.prioritized > 0 {
+            // Worded like the groups' own markers, so the count explains the
+            // stripe: one count per group, in the order they are listed.
+            let mut groups: Vec<(u32, usize)> = Vec::new();
+            for result in state.results.iter().take(state.prioritized) {
+                let group = state
+                    .priorities
+                    .group(&result.session_id)
+                    .unwrap_or_default();
+                match groups.last_mut() {
+                    Some((last, n)) if *last == group => *n += 1,
+                    _ => groups.push((group, 1)),
+                }
+            }
+            let text: Vec<String> = groups
+                .iter()
+                .map(|(group, n)| {
+                    let label = integration.availability_label(SessionState::Prioritized(*group));
+                    format!("{n} {label}")
+                })
+                .collect();
             counts.push(Span::styled(
-                format!(" ◉ {} {label} ", state.prioritized),
+                format!(" ◉ {} ", text.join(" ")),
                 Style::new().fg(p.teal),
             ));
             counts.push(Span::styled("·", p.muted()));
@@ -992,6 +1006,13 @@ pub(crate) fn hints(
     }
     if mode != Mode::Query {
         v.push(("^C", "quit".into()));
+    }
+    let close = integration.close_label();
+    for (key, label) in &mut v {
+        *key = integration.key_name(key);
+        if label == "quit" {
+            *label = close.to_string();
+        }
     }
     v
 }
@@ -1722,6 +1743,77 @@ mod tests {
         let inner = results_inner(&buf);
         assert_eq!(buf[(inner.x, inner.y)].symbol(), " ");
         assert!(!row(&buf, inner.bottom()).contains('◉'));
+    }
+
+    /// Groups worded by state, with a host's own key names.
+    struct ByState;
+    impl Integration for ByState {
+        fn title(&self) -> &str {
+            "Agent History"
+        }
+        fn enter_label(&self) -> &str {
+            "Resume"
+        }
+        fn handle(
+            &mut self,
+            _: Key,
+            _: &mut BrowserState,
+            _: &SqliteStore,
+        ) -> agent_history_core::Result<bool> {
+            Ok(false)
+        }
+        fn action_lines(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn close_label(&self) -> &str {
+            "close"
+        }
+        fn key_name(&self, key: &'static str) -> &'static str {
+            match key {
+                "^C" => "⌃C",
+                key => key,
+            }
+        }
+        fn availability_label(&self, state: SessionState) -> &str {
+            match state {
+                SessionState::Prioritized(0) => "blocked",
+                SessionState::Prioritized(_) => "idle",
+                _ => "other",
+            }
+        }
+    }
+
+    #[test]
+    fn several_prioritized_groups_are_counted_each_in_its_own_wording() {
+        let temp = TempDir::new("ui-priority-groups").unwrap();
+        let (_store, mut state, _) = five_sessions(&temp);
+        let groups = [
+            (state.results[0].session_id.clone(), 0),
+            (state.results[1].session_id.clone(), 4),
+            (state.results[2].session_id.clone(), 4),
+        ];
+        state
+            .availability
+            .set_priorities(Priorities::from_iter(groups.clone()));
+        state.priorities = Priorities::from_iter(groups);
+        state.prioritized = 3;
+        let buf = render(&mut state, &ByState, 120, 60);
+        let bottom = row(&buf, results_inner(&buf).bottom());
+        assert!(bottom.contains("◉ 1 blocked 2 idle "), "{bottom}");
+    }
+
+    #[test]
+    fn a_host_names_the_keys_and_closing_in_its_own_words() {
+        let hint = |mode| hints(mode, true, &ByState);
+        assert!(hint(Mode::Query).contains(&("esc", "close".into())));
+        assert!(hint(Mode::Results).contains(&("⌃C", "close".into())));
+        assert!(!hint(Mode::Results)
+            .iter()
+            .any(|(k, l)| *k == "^C" || l == "quit"));
+        // The default spelling is unchanged.
+        let standalone = hints(Mode::Results, true, &Standalone);
+        assert!(standalone.contains(&("^C", "quit".into())));
+        assert!(hints(Mode::Query, true, &Standalone).contains(&("esc", "quit".into())));
     }
 
     #[test]

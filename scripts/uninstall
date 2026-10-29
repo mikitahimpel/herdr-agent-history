@@ -8,7 +8,7 @@ had_herdr=false
 if [ -f "$prefix/agent-history-herdr" ] || [ -L "$prefix/agent-history-herdr" ] || [ -f "$prefix/../share/agent-history/plugin/herdr-plugin.toml" ]; then
   had_herdr=true
 fi
-for name in agent-history agent-history-overlay agent-history-herdr; do
+for name in agent-history agent-history-overlay agent-history-herdr agent-history-rex; do
   path="$prefix/$name"
   if [ -f "$path" ] || [ -L "$path" ]; then rm -f "$path"; echo "removed $path"; fi
 done

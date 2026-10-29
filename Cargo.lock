@@ -28,10 +28,29 @@ name = "agent-history-herdr"
 version = "0.1.0"
 dependencies = [
  "agent-history-core",
+ "agent-history-restore",
  "agent-history-tui",
  "serde",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "agent-history-restore"
+version = "0.1.0"
+dependencies = [
+ "agent-history-core",
+]
+
+[[package]]
+name = "agent-history-rex"
+version = "0.1.0"
+dependencies = [
+ "agent-history-core",
+ "agent-history-restore",
+ "agent-history-tui",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

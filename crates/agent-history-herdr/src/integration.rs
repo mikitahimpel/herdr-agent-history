@@ -4,6 +4,7 @@ use agent_history_core::{
     availability::Availability, preview::preview_source, CoreError, Priorities, Result,
     ResultPrioritizer, Session, SqliteStore,
 };
+use agent_history_restore::{already_running_notice, resumed_notice};
 use agent_history_tui::{
     BackgroundPrioritizer, BrowserState, Integration, Key, Mode, Palette, SessionState,
 };
@@ -128,38 +129,6 @@ impl<H> HerdrIntegration<H> {
         }
         Ok(())
     }
-}
-
-fn agent_name(session: &agent_history_core::Session) -> &'static str {
-    match session.id.agent {
-        agent_history_core::Agent::Claude => "Claude",
-        agent_history_core::Agent::Codex => "Codex",
-    }
-}
-
-/// Names the session that was resumed, so returning to the browser explains
-/// what happened rather than looking as though nothing did. A session that
-/// was already running was shown, not started, and saying "resumed" for both
-/// would hide the difference that matters here.
-fn resumed_notice(session: &agent_history_core::Session, outcome: Resumed) -> String {
-    let agent = agent_name(session);
-    let verb = match outcome {
-        Resumed::Focused => "Opened running",
-        _ => "Resumed",
-    };
-    match session.repository.as_deref() {
-        Some(repository) => format!("{verb} {agent} session in {repository}"),
-        None => format!("{verb} {agent} session"),
-    }
-}
-
-/// Explains the one case where Enter starts nothing: the conversation is
-/// already being served, but not by a pane this integration can point to.
-fn already_running_notice(session: &agent_history_core::Session) -> String {
-    format!(
-        "This {} session is already running on this machine; showing it here instead of starting a second one",
-        agent_name(session)
-    )
 }
 
 /// The one priority group: sessions whose agent is running in Herdr now.

@@ -17,6 +17,7 @@ PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" "$tmp/default-prefi
 test -x "$tmp/default-prefix/agent-history"
 test -x "$tmp/default-prefix/agent-history-overlay"
 test ! -e "$tmp/default-prefix/agent-history-herdr"
+test ! -e "$tmp/default-prefix/agent-history-rex"
 test ! -e "$tmp/share/agent-history/plugin/herdr-plugin.toml"
 
 # Opt-in accepts either argument order and requires both optional artifacts.
@@ -36,6 +37,25 @@ PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" --with-herdr "$tmp/
 test -x "$tmp/optional-prefix/agent-history-herdr"
 PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/uninstall" "$tmp/optional-prefix" >/dev/null
 test ! -e "$tmp/optional-prefix/agent-history-herdr"
+
+# The Rex integration is opt-in too, needs only its binary (not Rex), and
+# combines with Herdr's.
+if PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" --with-rex "$tmp/rex-prefix" >/dev/null 2>&1; then exit 1; fi
+test ! -e "$tmp/rex-prefix/agent-history-rex"
+printf '#!/bin/sh\n' > "$package/agent-history-rex"
+chmod 755 "$package/agent-history-rex"
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" "$tmp/rex-prefix" --with-rex > "$tmp/rex-install.out"
+test -x "$tmp/rex-prefix/agent-history-rex"
+test ! -e "$tmp/rex-prefix/agent-history-herdr"
+grep -q 'rex-agent on PATH or REX_AGENT_BIN' "$tmp/rex-install.out"
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" "$tmp/rex-prefix" > "$tmp/rex-install.out"
+grep -q 'existing Rex integration found' "$tmp/rex-install.out"
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/install" --with-herdr --with-rex "$tmp/rex-prefix" >/dev/null
+test -x "$tmp/rex-prefix/agent-history-herdr"
+test -x "$tmp/rex-prefix/agent-history-rex"
+PATH="$tmp/bin:$PATH" HOME="$tmp/home" sh "$package/uninstall" "$tmp/rex-prefix" >/dev/null
+test ! -e "$tmp/rex-prefix/agent-history-rex"
+test ! -e "$tmp/rex-prefix/agent-history-herdr"
 
 printf unrelated > "$tmp/default-prefix/keep"
 printf native > "$tmp/native-history"
@@ -151,7 +171,7 @@ cat > "$stubs/cargo" <<EOF
 echo "cargo \$*" >> "$calls"
 echo "build-id \${AGENT_HISTORY_BUILD_ID-unset}" >> "$calls"
 mkdir -p target/release
-for n in agent-history agent-history-overlay agent-history-herdr; do cp "$stubs/built-binary" target/release/\$n; chmod 755 target/release/\$n; done
+for n in agent-history agent-history-overlay agent-history-herdr agent-history-rex; do cp "$stubs/built-binary" target/release/\$n; chmod 755 target/release/\$n; done
 printf 'echo "agent-history 0.1.0 (%s)"\n' "\${STUB_VERSION_ID-\$AGENT_HISTORY_BUILD_ID}" >> target/release/agent-history
 EOF
 chmod 755 "$stubs/cargo"
@@ -182,7 +202,7 @@ test "$(tail -n 1 "$tmp/stdout")" = "signing: ad-hoc only, NOT notarized"
 test "$(calls_to codesign)" = 0
 test "$(calls_to xcrun)" = 0
 test "$(calls_to check)" = 1
-test "$(tar -tzf "$tmp/dist/agent-history-macos-arm64.tar.gz" | grep -c -E '^agent-history/agent-history(-overlay|-herdr)?$')" = 3
+test "$(tar -tzf "$tmp/dist/agent-history-macos-arm64.tar.gz" | grep -c -E '^agent-history/agent-history(-overlay|-herdr|-rex)?$')" = 4
 
 # The release tag is stamped into the build, and the built binary must report it.
 grep -q '^build-id v0.1.0-rc.9$' "$calls"
@@ -236,8 +256,8 @@ test "$(calls_to check)" = 0
 # Identity alone signs every binary with a hardened runtime and a timestamp,
 # but warns that the result is still quarantined.
 package_run AGENT_HISTORY_SIGN_IDENTITY=TEAMID0000
-test "$(grep -c '^codesign --force --sign TEAMID0000 --options runtime --timestamp ' "$calls")" = 3
-test "$(grep -c '^codesign --verify --strict ' "$calls")" = 3
+test "$(grep -c '^codesign --force --sign TEAMID0000 --options runtime --timestamp ' "$calls")" = 4
+test "$(grep -c '^codesign --verify --strict ' "$calls")" = 4
 grep -q 'signed with Developer ID but NOT notarized' "$tmp/stderr"
 test "$(tail -n 1 "$tmp/stdout")" = "signing: Developer ID signed, NOT notarized"
 test "$(grep -c '^xcrun notarytool submit' "$calls")" = 0
@@ -251,8 +271,8 @@ test ! -e "$tmp/dist/agent-history-macos-arm64.tar.gz"
 # every binary and run it, as Gatekeeper meets a browser download.
 package_run AGENT_HISTORY_SIGN_IDENTITY=TEAMID0000 AGENT_HISTORY_NOTARY_PROFILE=release
 grep -q '^xcrun notarytool submit .*/notarize.zip --keychain-profile release --wait --output-format json$' "$calls"
-test "$(calls_to xattr)" = 3
-test "$(calls_to ran-quarantined)" = 3
+test "$(calls_to xattr)" = 4
+test "$(calls_to ran-quarantined)" = 4
 test "$(tail -n 1 "$tmp/stdout")" = "signing: Developer ID signed and notarized by Apple; Gatekeeper allows a quarantined copy after an online check"
 test ! -s "$tmp/stderr"
 test -f "$tmp/dist/agent-history-macos-arm64.tar.gz"

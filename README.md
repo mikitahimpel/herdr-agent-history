@@ -1,6 +1,6 @@
 # Agent History
 
-Local Claude Code and Codex conversation search for macOS. Search and preview work independently; optional Herdr integration adds session resume and worktree recovery.
+Local Claude Code and Codex conversation search for macOS. Search and preview work independently; optional Herdr and Rex integrations add session resume and worktree recovery.
 
 ![Agent History searching past Claude and Codex sessions](docs/media/agent-history.png)
 
@@ -73,6 +73,7 @@ tar -xzf agent-history-macos-arm64.tar.gz
 cd agent-history
 ./install                # standalone
 ./install --with-herdr   # instead, to also install the Herdr integration and plugin
+./install --with-rex     # also install the Rex integration (combines with --with-herdr)
 ```
 
 `./install` uses the same `~/.local/bin`; pass an absolute directory, for example `./install /opt/agent-history/bin`, to choose another. Keep the extracted folder if you want its `./uninstall` later.
@@ -152,6 +153,32 @@ If the recorded directory no longer exists, Enter offers choices instead, such a
 
 Without the plugin, running `agent-history-herdr` in any Herdr pane opens the same overlay. Indexing runs each time it opens; there is no permanent daemon.
 
+## Optional: resume from Rex
+
+`agent-history-rex` is the same browser for the Rex terminal app: Enter resumes the selected Claude Code or Codex session in Rex, and the recovery choices for a missing directory are the ones described for Herdr above. Install it with `./install --with-rex` from an archive that contains it, such as one [built from source](#build-from-source); releases up to 0.1.0-rc.3, and the install command above, do not include it yet. Installing does not need Rex.
+
+It runs only inside a Rex terminal, where Rex sets `REX_SESSION`; anywhere else it exits and points to `agent-history browse`. Every Rex operation goes through the `rex-agent` command from agent-box, so `rex-agent` must be on `PATH`, or `REX_AGENT_BIN` must name it. A Rex config can open it in a floating layer with an action and a key; this one binds it to **Shift-Cmd-H**:
+
+```lua
+rex.action{
+  name = "agent_history",
+  title = "Search Agent History…",
+  run = function()
+    overlay({ "sh", "-c",
+      'if command -v agent-history-rex >/dev/null; then exec agent-history-rex; ' ..
+      'else exec agent-history browse; fi' })
+  end,
+}
+rex.bind("shift+cmd+h", "agent_history")
+```
+
+(`overlay` is that config's helper that opens a command in a floating layer.)
+
+- **Results.** Sessions with a running agent come first, most urgent first, marked with the state Rex reports for Claude Code: `blocked` (waiting for your permission or answer), `error`, `done` (a finished turn you have not looked at), `working`, `idle`. A session found running only on this machine's process list, such as any Codex agent, is marked `running`.
+- **Enter.** A session already running in a Rex pane is focused. Otherwise, when exactly one Rex session has terminals working in the session's directory, the agent opens as a new tab there; with none or several, it opens in a new Rex session named after the directory. The browser then closes.
+- **Switching the app.** Focusing or opening a session elsewhere only brings the app along when **Remote Control** is on in Rex's settings. With it off, the pane is still focused, and the browser stays open to say so.
+- **Keys.** **Esc** steps back from the preview and the results, and from the search box closes the browser; **Ctrl-C** closes it from anywhere.
+
 ## Standalone app and CLI reference
 
 `agent-history browse` and the equivalent `agent-history-overlay` are standalone. Use `agent-history-herdr` inside a Herdr-managed pane when you want Enter to resume. Its title and controls identify that integration explicitly.
@@ -216,7 +243,7 @@ Building needs a checkout of this repository and the Rust toolchain pinned in `r
 ./scripts/package
 ```
 
-The archive and SHA-256 checksum are written to `dist/`; install from it exactly as from a release. A locally built archive is not quarantined. By default it is ad-hoc signed, and `package` ends with a warning saying so: a copy of it that a browser downloads will be killed by Gatekeeper. Maintainers produce a Developer ID signed and notarized archive by setting `AGENT_HISTORY_SIGN_IDENTITY` and `AGENT_HISTORY_NOTARY_PROFILE`. The one-time credential setup and the exact release command are in [release status](docs/RELEASE_STATUS.md#what-the-owner-must-run). `package` stamps the binaries with the checkout's `git describe --tags --always --dirty` (or `AGENT_HISTORY_BUILD_ID`, when set), so `agent-history --version` prints for example `agent-history 0.1.0 (v0.1.0-rc.3)`; a plain `cargo build` prints `(development build)`, and rc.2, built before this, prints only `agent-history 0.1.0`. To build and run just the standalone app without compiling the Herdr integration:
+The archive and SHA-256 checksum are written to `dist/`; install from it exactly as from a release. A locally built archive is not quarantined. By default it is ad-hoc signed, and `package` ends with a warning saying so: a copy of it that a browser downloads will be killed by Gatekeeper. Maintainers produce a Developer ID signed and notarized archive by setting `AGENT_HISTORY_SIGN_IDENTITY` and `AGENT_HISTORY_NOTARY_PROFILE`. The one-time credential setup and the exact release command are in [release status](docs/RELEASE_STATUS.md#what-the-owner-must-run). `package` stamps the binaries with the checkout's `git describe --tags --always --dirty` (or `AGENT_HISTORY_BUILD_ID`, when set), so `agent-history --version` prints for example `agent-history 0.1.0 (v0.1.0-rc.3)`; a plain `cargo build` prints `(development build)`, and rc.2, built before this, prints only `agent-history 0.1.0`. To build and run just the standalone app without compiling the Herdr or Rex integration:
 
 ```sh
 cargo build --release -p agent-history-cli

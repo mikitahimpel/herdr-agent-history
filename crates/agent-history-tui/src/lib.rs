@@ -528,6 +528,15 @@ pub trait Integration {
     fn background_prioritizer(&mut self) -> Option<BackgroundPrioritizer> {
         None
     }
+    /// What leaving the browser is called in the key hints.
+    fn close_label(&self) -> &str {
+        "quit"
+    }
+    /// How the key hints spell `key`, for a host whose keyboard names it
+    /// differently. Keys are spelled as in [`ui::hints`] by default.
+    fn key_name(&self, key: &'static str) -> &'static str {
+        key
+    }
     /// Short wording for a result's availability marker. The default only
     /// describes what exists on disk; it never promises that Enter resumes.
     fn availability_label(&self, state: SessionState) -> &str {
